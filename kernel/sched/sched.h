@@ -2761,17 +2761,27 @@ static inline int sched_tick_offload_init(void) { return 0; }
 static inline void sched_update_tick_dependency(struct rq *rq) { }
 #endif /* !CONFIG_NO_HZ_FULL */
 
+/* Shift half the size of the type, atomic_long_t */
+#define IOWAIT_SHIFT	(4 * sizeof(atomic_long_t))
+
+/*
+ * Store iowait and iowait_acct state in the same variable. The lower bits
+ * hold the iowait state, and the upper bits hold the iowait_acct state.
+ */
 static inline void task_iowait_inc(struct task_struct *p)
 {
-	atomic_long_inc(&task_rq(p)->nr_iowait);
+	long val = 1 + ((long) p->in_iowait_acct << IOWAIT_SHIFT);
+	atomic_long_add(val, &task_rq(p)->nr_iowait);
 }
 
 static inline void task_iowait_dec(struct task_struct *p)
 {
-	atomic_long_dec(&task_rq(p)->nr_iowait);
+	long val = 1 + ((long) p->in_iowait_acct << IOWAIT_SHIFT);
+	atomic_long_sub(val, &task_rq(p)->nr_iowait);
 }
 
 int rq_iowait(struct rq *rq);
+int rq_iowait_acct(struct rq *rq);
 
 static inline void add_nr_running(struct rq *rq, unsigned count)
 {

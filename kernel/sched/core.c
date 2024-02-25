@@ -3657,7 +3657,12 @@ static inline bool rq_has_pinned_tasks(struct rq *rq)
 
 int rq_iowait(struct rq *rq)
 {
-	return atomic_long_read(&rq->nr_iowait);
+	return atomic_long_read(&rq->nr_iowait) & ((1UL << IOWAIT_SHIFT) - 1);
+}
+
+int rq_iowait_acct(struct rq *rq)
+{
+	return atomic_long_read(&rq->nr_iowait) >> IOWAIT_SHIFT;
 }
 
 static void
@@ -5444,7 +5449,12 @@ unsigned long long nr_context_switches(void)
  * it does become runnable.
  */
 
-unsigned int nr_iowait_cpu(int cpu)
+unsigned int nr_iowait_acct_cpu(int cpu)
+{
+	return rq_iowait_acct(cpu_rq(cpu));
+}
+
+unsigned nr_iowait_cpu(int cpu)
 {
 	return rq_iowait(cpu_rq(cpu));
 }
@@ -5479,12 +5489,12 @@ unsigned int nr_iowait_cpu(int cpu)
  * Task CPU affinities can make all that even more 'interesting'.
  */
 
-unsigned int nr_iowait(void)
+unsigned int nr_iowait_acct(void)
 {
 	unsigned int i, sum = 0;
 
 	for_each_possible_cpu(i)
-		sum += nr_iowait_cpu(i);
+		sum += nr_iowait_acct_cpu(i);
 
 	return sum;
 }
@@ -7656,18 +7666,24 @@ static inline void preempt_dynamic_init(void) { }
 
 #endif /* CONFIG_PREEMPT_DYNAMIC */
 
+/*
+ * Returns a token which is comprised of the two bits of iowait wait state -
+ * one is whether we're making ourselves as in iowait for cpufreq reasons,
+ * and the other is if the task should be accounted as such.
+ */
 long io_schedule_prepare(void)
 {
-	long old_iowait = current->in_iowait;
-
+	long token = current->in_iowait + ((long) current->in_iowait_acct << IOWAIT_SHIFT);
 	current->in_iowait = 1;
+	current->in_iowait_acct = 1;
 	blk_flush_plug(current->plug, true);
-	return old_iowait;
+	return token;
 }
 
 void io_schedule_finish(long token)
 {
-	current->in_iowait = token;
+	current->in_iowait = token & 0x01;
+	current->in_iowait_acct = token >> IOWAIT_SHIFT;
 }
 
 /*
