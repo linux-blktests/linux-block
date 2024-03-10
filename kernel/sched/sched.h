@@ -2761,6 +2761,18 @@ static inline int sched_tick_offload_init(void) { return 0; }
 static inline void sched_update_tick_dependency(struct rq *rq) { }
 #endif /* !CONFIG_NO_HZ_FULL */
 
+static inline void task_iowait_inc(struct task_struct *p)
+{
+	atomic_inc(&task_rq(p)->nr_iowait);
+}
+
+static inline void task_iowait_dec(struct task_struct *p)
+{
+	atomic_dec(&task_rq(p)->nr_iowait);
+}
+
+int rq_iowait(struct rq *rq);
+
 static inline void add_nr_running(struct rq *rq, unsigned count)
 {
 	unsigned prev_nr = rq->nr_running;
@@ -2795,7 +2807,7 @@ static inline void __block_task(struct rq *rq, struct task_struct *p)
 		rq->nr_uninterruptible++;
 
 	if (p->in_iowait) {
-		atomic_inc(&rq->nr_iowait);
+		task_iowait_inc(p);
 		delayacct_blkio_start();
 	}
 
@@ -3905,6 +3917,7 @@ static inline void init_sched_mm_cid(struct task_struct *t) { }
 
 extern u64 avg_vruntime(struct cfs_rq *cfs_rq);
 extern int entity_eligible(struct cfs_rq *cfs_rq, struct sched_entity *se);
+
 #ifdef CONFIG_SMP
 static inline
 void move_queued_task_locked(struct rq *src_rq, struct rq *dst_rq, struct task_struct *task)
