@@ -1178,7 +1178,7 @@ struct rq {
 	u64			clock_idle_copy;
 #endif
 
-	atomic_t		nr_iowait;
+	atomic_long_t		nr_iowait;
 
 #ifdef CONFIG_SCHED_DEBUG
 	u64 last_seen_need_resched_ns;
@@ -2763,12 +2763,12 @@ static inline void sched_update_tick_dependency(struct rq *rq) { }
 
 static inline void task_iowait_inc(struct task_struct *p)
 {
-	atomic_inc(&task_rq(p)->nr_iowait);
+	atomic_long_inc(&task_rq(p)->nr_iowait);
 }
 
 static inline void task_iowait_dec(struct task_struct *p)
 {
-	atomic_dec(&task_rq(p)->nr_iowait);
+	atomic_long_dec(&task_rq(p)->nr_iowait);
 }
 
 int rq_iowait(struct rq *rq);
