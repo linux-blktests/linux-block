@@ -238,6 +238,20 @@ static inline void io_req_add_to_cache(struct io_kiocb *req, struct io_ring_ctx 
 	wq_stack_add_head(&req->comp_list, &ctx->submit_state.free_list);
 }
 
+static __cold void io_kworker_tw_start(void)
+{
+	if (WARN_ON_ONCE(!(current->flags & PF_NO_TASKWORK)))
+		return;
+	current->flags &= ~PF_NO_TASKWORK;
+}
+
+static __cold void io_kworker_tw_end(void)
+{
+	while (task_work_pending(current))
+		task_work_run();
+	current->flags |= PF_NO_TASKWORK;
+}
+
 static __cold void io_ring_ctx_ref_free(struct percpu_ref *ref)
 {
 	struct io_ring_ctx *ctx = container_of(ref, struct io_ring_ctx, refs);
@@ -253,6 +267,8 @@ static __cold void io_fallback_req_func(struct work_struct *work)
 	struct io_kiocb *req, *tmp;
 	struct io_tw_state ts = {};
 
+	io_kworker_tw_start();
+
 	percpu_ref_get(&ctx->refs);
 	mutex_lock(&ctx->uring_lock);
 	llist_for_each_entry_safe(req, tmp, node, io_task_work.node)
@@ -260,6 +276,7 @@ static __cold void io_fallback_req_func(struct work_struct *work)
 	io_submit_flush_completions(ctx);
 	mutex_unlock(&ctx->uring_lock);
 	percpu_ref_put(&ctx->refs);
+	io_kworker_tw_end();
 }
 
 static int io_alloc_hash_table(struct io_hash_table *table, unsigned bits)
@@ -2878,6 +2895,8 @@ static __cold void io_ring_exit_work(struct work_struct *work)
 	struct io_tctx_node *node;
 	int ret;
 
+	io_kworker_tw_start();
+
 	/*
 	 * If we're doing polled IO and end up having requests being
 	 * submitted async (out-of-line), then completions can come in while
@@ -2933,6 +2952,8 @@ static __cold void io_ring_exit_work(struct work_struct *work)
 		 * on stuck tasks if that is enabled.
 		 */
 	} while (!wait_for_completion_interruptible_timeout(&ctx->ref_comp, interval));
+
+	io_kworker_tw_end();
 
 	init_completion(&exit.completion);
 	init_task_work(&exit.task_work, io_tctx_exit_cb);
