@@ -521,7 +521,10 @@ static void __fput_deferred(struct file *file)
 		return;
 	}
 
-	if (likely(!in_interrupt() && !(task->flags & PF_KTHREAD))) {
+	/* PF_NO_TASKWORK should only be used with PF_KTHREAD */
+	VFS_WARN_ON_ONCE((task->flags & (PF_NO_TASKWORK ^ PF_KTHREAD)) == PF_NO_TASKWORK);
+
+	if (likely(!in_interrupt() && !(task->flags & PF_NO_TASKWORK))) {
 		init_task_work(&file->f_task_work, ____fput);
 		if (!task_work_add(task, &file->f_task_work, TWA_RESUME))
 			return;
