@@ -1145,6 +1145,7 @@ static int ext4_write_begin(struct file *file, struct address_space *mapping,
 	int ret, needed_blocks;
 	handle_t *handle;
 	int retries = 0;
+	fgf_t fgp_flags;
 	struct folio *folio;
 	pgoff_t index;
 	unsigned from, to;
@@ -1172,6 +1173,15 @@ static int ext4_write_begin(struct file *file, struct address_space *mapping,
 	}
 
 	/*
+	 * Set FGP_WRITEBEGIN, and FGP_DONTCACHE if foliop is marked as
+	 * dropbehind. That's how generic_perform_write() informs us that this
+	 * is a dropbehind write.
+	 */
+	fgp_flags = FGP_WRITEBEGIN;
+	if (foliop_is_dropbehind(foliop))
+		fgp_flags |= FGP_DONTCACHE;
+
+	/*
 	 * __filemap_get_folio() can take a long time if the
 	 * system is thrashing due to memory pressure, or if the folio
 	 * is being written back.  So grab it first before we start
@@ -1179,7 +1189,7 @@ static int ext4_write_begin(struct file *file, struct address_space *mapping,
 	 * the folio (if needed) without using GFP_NOFS.
 	 */
 retry_grab:
-	folio = __filemap_get_folio(mapping, index, FGP_WRITEBEGIN,
+	folio = __filemap_get_folio(mapping, index, fgp_flags,
 					mapping_gfp_mask(mapping));
 	if (IS_ERR(folio))
 		return PTR_ERR(folio);
@@ -2914,6 +2924,7 @@ static int ext4_da_write_begin(struct file *file, struct address_space *mapping,
 	struct folio *folio;
 	pgoff_t index;
 	struct inode *inode = mapping->host;
+	fgf_t fgp_flags;
 
 	if (unlikely(ext4_forced_shutdown(inode->i_sb)))
 		return -EIO;
@@ -2937,8 +2948,11 @@ static int ext4_da_write_begin(struct file *file, struct address_space *mapping,
 			return 0;
 	}
 
+	fgp_flags = FGP_WRITEBEGIN;
+	if (foliop_is_dropbehind(foliop))
+		fgp_flags |= FGP_DONTCACHE;
 retry:
-	folio = __filemap_get_folio(mapping, index, FGP_WRITEBEGIN,
+	folio = __filemap_get_folio(mapping, index, fgp_flags,
 			mapping_gfp_mask(mapping));
 	if (IS_ERR(folio))
 		return PTR_ERR(folio);
