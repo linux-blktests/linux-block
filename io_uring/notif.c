@@ -104,13 +104,14 @@ static const struct ubuf_info_ops io_ubuf_ops = {
 	.link_skb = io_link_skb,
 };
 
-struct io_kiocb *io_alloc_notif(struct io_ring_ctx *ctx)
-	__must_hold(&ctx->uring_lock)
+struct io_kiocb *io_alloc_notif(struct io_sq_cq *s)
 {
 	struct io_kiocb *notif;
 	struct io_notif_data *nd;
 
-	if (unlikely(!io_alloc_req(ctx, &notif)))
+	lockdep_assert_held(&s->ring_lock);
+
+	if (unlikely(!io_alloc_req(s, &notif)))
 		return NULL;
 	notif->opcode = IORING_OP_NOP;
 	notif->flags = 0;

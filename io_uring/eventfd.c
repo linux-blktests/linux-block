@@ -91,7 +91,7 @@ static struct io_ev_fd *io_eventfd_grab(struct io_ring_ctx *ctx)
 {
 	struct io_ev_fd *ev_fd;
 
-	if (READ_ONCE(ctx->rings->cq_flags) & IORING_CQ_EVENTFD_DISABLED)
+	if (READ_ONCE(ctx->s->rings->cq_flags) & IORING_CQ_EVENTFD_DISABLED)
 		return NULL;
 
 	rcu_read_lock();
@@ -141,8 +141,8 @@ void io_eventfd_flush_signal(struct io_ring_ctx *ctx)
 		 * the CQ ring.
 		 */
 		spin_lock(&ctx->completion_lock);
-		skip = ctx->cached_cq_tail == ev_fd->last_cq_tail;
-		ev_fd->last_cq_tail = ctx->cached_cq_tail;
+		skip = ctx->s->cached_cq_tail == ev_fd->last_cq_tail;
+		ev_fd->last_cq_tail = ctx->s->cached_cq_tail;
 		spin_unlock(&ctx->completion_lock);
 
 		if (!skip)
@@ -180,7 +180,7 @@ int io_eventfd_register(struct io_ring_ctx *ctx, void __user *arg,
 	}
 
 	spin_lock(&ctx->completion_lock);
-	ev_fd->last_cq_tail = ctx->cached_cq_tail;
+	ev_fd->last_cq_tail = ctx->s->cached_cq_tail;
 	spin_unlock(&ctx->completion_lock);
 
 	ev_fd->eventfd_async = eventfd_async;

@@ -219,6 +219,9 @@ enum io_uring_sqe_flags_bit {
 /* Use hybrid poll in iopoll process */
 #define IORING_SETUP_HYBRID_IOPOLL	(1U << 17)
 
+/* multiple submit/completion contexts */
+#define IORING_SETUP_THREAD_ISSUER	(1U << 18)
+
 enum io_uring_op {
 	IORING_OP_NOP,
 	IORING_OP_READV,
@@ -489,6 +492,7 @@ struct io_uring_cqe {
 #define IORING_OFF_PBUF_RING		0x80000000ULL
 #define IORING_OFF_PBUF_SHIFT		16
 #define IORING_OFF_MMAP_MASK		0xf8000000ULL
+#define IORING_OFF_ISSUER_SHIFT		16
 
 /*
  * Filled with the offset for mmap(2)
@@ -651,6 +655,8 @@ enum io_uring_register_op {
 	/* flag added to the opcode to use a registered ring fd */
 	IORING_REGISTER_USE_REGISTERED_RING	= 1U << 31
 };
+
+#define IO_URING_MAX_CONTEXTS		128
 
 /* io-wq worker categories */
 enum io_wq_type {

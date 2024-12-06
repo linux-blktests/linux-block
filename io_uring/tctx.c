@@ -39,7 +39,7 @@ static struct io_wq *io_init_wq_offload(struct io_ring_ctx *ctx,
 	data.do_work = io_wq_submit_work;
 
 	/* Do QD, or 4 * CPUS, whatever is smallest */
-	concurrency = min(ctx->sq_entries, 4 * num_online_cpus());
+	concurrency = min(ctx->s->sq_entries, 4 * num_online_cpus());
 
 	return io_wq_create(concurrency, &data);
 }
@@ -103,7 +103,8 @@ __cold int io_uring_alloc_task_context(struct task_struct *task,
 	return 0;
 }
 
-int __io_uring_add_tctx_node(struct io_ring_ctx *ctx)
+static struct io_tctx_node *__io_uring_add_ret_tctx_node(struct io_ring_ctx *ctx,
+							 struct io_sq_cq *s)
 {
 	struct io_uring_task *tctx = current->io_uring;
 	struct io_tctx_node *node;
@@ -112,7 +113,7 @@ int __io_uring_add_tctx_node(struct io_ring_ctx *ctx)
 	if (unlikely(!tctx)) {
 		ret = io_uring_alloc_task_context(current, ctx);
 		if (unlikely(ret))
-			return ret;
+			return ERR_PTR(ret);
 
 		tctx = current->io_uring;
 		if (ctx->iowq_limits_set) {
@@ -121,39 +122,71 @@ int __io_uring_add_tctx_node(struct io_ring_ctx *ctx)
 
 			ret = io_wq_max_workers(tctx->io_wq, limits);
 			if (ret)
-				return ret;
+				return ERR_PTR(ret);
 		}
 	}
-	if (!xa_load(&tctx->xa, (unsigned long)ctx)) {
+	node = xa_load(&tctx->xa, (unsigned long) ctx);
+	if (!node) {
 		node = kmalloc(sizeof(*node), GFP_KERNEL);
 		if (!node)
-			return -ENOMEM;
+			return ERR_PTR(-ENOMEM);
 		node->ctx = ctx;
+		node->sq = s;
 		node->task = current;
 
 		ret = xa_err(xa_store(&tctx->xa, (unsigned long)ctx,
 					node, GFP_KERNEL));
 		if (ret) {
 			kfree(node);
-			return ret;
+			return ERR_PTR(ret);
 		}
 
 		mutex_lock(&ctx->uring_lock);
 		list_add(&node->ctx_node, &ctx->tctx_list);
 		mutex_unlock(&ctx->uring_lock);
 	}
+	return node;
+}
+
+int __io_uring_add_tctx_node(struct io_ring_ctx *ctx, struct io_sq_cq *s)
+{
+	struct io_tctx_node *node;
+
+	node = __io_uring_add_ret_tctx_node(ctx, s);
+	if (IS_ERR(node))
+		return PTR_ERR(node);
+
 	return 0;
 }
 
-int __io_uring_add_tctx_node_from_submit(struct io_ring_ctx *ctx)
+int io_uring_tctx_node_set_sq(struct io_ring_ctx *ctx, struct io_sq_cq *s)
+{
+	struct io_tctx_node *node;
+
+	mutex_unlock(&ctx->uring_lock);
+	node = __io_uring_add_ret_tctx_node(ctx, s);
+	mutex_lock(&ctx->uring_lock);
+	if (IS_ERR(node))
+		return PTR_ERR(node);
+	if (node->sq == s)
+		return 0;
+	else if (node->sq)
+		return -EBUSY;
+
+	node->sq = s;
+	return 0;
+}
+
+int __io_uring_add_tctx_node_from_submit(struct io_ring_ctx *ctx,
+					 struct io_sq_cq *s)
 {
 	int ret;
 
 	if (ctx->flags & IORING_SETUP_SINGLE_ISSUER
-	    && ctx->submitter_task != current)
+	    && s->submitter_task != current)
 		return -EEXIST;
 
-	ret = __io_uring_add_tctx_node(ctx);
+	ret = __io_uring_add_tctx_node(ctx, s);
 	if (ret)
 		return ret;
 
@@ -274,7 +307,7 @@ int io_ringfd_register(struct io_ring_ctx *ctx, void __user *__arg,
 		return -EINVAL;
 
 	mutex_unlock(&ctx->uring_lock);
-	ret = __io_uring_add_tctx_node(ctx);
+	ret = __io_uring_add_tctx_node(ctx, NULL);
 	mutex_lock(&ctx->uring_lock);
 	if (ret)
 		return ret;

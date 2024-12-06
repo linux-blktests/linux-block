@@ -34,7 +34,7 @@ struct io_provide_buf {
 static inline struct io_buffer_list *io_buffer_get_list(struct io_ring_ctx *ctx,
 							unsigned int bgid)
 {
-	lockdep_assert_held(&ctx->uring_lock);
+	lockdep_assert_held(&ctx->s->ring_lock);
 
 	return xa_load(&ctx->io_bl_xa, bgid);
 }
@@ -58,7 +58,7 @@ bool io_kbuf_recycle_legacy(struct io_kiocb *req, unsigned issue_flags)
 	struct io_buffer_list *bl;
 	struct io_buffer *buf;
 
-	io_ring_submit_lock(ctx, issue_flags);
+	io_ring_submit_lock(req->sq, issue_flags);
 
 	buf = req->kbuf;
 	bl = io_buffer_get_list(ctx, buf->bgid);
@@ -66,7 +66,7 @@ bool io_kbuf_recycle_legacy(struct io_kiocb *req, unsigned issue_flags)
 	req->flags &= ~REQ_F_BUFFER_SELECTED;
 	req->buf_index = buf->bgid;
 
-	io_ring_submit_unlock(ctx, issue_flags);
+	io_ring_submit_unlock(req->sq, issue_flags);
 	return true;
 }
 
@@ -178,7 +178,7 @@ void __user *io_buffer_select(struct io_kiocb *req, size_t *len,
 	struct io_buffer_list *bl;
 	void __user *ret = NULL;
 
-	io_ring_submit_lock(req->ctx, issue_flags);
+	io_ring_submit_lock(req->sq, issue_flags);
 
 	bl = io_buffer_get_list(ctx, req->buf_index);
 	if (likely(bl)) {
@@ -187,7 +187,7 @@ void __user *io_buffer_select(struct io_kiocb *req, size_t *len,
 		else
 			ret = io_provided_buffer_select(req, len, bl);
 	}
-	io_ring_submit_unlock(req->ctx, issue_flags);
+	io_ring_submit_unlock(req->sq, issue_flags);
 	return ret;
 }
 
@@ -291,7 +291,7 @@ int io_buffers_select(struct io_kiocb *req, struct buf_sel_arg *arg,
 	struct io_buffer_list *bl;
 	int ret = -ENOENT;
 
-	io_ring_submit_lock(ctx, issue_flags);
+	io_ring_submit_lock(req->sq, issue_flags);
 	bl = io_buffer_get_list(ctx, req->buf_index);
 	if (unlikely(!bl))
 		goto out_unlock;
@@ -313,7 +313,7 @@ int io_buffers_select(struct io_kiocb *req, struct buf_sel_arg *arg,
 		ret = io_provided_buffers_select(req, &arg->out_len, bl, arg->iovs);
 	}
 out_unlock:
-	io_ring_submit_unlock(ctx, issue_flags);
+	io_ring_submit_unlock(req->sq, issue_flags);
 	return ret;
 }
 
@@ -351,7 +351,7 @@ static int __io_remove_buffers(struct io_ring_ctx *ctx,
 
 	if (bl->flags & IOBL_BUF_RING) {
 		i = bl->buf_ring->tail - bl->head;
-		io_free_region(ctx, &bl->region);
+		io_free_region(ctx->user, &bl->region);
 		/* make sure it's seen as empty */
 		INIT_LIST_HEAD(&bl->buf_list);
 		bl->flags &= ~IOBL_BUF_RING;
@@ -439,7 +439,7 @@ int io_remove_buffers(struct io_kiocb *req, unsigned int issue_flags)
 	struct io_buffer_list *bl;
 	int ret = 0;
 
-	io_ring_submit_lock(ctx, issue_flags);
+	io_ring_submit_lock(req->sq, issue_flags);
 
 	ret = -ENOENT;
 	bl = io_buffer_get_list(ctx, p->bgid);
@@ -449,7 +449,7 @@ int io_remove_buffers(struct io_kiocb *req, unsigned int issue_flags)
 		if (!(bl->flags & IOBL_BUF_RING))
 			ret = __io_remove_buffers(ctx, bl, p->nbufs);
 	}
-	io_ring_submit_unlock(ctx, issue_flags);
+	io_ring_submit_unlock(req->sq, issue_flags);
 	if (ret < 0)
 		req_set_fail(req);
 	io_req_set_res(req, ret, 0);
@@ -572,7 +572,7 @@ int io_provide_buffers(struct io_kiocb *req, unsigned int issue_flags)
 	struct io_buffer_list *bl;
 	int ret = 0;
 
-	io_ring_submit_lock(ctx, issue_flags);
+	io_ring_submit_lock(req->sq, issue_flags);
 
 	bl = io_buffer_get_list(ctx, p->bgid);
 	if (unlikely(!bl)) {
@@ -596,7 +596,7 @@ int io_provide_buffers(struct io_kiocb *req, unsigned int issue_flags)
 
 	ret = io_add_buffers(ctx, p, bl);
 err:
-	io_ring_submit_unlock(ctx, issue_flags);
+	io_ring_submit_unlock(req->sq, issue_flags);
 
 	if (ret < 0)
 		req_set_fail(req);
@@ -680,7 +680,7 @@ int io_register_pbuf_ring(struct io_ring_ctx *ctx, void __user *arg)
 	io_buffer_add_list(ctx, bl, reg.bgid);
 	return 0;
 fail:
-	io_free_region(ctx, &bl->region);
+	io_free_region(ctx->user, &bl->region);
 	kfree(free_bl);
 	return ret;
 }

@@ -174,13 +174,26 @@ out:
 	return ret;
 }
 
-static int io_register_enable_rings(struct io_ring_ctx *ctx)
+static int io_register_enable_rings(struct io_ring_ctx *ctx, int index)
 {
+	struct io_sq_cq *s;
+	int i, ret;
+
 	if (!(ctx->flags & IORING_SETUP_R_DISABLED))
 		return -EBADFD;
+	if (index >= ctx->nr_sq)
+		return -EINVAL;
 
-	if (ctx->flags & IORING_SETUP_SINGLE_ISSUER && !ctx->submitter_task) {
-		WRITE_ONCE(ctx->submitter_task, get_task_struct(current));
+	s = &ctx->s[index];
+	if (!(s->ring_flags & IORING_SETUP_R_DISABLED))
+		return -EBADFD;
+
+	ret = io_uring_tctx_node_set_sq(ctx, s);
+	if (ret)
+		return ret;
+
+	if (ctx->flags & IORING_SETUP_SINGLE_ISSUER && !s->submitter_task) {
+		WRITE_ONCE(s->submitter_task, get_task_struct(current));
 		/*
 		 * Lazy activation attempts would fail if it was polled before
 		 * submitter_task is set.
@@ -192,6 +205,13 @@ static int io_register_enable_rings(struct io_ring_ctx *ctx)
 	if (ctx->restrictions.registered)
 		ctx->restricted = 1;
 
+	s->ring_flags &= ~IORING_SETUP_R_DISABLED;
+	io_for_each_s(ctx, s, i) {
+		if (s->ring_flags & IORING_SETUP_R_DISABLED)
+			return 0;
+	}
+
+	printk("all enabled, live\n");
 	ctx->flags &= ~IORING_SETUP_R_DISABLED;
 	if (ctx->sq_data && wq_has_sleeper(&ctx->sq_data->wait))
 		wake_up(&ctx->sq_data->wait);
@@ -374,12 +394,12 @@ struct io_ring_ctx_rings {
 	struct io_mapped_region ring_region;
 };
 
-static void io_register_free_rings(struct io_ring_ctx *ctx,
+static void io_register_free_rings(struct user_struct *user,
 				   struct io_uring_params *p,
 				   struct io_ring_ctx_rings *r)
 {
-	io_free_region(ctx, &r->sq_region);
-	io_free_region(ctx, &r->ring_region);
+	io_free_region(user, &r->sq_region);
+	io_free_region(user, &r->ring_region);
 }
 
 #define swap_old(ctx, o, n, field)		\
@@ -392,7 +412,8 @@ static void io_register_free_rings(struct io_ring_ctx *ctx,
 #define COPY_FLAGS	(IORING_SETUP_NO_SQARRAY | IORING_SETUP_SQE128 | \
 			 IORING_SETUP_CQE32 | IORING_SETUP_NO_MMAP)
 
-static int io_register_resize_rings(struct io_ring_ctx *ctx, void __user *arg)
+static int io_register_resize_rings(struct io_ring_ctx *ctx, struct io_sq_cq *s,
+				    void __user *arg)
 {
 	struct io_uring_region_desc rd;
 	struct io_ring_ctx_rings o = { }, n = { }, *to_free = NULL;
@@ -403,7 +424,7 @@ static int io_register_resize_rings(struct io_ring_ctx *ctx, void __user *arg)
 
 	/* for single issuer, must be owner resizing */
 	if (ctx->flags & IORING_SETUP_SINGLE_ISSUER &&
-	    current != ctx->submitter_task)
+	    current != s->submitter_task)
 		return -EEXIST;
 	if (copy_from_user(&p, arg, sizeof(p)))
 		return -EFAULT;
@@ -418,7 +439,7 @@ static int io_register_resize_rings(struct io_ring_ctx *ctx, void __user *arg)
 		return ret;
 
 	/* nothing to do, but copy params back */
-	if (p.sq_entries == ctx->sq_entries && p.cq_entries == ctx->cq_entries) {
+	if (p.sq_entries == s->sq_entries && p.cq_entries == s->cq_entries) {
 		if (copy_to_user(arg, &p, sizeof(p)))
 			return -EFAULT;
 		return 0;
@@ -437,7 +458,7 @@ static int io_register_resize_rings(struct io_ring_ctx *ctx, void __user *arg)
 	}
 	ret = io_create_region_mmap_safe(ctx, &n.ring_region, &rd, IORING_OFF_CQ_RING);
 	if (ret) {
-		io_register_free_rings(ctx, &p, &n);
+		io_register_free_rings(ctx->user, &p, &n);
 		return ret;
 	}
 	n.rings = io_region_get_ptr(&n.ring_region);
@@ -448,7 +469,7 @@ static int io_register_resize_rings(struct io_ring_ctx *ctx, void __user *arg)
 	n.rings->cq_ring_entries = p.cq_entries;
 
 	if (copy_to_user(arg, &p, sizeof(p))) {
-		io_register_free_rings(ctx, &p, &n);
+		io_register_free_rings(ctx->user, &p, &n);
 		return -EFAULT;
 	}
 
@@ -457,7 +478,7 @@ static int io_register_resize_rings(struct io_ring_ctx *ctx, void __user *arg)
 	else
 		size = array_size(sizeof(struct io_uring_sqe), p.sq_entries);
 	if (size == SIZE_MAX) {
-		io_register_free_rings(ctx, &p, &n);
+		io_register_free_rings(ctx->user, &p, &n);
 		return -EOVERFLOW;
 	}
 
@@ -469,7 +490,7 @@ static int io_register_resize_rings(struct io_ring_ctx *ctx, void __user *arg)
 	}
 	ret = io_create_region_mmap_safe(ctx, &n.sq_region, &rd, IORING_OFF_SQES);
 	if (ret) {
-		io_register_free_rings(ctx, &p, &n);
+		io_register_free_rings(ctx->user, &p, &n);
 		return ret;
 	}
 	n.sq_sqes = io_region_get_ptr(&n.sq_region);
@@ -494,10 +515,10 @@ static int io_register_resize_rings(struct io_ring_ctx *ctx, void __user *arg)
 	 */
 	mutex_lock(&ctx->mmap_lock);
 	spin_lock(&ctx->completion_lock);
-	o.rings = ctx->rings;
-	ctx->rings = NULL;
-	o.sq_sqes = ctx->sq_sqes;
-	ctx->sq_sqes = NULL;
+	o.rings = s->rings;
+	s->rings = NULL;
+	o.sq_sqes = s->sq_sqes;
+	s->sq_sqes = NULL;
 
 	/*
 	 * Now copy SQ and CQ entries, if any. If either of the destination
@@ -507,7 +528,7 @@ static int io_register_resize_rings(struct io_ring_ctx *ctx, void __user *arg)
 	if (tail - o.rings->sq.head > p.sq_entries)
 		goto overflow;
 	for (i = o.rings->sq.head; i < tail; i++) {
-		unsigned src_head = i & (ctx->sq_entries - 1);
+		unsigned src_head = i & (s->sq_entries - 1);
 		unsigned dst_head = i & n.rings->sq_ring_mask;
 
 		n.sq_sqes[dst_head] = o.sq_sqes[src_head];
@@ -519,14 +540,14 @@ static int io_register_resize_rings(struct io_ring_ctx *ctx, void __user *arg)
 	if (tail - o.rings->cq.head > p.cq_entries) {
 overflow:
 		/* restore old rings, and return -EOVERFLOW via cleanup path */
-		ctx->rings = o.rings;
-		ctx->sq_sqes = o.sq_sqes;
+		s->rings = o.rings;
+		s->sq_sqes = o.sq_sqes;
 		to_free = &n;
 		ret = -EOVERFLOW;
 		goto out;
 	}
 	for (i = o.rings->cq.head; i < tail; i++) {
-		unsigned src_head = i & (ctx->cq_entries - 1);
+		unsigned src_head = i & (s->cq_entries - 1);
 		unsigned dst_head = i & n.rings->cq_ring_mask;
 
 		n.rings->cqes[dst_head] = o.rings->cqes[src_head];
@@ -534,7 +555,7 @@ overflow:
 	n.rings->cq.head = o.rings->cq.head;
 	n.rings->cq.tail = o.rings->cq.tail;
 	/* invalidate cached cqe refill */
-	ctx->cqe_cached = ctx->cqe_sentinel = NULL;
+	s->cqe_cached = s->cqe_sentinel = NULL;
 
 	n.rings->sq_dropped = o.rings->sq_dropped;
 	n.rings->sq_flags = o.rings->sq_flags;
@@ -543,21 +564,21 @@ overflow:
 
 	/* all done, store old pointers and assign new ones */
 	if (!(ctx->flags & IORING_SETUP_NO_SQARRAY))
-		ctx->sq_array = (u32 *)((char *)n.rings + sq_array_offset);
+		s->sq_array = (u32 *)((char *)n.rings + sq_array_offset);
 
-	ctx->sq_entries = p.sq_entries;
-	ctx->cq_entries = p.cq_entries;
+	s->sq_entries = p.sq_entries;
+	s->cq_entries = p.cq_entries;
 
-	ctx->rings = n.rings;
-	ctx->sq_sqes = n.sq_sqes;
-	swap_old(ctx, o, n, ring_region);
-	swap_old(ctx, o, n, sq_region);
+	s->rings = n.rings;
+	s->sq_sqes = n.sq_sqes;
+	swap_old(s, o, n, ring_region);
+	swap_old(s, o, n, sq_region);
 	to_free = &o;
 	ret = 0;
 out:
 	spin_unlock(&ctx->completion_lock);
 	mutex_unlock(&ctx->mmap_lock);
-	io_register_free_rings(ctx, &p, to_free);
+	io_register_free_rings(ctx->user, &p, to_free);
 
 	if (ctx->sq_data)
 		io_sq_thread_unpark(ctx->sq_data);
@@ -599,7 +620,7 @@ static int io_register_mem_region(struct io_ring_ctx *ctx, void __user *uarg)
 	if (ret)
 		return ret;
 	if (copy_to_user(rd_uptr, &rd, sizeof(rd))) {
-		io_free_region(ctx, &ctx->param_region);
+		io_free_region(ctx->user, &ctx->param_region);
 		return -EFAULT;
 	}
 
@@ -615,6 +636,7 @@ static int __io_uring_register(struct io_ring_ctx *ctx, unsigned opcode,
 	__releases(ctx->uring_lock)
 	__acquires(ctx->uring_lock)
 {
+	struct io_sq_cq *s = ctx->s;
 	int ret;
 
 	/*
@@ -624,7 +646,10 @@ static int __io_uring_register(struct io_ring_ctx *ctx, unsigned opcode,
 	if (WARN_ON_ONCE(percpu_ref_is_dying(&ctx->refs)))
 		return -ENXIO;
 
-	if (ctx->submitter_task && ctx->submitter_task != current)
+	if (ctx->flags & IORING_SETUP_THREAD_ISSUER)
+		s = io_uring_get_sq(ctx);
+
+	if (s && s->submitter_task && s->submitter_task != current)
 		return -EEXIST;
 
 	if (ctx->restricted) {
@@ -699,9 +724,11 @@ static int __io_uring_register(struct io_ring_ctx *ctx, unsigned opcode,
 		break;
 	case IORING_REGISTER_ENABLE_RINGS:
 		ret = -EINVAL;
-		if (arg || nr_args)
+		if (arg)
 			break;
-		ret = io_register_enable_rings(ctx);
+		if (nr_args && !(ctx->flags & IORING_SETUP_THREAD_ISSUER))
+			break;
+		ret = io_register_enable_rings(ctx, nr_args);
 		break;
 	case IORING_REGISTER_RESTRICTIONS:
 		ret = io_register_restrictions(ctx, arg, nr_args);
@@ -802,7 +829,7 @@ static int __io_uring_register(struct io_ring_ctx *ctx, unsigned opcode,
 		ret = -EINVAL;
 		if (!arg || nr_args != 1)
 			break;
-		ret = io_register_resize_rings(ctx, arg);
+		ret = io_register_resize_rings(ctx, ctx->s, arg);
 		break;
 	case IORING_REGISTER_MEM_REGION:
 		ret = -EINVAL;

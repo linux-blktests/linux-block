@@ -162,10 +162,11 @@ static inline bool io_sqd_events_pending(struct io_sq_data *sqd)
 
 static int __io_sq_thread(struct io_ring_ctx *ctx, bool cap_entries)
 {
+	struct io_sq_cq *s = ctx->s;
 	unsigned int to_submit;
 	int ret = 0;
 
-	to_submit = io_sqring_entries(ctx);
+	to_submit = io_sqring_entries(s);
 	/* if we're handling multiple rings, cap submit size for fairness */
 	if (cap_entries && to_submit > IORING_SQPOLL_CAP_ENTRIES_VALUE)
 		to_submit = IORING_SQPOLL_CAP_ENTRIES_VALUE;
@@ -176,9 +177,9 @@ static int __io_sq_thread(struct io_ring_ctx *ctx, bool cap_entries)
 		if (ctx->sq_creds != current_cred())
 			creds = override_creds(ctx->sq_creds);
 
-		mutex_lock(&ctx->uring_lock);
+		mutex_lock(&s->ring_lock);
 		if (!wq_list_empty(&ctx->iopoll_list))
-			io_do_iopoll(ctx, true);
+			io_do_iopoll(&ctx->s[0], true);
 
 		/*
 		 * Don't submit if refs are dying, good for io_uring_register(),
@@ -186,8 +187,8 @@ static int __io_sq_thread(struct io_ring_ctx *ctx, bool cap_entries)
 		 */
 		if (to_submit && likely(!percpu_ref_is_dying(&ctx->refs)) &&
 		    !(ctx->flags & IORING_SETUP_R_DISABLED))
-			ret = io_submit_sqes(ctx, to_submit);
-		mutex_unlock(&ctx->uring_lock);
+			ret = io_submit_sqes(s, to_submit);
+		mutex_unlock(&s->ring_lock);
 
 		if (to_submit && wq_has_sleeper(&ctx->sqo_sq_wait))
 			wake_up(&ctx->sqo_sq_wait);
@@ -337,7 +338,7 @@ static int io_sq_thread(void *data)
 
 			list_for_each_entry(ctx, &sqd->ctx_list, sqd_list) {
 				atomic_or(IORING_SQ_NEED_WAKEUP,
-						&ctx->rings->sq_flags);
+						&ctx->s->rings->sq_flags);
 				if ((ctx->flags & IORING_SETUP_IOPOLL) &&
 				    !wq_list_empty(&ctx->iopoll_list)) {
 					needs_sched = false;
@@ -350,7 +351,7 @@ static int io_sq_thread(void *data)
 				 */
 				smp_mb__after_atomic();
 
-				if (io_sqring_entries(ctx)) {
+				if (io_sqring_entries(ctx->s)) {
 					needs_sched = false;
 					break;
 				}
@@ -364,7 +365,7 @@ static int io_sq_thread(void *data)
 			}
 			list_for_each_entry(ctx, &sqd->ctx_list, sqd_list)
 				atomic_andnot(IORING_SQ_NEED_WAKEUP,
-						&ctx->rings->sq_flags);
+						&ctx->s->rings->sq_flags);
 		}
 
 		finish_wait(&sqd->wait, &wait);
@@ -377,7 +378,7 @@ static int io_sq_thread(void *data)
 	io_uring_cancel_generic(true, sqd);
 	sqd->thread = NULL;
 	list_for_each_entry(ctx, &sqd->ctx_list, sqd_list)
-		atomic_or(IORING_SQ_NEED_WAKEUP, &ctx->rings->sq_flags);
+		atomic_or(IORING_SQ_NEED_WAKEUP, &ctx->s->rings->sq_flags);
 	io_run_task_work();
 	mutex_unlock(&sqd->lock);
 err_out:
@@ -390,11 +391,11 @@ void io_sqpoll_wait_sq(struct io_ring_ctx *ctx)
 	DEFINE_WAIT(wait);
 
 	do {
-		if (!io_sqring_full(ctx))
+		if (!io_sqring_full(ctx->s))
 			break;
 		prepare_to_wait(&ctx->sqo_sq_wait, &wait, TASK_INTERRUPTIBLE);
 
-		if (!io_sqring_full(ctx))
+		if (!io_sqring_full(ctx->s))
 			break;
 		schedule();
 	} while (!signal_pending(current));

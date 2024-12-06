@@ -95,8 +95,8 @@ static bool io_kill_timeout(struct io_kiocb *req, int status)
 
 		if (status)
 			req_set_fail(req);
-		atomic_set(&req->ctx->cq_timeouts,
-			atomic_read(&req->ctx->cq_timeouts) + 1);
+		atomic_set(&req->sq->cq_timeouts,
+			atomic_read(&req->sq->cq_timeouts) + 1);
 		list_del_init(&timeout->list);
 		io_req_queue_tw_complete(req, status);
 		return true;
@@ -110,7 +110,7 @@ __cold void io_flush_timeouts(struct io_ring_ctx *ctx)
 	struct io_timeout *timeout, *tmp;
 
 	raw_spin_lock_irq(&ctx->timeout_lock);
-	seq = ctx->cached_cq_tail - atomic_read(&ctx->cq_timeouts);
+	seq = ctx->s->cached_cq_tail - atomic_read(&ctx->s->cq_timeouts);
 
 	list_for_each_entry_safe(timeout, tmp, &ctx->timeout_list, list) {
 		struct io_kiocb *req = cmd_to_io_kiocb(timeout);
@@ -139,7 +139,7 @@ __cold void io_flush_timeouts(struct io_ring_ctx *ctx)
 
 static void io_req_tw_fail_links(struct io_kiocb *link, struct io_tw_state *ts)
 {
-	io_tw_lock(link->ctx, ts);
+	io_tw_lock(ts->sq);
 	while (link) {
 		struct io_kiocb *nxt = link->link;
 		long res = -ECANCELED;
@@ -240,8 +240,8 @@ static enum hrtimer_restart io_timeout_fn(struct hrtimer *timer)
 
 	raw_spin_lock_irqsave(&ctx->timeout_lock, flags);
 	list_del_init(&timeout->list);
-	atomic_set(&req->ctx->cq_timeouts,
-		atomic_read(&req->ctx->cq_timeouts) + 1);
+	atomic_set(&req->ctx->s->cq_timeouts,
+		atomic_read(&req->ctx->s->cq_timeouts) + 1);
 	raw_spin_unlock_irqrestore(&ctx->timeout_lock, flags);
 
 	if (!(data->flags & IORING_TIMEOUT_ETIME_SUCCESS))
@@ -541,7 +541,7 @@ static int __io_timeout_prep(struct io_kiocb *req,
 	hrtimer_init(&data->timer, io_timeout_get_clock(data), data->mode);
 
 	if (is_timeout_link) {
-		struct io_submit_link *link = &req->ctx->submit_state.link;
+		struct io_submit_link *link = &req->sq->submit_state.link;
 
 		if (!link->head)
 			return -EINVAL;
@@ -567,6 +567,7 @@ int io_timeout(struct io_kiocb *req, unsigned int issue_flags)
 {
 	struct io_timeout *timeout = io_kiocb_to_cmd(req, struct io_timeout);
 	struct io_ring_ctx *ctx = req->ctx;
+	struct io_sq_cq *s = req->sq;
 	struct io_timeout_data *data = req->async_data;
 	struct list_head *entry;
 	u32 tail, off = timeout->off;
@@ -583,7 +584,7 @@ int io_timeout(struct io_kiocb *req, unsigned int issue_flags)
 		goto add;
 	}
 
-	tail = data_race(ctx->cached_cq_tail) - atomic_read(&ctx->cq_timeouts);
+	tail = data_race(s->cached_cq_tail) - atomic_read(&s->cq_timeouts);
 	timeout->target_seq = tail + off;
 
 	/* Update the last seq here in case io_flush_timeouts() hasn't.

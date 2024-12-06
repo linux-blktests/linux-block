@@ -74,12 +74,13 @@ static inline bool io_msg_need_remote(struct io_ring_ctx *target_ctx)
 static void io_msg_tw_complete(struct io_kiocb *req, struct io_tw_state *ts)
 {
 	struct io_ring_ctx *ctx = req->ctx;
+	struct io_sq_cq *s = req->sq;
 
-	io_add_aux_cqe(ctx, req->cqe.user_data, req->cqe.res, req->cqe.flags);
-	if (spin_trylock(&ctx->msg_lock)) {
-		if (io_alloc_cache_put(&ctx->msg_cache, req))
+	io_add_aux_cqe(s, req->cqe.user_data, req->cqe.res, req->cqe.flags);
+	if (spin_trylock(&s->msg_lock)) {
+		if (io_alloc_cache_put(&s->msg_cache, req))
 			req = NULL;
-		spin_unlock(&ctx->msg_lock);
+		spin_unlock(&s->msg_lock);
 	}
 	if (req)
 		kmem_cache_free(req_cachep, req);
@@ -89,7 +90,7 @@ static void io_msg_tw_complete(struct io_kiocb *req, struct io_tw_state *ts)
 static int io_msg_remote_post(struct io_ring_ctx *ctx, struct io_kiocb *req,
 			      int res, u32 cflags, u64 user_data)
 {
-	req->tctx = READ_ONCE(ctx->submitter_task->io_uring);
+	req->tctx = READ_ONCE(ctx->s[0].submitter_task->io_uring);
 	if (!req->tctx) {
 		kmem_cache_free(req_cachep, req);
 		return -EOWNERDEAD;
@@ -103,13 +104,13 @@ static int io_msg_remote_post(struct io_ring_ctx *ctx, struct io_kiocb *req,
 	return 0;
 }
 
-static struct io_kiocb *io_msg_get_kiocb(struct io_ring_ctx *ctx)
+static struct io_kiocb *io_msg_get_kiocb(struct io_sq_cq *s)
 {
 	struct io_kiocb *req = NULL;
 
-	if (spin_trylock(&ctx->msg_lock)) {
-		req = io_alloc_cache_get(&ctx->msg_cache);
-		spin_unlock(&ctx->msg_lock);
+	if (spin_trylock(&s->msg_lock)) {
+		req = io_alloc_cache_get(&s->msg_cache);
+		spin_unlock(&s->msg_lock);
 		if (req)
 			return req;
 	}
@@ -122,7 +123,7 @@ static int io_msg_data_remote(struct io_ring_ctx *target_ctx,
 	struct io_kiocb *target;
 	u32 flags = 0;
 
-	target = io_msg_get_kiocb(target_ctx);
+	target = io_msg_get_kiocb(target_ctx->s);
 	if (unlikely(!target))
 		return -ENOMEM;
 
@@ -157,7 +158,7 @@ static int __io_msg_ring_data(struct io_ring_ctx *target_ctx,
 		if (unlikely(io_double_lock_ctx(target_ctx, issue_flags)))
 			return -EAGAIN;
 	}
-	if (io_post_aux_cqe(target_ctx, msg->user_data, msg->len, flags))
+	if (io_post_aux_cqe(target_ctx->s, msg->user_data, msg->len, flags))
 		ret = 0;
 	if (target_ctx->flags & IORING_SETUP_IOPOLL)
 		io_double_unlock_ctx(target_ctx);
@@ -179,7 +180,7 @@ static int io_msg_grab_file(struct io_kiocb *req, unsigned int issue_flags)
 	struct io_rsrc_node *node;
 	int ret = -EBADF;
 
-	io_ring_submit_lock(ctx, issue_flags);
+	io_ring_submit_lock(ctx->s, issue_flags);
 	node = io_rsrc_node_lookup(&ctx->file_table.data, msg->src_fd);
 	if (node) {
 		msg->src_file = io_slot_file(node);
@@ -188,7 +189,7 @@ static int io_msg_grab_file(struct io_kiocb *req, unsigned int issue_flags)
 		req->flags |= REQ_F_NEED_CLEANUP;
 		ret = 0;
 	}
-	io_ring_submit_unlock(ctx, issue_flags);
+	io_ring_submit_unlock(ctx->s, issue_flags);
 	return ret;
 }
 
@@ -217,7 +218,7 @@ static int io_msg_install_complete(struct io_kiocb *req, unsigned int issue_flag
 	 * completes with -EOVERFLOW, then the sender must ensure that a
 	 * later IORING_OP_MSG_RING delivers the message.
 	 */
-	if (!io_post_aux_cqe(target_ctx, msg->user_data, ret, 0))
+	if (!io_post_aux_cqe(target_ctx->s, msg->user_data, ret, 0))
 		ret = -EOVERFLOW;
 out_unlock:
 	io_double_unlock_ctx(target_ctx);
@@ -241,7 +242,7 @@ static int io_msg_fd_remote(struct io_kiocb *req)
 {
 	struct io_ring_ctx *ctx = req->file->private_data;
 	struct io_msg *msg = io_kiocb_to_cmd(req, struct io_msg);
-	struct task_struct *task = READ_ONCE(ctx->submitter_task);
+	struct task_struct *task = READ_ONCE(ctx->s[0].submitter_task);
 
 	if (unlikely(!task))
 		return -EOWNERDEAD;

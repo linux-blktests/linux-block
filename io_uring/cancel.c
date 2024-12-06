@@ -181,7 +181,7 @@ static int __io_async_cancel(struct io_cancel_data *cd,
 	} while (1);
 
 	/* slow path, try all io-wq's */
-	io_ring_submit_lock(ctx, issue_flags);
+	io_ring_submit_lock(ctx->s, issue_flags);
 	ret = -ENOENT;
 	list_for_each_entry(node, &ctx->tctx_list, ctx_node) {
 		ret = io_async_cancel_one(node->task->io_uring, cd);
@@ -191,7 +191,7 @@ static int __io_async_cancel(struct io_cancel_data *cd,
 			nr++;
 		}
 	}
-	io_ring_submit_unlock(ctx, issue_flags);
+	io_ring_submit_unlock(ctx->s, issue_flags);
 	return all ? nr : ret;
 }
 
@@ -254,7 +254,6 @@ static int __io_sync_cancel(struct io_uring_task *tctx,
 }
 
 int io_sync_cancel(struct io_ring_ctx *ctx, void __user *arg)
-	__must_hold(&ctx->uring_lock)
 {
 	struct io_cancel_data cd = {
 		.ctx	= ctx,
@@ -265,6 +264,10 @@ int io_sync_cancel(struct io_ring_ctx *ctx, void __user *arg)
 	struct file *file = NULL;
 	DEFINE_WAIT(wait);
 	int ret, i;
+
+	lockdep_assert_held(&ctx->uring_lock);
+
+	guard(mutex)(&ctx->s->ring_lock);
 
 	if (copy_from_user(&sc, arg, sizeof(sc)))
 		return -EFAULT;
@@ -312,7 +315,7 @@ int io_sync_cancel(struct io_ring_ctx *ctx, void __user *arg)
 	do {
 		cd.seq = atomic_inc_return(&ctx->cancel_seq);
 
-		prepare_to_wait(&ctx->cq_wait, &wait, TASK_INTERRUPTIBLE);
+		prepare_to_wait(&ctx->s->cq_wait, &wait, TASK_INTERRUPTIBLE);
 
 		ret = __io_sync_cancel(current->io_uring, &cd, sc.fd);
 
@@ -331,7 +334,7 @@ int io_sync_cancel(struct io_ring_ctx *ctx, void __user *arg)
 		mutex_lock(&ctx->uring_lock);
 	} while (1);
 
-	finish_wait(&ctx->cq_wait, &wait);
+	finish_wait(&ctx->s->cq_wait, &wait);
 	mutex_lock(&ctx->uring_lock);
 
 	if (ret == -ENOENT || ret > 0)

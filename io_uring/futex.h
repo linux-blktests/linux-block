@@ -13,8 +13,8 @@ int io_futex_cancel(struct io_ring_ctx *ctx, struct io_cancel_data *cd,
 		    unsigned int issue_flags);
 bool io_futex_remove_all(struct io_ring_ctx *ctx, struct io_uring_task *tctx,
 			 bool cancel_all);
-bool io_futex_cache_init(struct io_ring_ctx *ctx);
-void io_futex_cache_free(struct io_ring_ctx *ctx);
+bool io_futex_cache_init(struct io_sq_cq *s);
+void io_futex_cache_free(struct io_sq_cq *s);
 #else
 static inline int io_futex_cancel(struct io_ring_ctx *ctx,
 				  struct io_cancel_data *cd,
@@ -27,11 +27,11 @@ static inline bool io_futex_remove_all(struct io_ring_ctx *ctx,
 {
 	return false;
 }
-static inline bool io_futex_cache_init(struct io_ring_ctx *ctx)
+static inline bool io_futex_cache_init(struct io_sq_cq *s)
 {
 	return false;
 }
-static inline void io_futex_cache_free(struct io_ring_ctx *ctx)
+static inline void io_futex_cache_free(struct io_sq_cq *s)
 {
 }
 #endif

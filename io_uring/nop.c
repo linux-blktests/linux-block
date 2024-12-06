@@ -68,13 +68,13 @@ int io_nop(struct io_kiocb *req, unsigned int issue_flags)
 		struct io_rsrc_node *node;
 
 		ret = -EFAULT;
-		io_ring_submit_lock(ctx, issue_flags);
+		io_ring_submit_lock(ctx->s, issue_flags);
 		node = io_rsrc_node_lookup(&ctx->buf_table, nop->buffer);
 		if (node) {
 			io_req_assign_buf_node(req, node);
 			ret = 0;
 		}
-		io_ring_submit_unlock(ctx, issue_flags);
+		io_ring_submit_unlock(ctx->s, issue_flags);
 	}
 done:
 	if (ret < 0)

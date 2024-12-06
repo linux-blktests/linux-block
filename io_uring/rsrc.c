@@ -125,7 +125,7 @@ struct io_rsrc_node *io_rsrc_node_alloc(struct io_ring_ctx *ctx, int type)
 	node = kzalloc(sizeof(*node), GFP_KERNEL);
 	if (node) {
 		node->type = type;
-		node->refs = 1;
+		atomic_set(&node->refs, 1);
 	}
 	return node;
 }
@@ -430,10 +430,10 @@ int io_files_update(struct io_kiocb *req, unsigned int issue_flags)
 	if (up->offset == IORING_FILE_INDEX_ALLOC) {
 		ret = io_files_update_with_index_alloc(req, issue_flags);
 	} else {
-		io_ring_submit_lock(ctx, issue_flags);
+		io_ring_submit_lock(req->sq, issue_flags);
 		ret = __io_register_rsrc_update(ctx, IORING_RSRC_FILE,
 						&up2, up->nr_args);
-		io_ring_submit_unlock(ctx, issue_flags);
+		io_ring_submit_unlock(req->sq, issue_flags);
 	}
 
 	if (ret < 0)
@@ -444,10 +444,8 @@ int io_files_update(struct io_kiocb *req, unsigned int issue_flags)
 
 void io_free_rsrc_node(struct io_ring_ctx *ctx, struct io_rsrc_node *node)
 {
-	lockdep_assert_held(&ctx->uring_lock);
-
 	if (node->tag)
-		io_post_aux_cqe(ctx, node->tag, 0, 0);
+		io_post_aux_cqe(ctx->s, node->tag, 0, 0);
 
 	switch (node->type) {
 	case IORING_RSRC_FILE:
@@ -957,7 +955,7 @@ static int io_clone_buffers(struct io_ring_ctx *ctx, struct io_ring_ctx *src_ctx
 
 		if (src_node) {
 			data.nodes[i] = src_node;
-			src_node->refs++;
+			atomic_inc(&src_node->refs);
 		}
 	}
 

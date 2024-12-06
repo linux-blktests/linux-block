@@ -86,17 +86,10 @@ static inline void napi_show_fdinfo(struct io_ring_ctx *ctx,
 }
 #endif
 
-/*
- * Caller holds a reference to the file already, we don't need to do
- * anything else to get an extra reference.
- */
-__cold void io_uring_show_fdinfo(struct seq_file *m, struct file *file)
+static void io_uring_show_s(struct seq_file *m, struct io_sq_cq *s, int idx)
 {
-	struct io_ring_ctx *ctx = file->private_data;
-	struct io_overflow_cqe *ocqe;
-	struct io_rings *r = ctx->rings;
-	struct rusage sq_usage;
-	unsigned int sq_mask = ctx->sq_entries - 1, cq_mask = ctx->cq_entries - 1;
+	struct io_rings *r = s->rings;
+	unsigned int sq_mask = s->sq_entries - 1, cq_mask = s->cq_entries - 1;
 	unsigned int sq_head = READ_ONCE(r->sq.head);
 	unsigned int sq_tail = READ_ONCE(r->sq.tail);
 	unsigned int cq_head = READ_ONCE(r->cq.head);
@@ -104,14 +97,11 @@ __cold void io_uring_show_fdinfo(struct seq_file *m, struct file *file)
 	unsigned int cq_shift = 0;
 	unsigned int sq_shift = 0;
 	unsigned int sq_entries, cq_entries;
-	int sq_pid = -1, sq_cpu = -1;
-	u64 sq_total_time = 0, sq_work_time = 0;
-	bool has_lock;
 	unsigned int i;
 
-	if (ctx->flags & IORING_SETUP_CQE32)
+	if (s->ctx->flags & IORING_SETUP_CQE32)
 		cq_shift = 1;
-	if (ctx->flags & IORING_SETUP_SQE128)
+	if (s->ctx->flags & IORING_SETUP_SQE128)
 		sq_shift = 1;
 
 	/*
@@ -120,27 +110,29 @@ __cold void io_uring_show_fdinfo(struct seq_file *m, struct file *file)
 	 * and sq_tail and cq_head are changed by userspace. But it's ok since
 	 * we usually use these info when it is stuck.
 	 */
+	seq_printf(m, "Issuer:\t%d\n", idx);
 	seq_printf(m, "SqMask:\t0x%x\n", sq_mask);
 	seq_printf(m, "SqHead:\t%u\n", sq_head);
 	seq_printf(m, "SqTail:\t%u\n", sq_tail);
-	seq_printf(m, "CachedSqHead:\t%u\n", ctx->cached_sq_head);
+	seq_printf(m, "CachedSqHead:\t%u\n", s->cached_sq_head);
 	seq_printf(m, "CqMask:\t0x%x\n", cq_mask);
 	seq_printf(m, "CqHead:\t%u\n", cq_head);
 	seq_printf(m, "CqTail:\t%u\n", cq_tail);
-	seq_printf(m, "CachedCqTail:\t%u\n", ctx->cached_cq_tail);
+	seq_printf(m, "CachedCqTail:\t%u\n", s->cached_cq_tail);
 	seq_printf(m, "SQEs:\t%u\n", sq_tail - sq_head);
-	sq_entries = min(sq_tail - sq_head, ctx->sq_entries);
+	sq_entries = min(sq_tail - sq_head, s->sq_entries);
+
 	for (i = 0; i < sq_entries; i++) {
 		unsigned int entry = i + sq_head;
 		struct io_uring_sqe *sqe;
 		unsigned int sq_idx;
 
-		if (ctx->flags & IORING_SETUP_NO_SQARRAY)
+		if (s->ring_flags & IORING_SETUP_NO_SQARRAY)
 			break;
-		sq_idx = READ_ONCE(ctx->sq_array[entry & sq_mask]);
+		sq_idx = READ_ONCE(s->sq_array[entry & sq_mask]);
 		if (sq_idx > sq_mask)
 			continue;
-		sqe = &ctx->sq_sqes[sq_idx << sq_shift];
+		sqe = &s->sq_sqes[sq_idx << sq_shift];
 		seq_printf(m, "%5u: opcode:%s, fd:%d, flags:%x, off:%llu, "
 			      "addr:0x%llx, rw_flags:0x%x, buf_index:%d "
 			      "user_data:%llu",
@@ -162,7 +154,7 @@ __cold void io_uring_show_fdinfo(struct seq_file *m, struct file *file)
 		seq_printf(m, "\n");
 	}
 	seq_printf(m, "CQEs:\t%u\n", cq_tail - cq_head);
-	cq_entries = min(cq_tail - cq_head, ctx->cq_entries);
+	cq_entries = min(cq_tail - cq_head, s->cq_entries);
 	for (i = 0; i < cq_entries; i++) {
 		unsigned int entry = i + cq_head;
 		struct io_uring_cqe *cqe = &r->cqes[(entry & cq_mask) << cq_shift];
@@ -175,6 +167,25 @@ __cold void io_uring_show_fdinfo(struct seq_file *m, struct file *file)
 					cqe->big_cqe[0], cqe->big_cqe[1]);
 		seq_printf(m, "\n");
 	}
+}
+
+/*
+ * Caller holds a reference to the file already, we don't need to do
+ * anything else to get an extra reference.
+ */
+__cold void io_uring_show_fdinfo(struct seq_file *m, struct file *file)
+{
+	struct io_ring_ctx *ctx = file->private_data;
+	struct io_overflow_cqe *ocqe;
+	struct rusage sq_usage;
+	int sq_pid = -1, sq_cpu = -1;
+	u64 sq_total_time = 0, sq_work_time = 0;
+	struct io_sq_cq *s;
+	bool has_lock;
+	unsigned int i;
+
+	io_for_each_s(ctx, s, i)
+		io_uring_show_s(m, s, i);
 
 	/*
 	 * Avoid ABBA deadlock between the seq lock and the io_uring mutex,
@@ -237,8 +248,8 @@ __cold void io_uring_show_fdinfo(struct seq_file *m, struct file *file)
 	}
 
 	seq_puts(m, "PollList:\n");
-	for (i = 0; has_lock && i < (1U << ctx->cancel_table.hash_bits); i++) {
-		struct io_hash_bucket *hb = &ctx->cancel_table.hbs[i];
+	for (i = 0; has_lock && i < (1U << ctx->s->cancel_table.hash_bits); i++) {
+		struct io_hash_bucket *hb = &ctx->s->cancel_table.hbs[i];
 		struct io_kiocb *req;
 
 		hlist_for_each_entry(req, &hb->list, hash_node)

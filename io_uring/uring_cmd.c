@@ -23,7 +23,7 @@ static void io_req_uring_cleanup(struct io_kiocb *req, unsigned int issue_flags)
 
 	if (issue_flags & IO_URING_F_UNLOCKED)
 		return;
-	if (io_alloc_cache_put(&req->ctx->uring_cache, cache)) {
+	if (io_alloc_cache_put(&req->sq->uring_cache, cache)) {
 		ioucmd->sqe = NULL;
 		req->async_data = NULL;
 		req->flags &= ~REQ_F_ASYNC_DATA;
@@ -57,7 +57,7 @@ bool io_uring_try_cancel_uring_cmd(struct io_ring_ctx *ctx,
 			ret = true;
 		}
 	}
-	io_submit_flush_completions(ctx);
+	io_submit_flush_completions(ctx->s);
 	return ret;
 }
 
@@ -71,9 +71,9 @@ static void io_uring_cmd_del_cancelable(struct io_uring_cmd *cmd,
 		return;
 
 	cmd->flags &= ~IORING_URING_CMD_CANCELABLE;
-	io_ring_submit_lock(ctx, issue_flags);
+	io_ring_submit_lock(ctx->s, issue_flags);
 	hlist_del(&req->hash_node);
-	io_ring_submit_unlock(ctx, issue_flags);
+	io_ring_submit_unlock(ctx->s, issue_flags);
 }
 
 /*
@@ -93,9 +93,9 @@ void io_uring_cmd_mark_cancelable(struct io_uring_cmd *cmd,
 
 	if (!(cmd->flags & IORING_URING_CMD_CANCELABLE)) {
 		cmd->flags |= IORING_URING_CMD_CANCELABLE;
-		io_ring_submit_lock(ctx, issue_flags);
+		io_ring_submit_lock(ctx->s, issue_flags);
 		hlist_add_head(&req->hash_node, &ctx->cancelable_uring_cmd);
-		io_ring_submit_unlock(ctx, issue_flags);
+		io_ring_submit_unlock(ctx->s, issue_flags);
 	}
 }
 EXPORT_SYMBOL_GPL(io_uring_cmd_mark_cancelable);
@@ -155,7 +155,7 @@ void io_uring_cmd_done(struct io_uring_cmd *ioucmd, ssize_t ret, u64 res2,
 	} else if (issue_flags & IO_URING_F_COMPLETE_DEFER) {
 		if (WARN_ON_ONCE(issue_flags & IO_URING_F_UNLOCKED))
 			return;
-		io_req_complete_defer(req);
+		io_req_complete_defer(req, req->sq);
 	} else {
 		req->io_task_work.func = io_req_task_complete;
 		io_req_task_work_add(req);
@@ -169,7 +169,7 @@ static int io_uring_cmd_prep_setup(struct io_kiocb *req,
 	struct io_uring_cmd *ioucmd = io_kiocb_to_cmd(req, struct io_uring_cmd);
 	struct uring_cache *cache;
 
-	cache = io_uring_alloc_async_data(&req->ctx->uring_cache, req, NULL);
+	cache = io_uring_alloc_async_data(&req->sq->uring_cache, req, NULL);
 	if (!cache)
 		return -ENOMEM;
 

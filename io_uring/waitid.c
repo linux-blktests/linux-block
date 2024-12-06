@@ -166,7 +166,7 @@ int io_waitid_cancel(struct io_ring_ctx *ctx, struct io_cancel_data *cd,
 	if (cd->flags & (IORING_ASYNC_CANCEL_FD|IORING_ASYNC_CANCEL_FD_FIXED))
 		return -ENOENT;
 
-	io_ring_submit_lock(ctx, issue_flags);
+	io_ring_submit_lock(ctx->s, issue_flags);
 	hlist_for_each_entry_safe(req, tmp, &ctx->waitid_list, hash_node) {
 		if (req->cqe.user_data != cd->data &&
 		    !(cd->flags & IORING_ASYNC_CANCEL_ANY))
@@ -176,7 +176,7 @@ int io_waitid_cancel(struct io_ring_ctx *ctx, struct io_cancel_data *cd,
 		if (!(cd->flags & IORING_ASYNC_CANCEL_ALL))
 			break;
 	}
-	io_ring_submit_unlock(ctx, issue_flags);
+	io_ring_submit_unlock(ctx->s, issue_flags);
 
 	if (nr)
 		return nr;
@@ -225,10 +225,9 @@ static inline bool io_waitid_drop_issue_ref(struct io_kiocb *req)
 static void io_waitid_cb(struct io_kiocb *req, struct io_tw_state *ts)
 {
 	struct io_waitid_async *iwa = req->async_data;
-	struct io_ring_ctx *ctx = req->ctx;
 	int ret;
 
-	io_tw_lock(ctx, ts);
+	io_tw_lock(ts->sq);
 
 	ret = __do_wait(&iwa->wo);
 
@@ -327,7 +326,7 @@ int io_waitid(struct io_kiocb *req, unsigned int issue_flags)
 	 * dropped. We only need to worry about racing with the wakeup
 	 * callback.
 	 */
-	io_ring_submit_lock(ctx, issue_flags);
+	io_ring_submit_lock(ctx->s, issue_flags);
 	hlist_add_head(&req->hash_node, &ctx->waitid_list);
 
 	init_waitqueue_func_entry(&iwa->wo.child_wait, io_waitid_wait);
@@ -342,7 +341,7 @@ int io_waitid(struct io_kiocb *req, unsigned int issue_flags)
 		 * a waitqueue callback, or if someone cancels it.
 		 */
 		if (!io_waitid_drop_issue_ref(req)) {
-			io_ring_submit_unlock(ctx, issue_flags);
+			io_ring_submit_unlock(ctx->s, issue_flags);
 			return IOU_ISSUE_SKIP_COMPLETE;
 		}
 
@@ -350,7 +349,7 @@ int io_waitid(struct io_kiocb *req, unsigned int issue_flags)
 		 * Wakeup triggered, racing with us. It was prevented from
 		 * completing because of that, queue up the tw to do that.
 		 */
-		io_ring_submit_unlock(ctx, issue_flags);
+		io_ring_submit_unlock(ctx->s, issue_flags);
 		return IOU_ISSUE_SKIP_COMPLETE;
 	}
 
@@ -358,7 +357,7 @@ int io_waitid(struct io_kiocb *req, unsigned int issue_flags)
 	remove_wait_queue(iw->head, &iwa->wo.child_wait);
 	ret = io_waitid_finish(req, ret);
 
-	io_ring_submit_unlock(ctx, issue_flags);
+	io_ring_submit_unlock(ctx->s, issue_flags);
 done:
 	if (ret < 0)
 		req_set_fail(req);

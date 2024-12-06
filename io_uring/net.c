@@ -147,7 +147,7 @@ static void io_netmsg_recycle(struct io_kiocb *req, unsigned int issue_flags)
 
 	/* Let normal cleanup path reap it if we fail adding to the cache */
 	iov = hdr->free_iov;
-	if (io_alloc_cache_put(&req->ctx->netmsg_cache, hdr)) {
+	if (io_alloc_cache_put(&req->sq->netmsg_cache, hdr)) {
 		if (iov)
 			kasan_mempool_poison_object(iov);
 		req->async_data = NULL;
@@ -165,10 +165,9 @@ static void io_msg_async_data_init(void *obj)
 
 static struct io_async_msghdr *io_msg_alloc_async(struct io_kiocb *req)
 {
-	struct io_ring_ctx *ctx = req->ctx;
 	struct io_async_msghdr *hdr;
 
-	hdr = io_uring_alloc_async_data(&ctx->netmsg_cache, req,
+	hdr = io_uring_alloc_async_data(&req->sq->netmsg_cache, req,
 					io_msg_async_data_init);
 	if (!hdr)
 		return NULL;
@@ -1228,7 +1227,6 @@ void io_send_zc_cleanup(struct io_kiocb *req)
 int io_send_zc_prep(struct io_kiocb *req, const struct io_uring_sqe *sqe)
 {
 	struct io_sr_msg *zc = io_kiocb_to_cmd(req, struct io_sr_msg);
-	struct io_ring_ctx *ctx = req->ctx;
 	struct io_kiocb *notif;
 
 	zc->done_io = 0;
@@ -1240,7 +1238,7 @@ int io_send_zc_prep(struct io_kiocb *req, const struct io_uring_sqe *sqe)
 	if (req->flags & REQ_F_CQE_SKIP)
 		return -EINVAL;
 
-	notif = zc->notif = io_alloc_notif(ctx);
+	notif = zc->notif = io_alloc_notif(req->sq);
 	if (!notif)
 		return -ENOMEM;
 	notif->cqe.user_data = req->cqe.user_data;
@@ -1346,13 +1344,13 @@ static int io_send_zc_import(struct io_kiocb *req, unsigned int issue_flags)
 		struct io_rsrc_node *node;
 
 		ret = -EFAULT;
-		io_ring_submit_lock(ctx, issue_flags);
+		io_ring_submit_lock(req->sq, issue_flags);
 		node = io_rsrc_node_lookup(&ctx->buf_table, sr->buf_index);
 		if (node) {
 			io_req_assign_buf_node(sr->notif, node);
 			ret = 0;
 		}
-		io_ring_submit_unlock(ctx, issue_flags);
+		io_ring_submit_unlock(req->sq, issue_flags);
 
 		if (unlikely(ret))
 			return ret;

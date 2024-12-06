@@ -23,7 +23,7 @@ struct io_notif_data {
 	bool			zc_copied;
 };
 
-struct io_kiocb *io_alloc_notif(struct io_ring_ctx *ctx);
+struct io_kiocb *io_alloc_notif(struct io_sq_cq *s);
 void io_tx_ubuf_complete(struct sk_buff *skb, struct ubuf_info *uarg,
 			 bool success);
 

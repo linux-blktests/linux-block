@@ -15,7 +15,7 @@ enum {
 
 struct io_rsrc_node {
 	unsigned char			type;
-	int				refs;
+	atomic_t			refs;
 
 	u64 tag;
 	union {
@@ -80,7 +80,7 @@ static inline struct io_rsrc_node *io_rsrc_node_lookup(struct io_rsrc_data *data
 
 static inline void io_put_rsrc_node(struct io_ring_ctx *ctx, struct io_rsrc_node *node)
 {
-	if (node && !--node->refs)
+	if (node && atomic_dec_and_test(&node->refs))
 		io_free_rsrc_node(ctx, node);
 }
 
@@ -111,7 +111,7 @@ static inline void io_req_put_rsrc_nodes(struct io_kiocb *req)
 static inline void io_req_assign_rsrc_node(struct io_rsrc_node **dst_node,
 					   struct io_rsrc_node *node)
 {
-	node->refs++;
+	atomic_inc(&node->refs);
 	*dst_node = node;
 }
 

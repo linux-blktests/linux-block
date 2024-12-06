@@ -65,15 +65,15 @@ static struct file *io_splice_get_file(struct io_kiocb *req,
 	if (!(sp->flags & SPLICE_F_FD_IN_FIXED))
 		return io_file_get_normal(req, sp->splice_fd_in);
 
-	io_ring_submit_lock(ctx, issue_flags);
+	io_ring_submit_lock(ctx->s, issue_flags);
 	node = io_rsrc_node_lookup(&ctx->file_table.data, sp->splice_fd_in);
 	if (node) {
-		node->refs++;
+		atomic_inc(&node->refs);
 		sp->rsrc_node = node;
 		file = io_slot_file(node);
 		req->flags |= REQ_F_NEED_CLEANUP;
 	}
-	io_ring_submit_unlock(ctx, issue_flags);
+	io_ring_submit_unlock(ctx->s, issue_flags);
 	return file;
 }
 

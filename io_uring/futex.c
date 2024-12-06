@@ -33,15 +33,15 @@ struct io_futex_data {
 
 #define IO_FUTEX_ALLOC_CACHE_MAX	32
 
-bool io_futex_cache_init(struct io_ring_ctx *ctx)
+bool io_futex_cache_init(struct io_sq_cq *s)
 {
-	return io_alloc_cache_init(&ctx->futex_cache, IO_FUTEX_ALLOC_CACHE_MAX,
+	return io_alloc_cache_init(&s->futex_cache, IO_FUTEX_ALLOC_CACHE_MAX,
 				sizeof(struct io_futex_data));
 }
 
-void io_futex_cache_free(struct io_ring_ctx *ctx)
+void io_futex_cache_free(struct io_sq_cq *s)
 {
-	io_alloc_cache_free(&ctx->futex_cache, kfree);
+	io_alloc_cache_free(&s->futex_cache, kfree);
 }
 
 static void __io_futex_complete(struct io_kiocb *req, struct io_tw_state *ts)
@@ -54,10 +54,10 @@ static void __io_futex_complete(struct io_kiocb *req, struct io_tw_state *ts)
 static void io_futex_complete(struct io_kiocb *req, struct io_tw_state *ts)
 {
 	struct io_futex_data *ifd = req->async_data;
-	struct io_ring_ctx *ctx = req->ctx;
+	struct io_sq_cq *s = ts->sq;
 
-	io_tw_lock(ctx, ts);
-	if (!io_alloc_cache_put(&ctx->futex_cache, ifd))
+	io_tw_lock(s);
+	if (!io_alloc_cache_put(&s->futex_cache, ifd))
 		kfree(ifd);
 	__io_futex_complete(req, ts);
 }
@@ -67,7 +67,7 @@ static void io_futexv_complete(struct io_kiocb *req, struct io_tw_state *ts)
 	struct io_futex *iof = io_kiocb_to_cmd(req, struct io_futex);
 	struct futex_vector *futexv = req->async_data;
 
-	io_tw_lock(req->ctx, ts);
+	io_tw_lock(ts->sq);
 
 	if (!iof->futexv_unqueued) {
 		int res;
@@ -123,7 +123,7 @@ int io_futex_cancel(struct io_ring_ctx *ctx, struct io_cancel_data *cd,
 	if (cd->flags & (IORING_ASYNC_CANCEL_FD|IORING_ASYNC_CANCEL_FD_FIXED))
 		return -ENOENT;
 
-	io_ring_submit_lock(ctx, issue_flags);
+	io_ring_submit_lock(ctx->s, issue_flags);
 	hlist_for_each_entry_safe(req, tmp, &ctx->futex_list, hash_node) {
 		if (req->cqe.user_data != cd->data &&
 		    !(cd->flags & IORING_ASYNC_CANCEL_ANY))
@@ -133,7 +133,7 @@ int io_futex_cancel(struct io_ring_ctx *ctx, struct io_cancel_data *cd,
 		if (!(cd->flags & IORING_ASYNC_CANCEL_ALL))
 			break;
 	}
-	io_ring_submit_unlock(ctx, issue_flags);
+	io_ring_submit_unlock(ctx->s, issue_flags);
 
 	if (nr)
 		return nr;
@@ -258,7 +258,7 @@ int io_futexv_wait(struct io_kiocb *req, unsigned int issue_flags)
 	struct io_ring_ctx *ctx = req->ctx;
 	int ret, woken = -1;
 
-	io_ring_submit_lock(ctx, issue_flags);
+	io_ring_submit_lock(ctx->s, issue_flags);
 
 	ret = futex_wait_multiple_setup(futexv, iof->futex_nr, &woken);
 
@@ -266,7 +266,7 @@ int io_futexv_wait(struct io_kiocb *req, unsigned int issue_flags)
 	 * Error case, ret is < 0. Mark the request as failed.
 	 */
 	if (unlikely(ret < 0)) {
-		io_ring_submit_unlock(ctx, issue_flags);
+		io_ring_submit_unlock(ctx->s, issue_flags);
 		req_set_fail(req);
 		io_req_set_res(req, ret, 0);
 		kfree(futexv);
@@ -302,7 +302,7 @@ int io_futexv_wait(struct io_kiocb *req, unsigned int issue_flags)
 			io_req_set_res(req, woken, 0);
 	}
 
-	io_ring_submit_unlock(ctx, issue_flags);
+	io_ring_submit_unlock(ctx->s, issue_flags);
 	return IOU_ISSUE_SKIP_COMPLETE;
 }
 
@@ -312,6 +312,7 @@ int io_futex_wait(struct io_kiocb *req, unsigned int issue_flags)
 	struct io_ring_ctx *ctx = req->ctx;
 	struct io_futex_data *ifd = NULL;
 	struct futex_hash_bucket *hb;
+	struct io_sq_cq *s = req->sq;
 	int ret;
 
 	if (!iof->futex_mask) {
@@ -319,8 +320,8 @@ int io_futex_wait(struct io_kiocb *req, unsigned int issue_flags)
 		goto done;
 	}
 
-	io_ring_submit_lock(ctx, issue_flags);
-	ifd = io_cache_alloc(&ctx->futex_cache, GFP_NOWAIT, NULL);
+	io_ring_submit_lock(s, issue_flags);
+	ifd = io_cache_alloc(&s->futex_cache, GFP_NOWAIT, NULL);
 	if (!ifd) {
 		ret = -ENOMEM;
 		goto done_unlock;
@@ -336,14 +337,14 @@ int io_futex_wait(struct io_kiocb *req, unsigned int issue_flags)
 			       &ifd->q, &hb);
 	if (!ret) {
 		hlist_add_head(&req->hash_node, &ctx->futex_list);
-		io_ring_submit_unlock(ctx, issue_flags);
+		io_ring_submit_unlock(s, issue_flags);
 
 		futex_queue(&ifd->q, hb);
 		return IOU_ISSUE_SKIP_COMPLETE;
 	}
 
 done_unlock:
-	io_ring_submit_unlock(ctx, issue_flags);
+	io_ring_submit_unlock(s, issue_flags);
 done:
 	if (ret < 0)
 		req_set_fail(req);

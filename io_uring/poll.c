@@ -120,10 +120,10 @@ static struct io_poll *io_poll_get_single(struct io_kiocb *req)
 
 static void io_poll_req_insert(struct io_kiocb *req)
 {
-	struct io_hash_table *table = &req->ctx->cancel_table;
+	struct io_hash_table *table = &req->sq->cancel_table;
 	u32 index = hash_long(req->cqe.user_data, table->hash_bits);
 
-	lockdep_assert_held(&req->ctx->uring_lock);
+	lockdep_assert_held(&req->sq->ring_lock);
 
 	hlist_add_head(&req->hash_node, &table->hbs[index].list);
 }
@@ -341,7 +341,7 @@ void io_poll_task_func(struct io_kiocb *req, struct io_tw_state *ts)
 		io_req_set_res(req, req->cqe.res, 0);
 		io_req_task_complete(req, ts);
 	} else {
-		io_tw_lock(req->ctx, ts);
+		io_tw_lock(ts->sq);
 
 		if (ret == IOU_POLL_REMOVE_POLL_USE_RES)
 			io_req_task_complete(req, ts);
@@ -524,11 +524,11 @@ static bool io_poll_can_finish_inline(struct io_kiocb *req,
 
 static void io_poll_add_hash(struct io_kiocb *req, unsigned int issue_flags)
 {
-	struct io_ring_ctx *ctx = req->ctx;
+	struct io_sq_cq *s = req->sq;
 
-	io_ring_submit_lock(ctx, issue_flags);
+	io_ring_submit_lock(s, issue_flags);
 	io_poll_req_insert(req);
-	io_ring_submit_unlock(ctx, issue_flags);
+	io_ring_submit_unlock(s, issue_flags);
 }
 
 /*
@@ -642,7 +642,6 @@ static void io_async_queue_proc(struct file *file, struct wait_queue_head *head,
 static struct async_poll *io_req_alloc_apoll(struct io_kiocb *req,
 					     unsigned issue_flags)
 {
-	struct io_ring_ctx *ctx = req->ctx;
 	struct async_poll *apoll;
 
 	if (req->flags & REQ_F_POLLED) {
@@ -650,7 +649,7 @@ static struct async_poll *io_req_alloc_apoll(struct io_kiocb *req,
 		kfree(apoll->double_poll);
 	} else {
 		if (!(issue_flags & IO_URING_F_UNLOCKED))
-			apoll = io_cache_alloc(&ctx->apoll_cache, GFP_ATOMIC, NULL);
+			apoll = io_cache_alloc(&req->sq->apoll_cache, GFP_ATOMIC, NULL);
 		else
 			apoll = kmalloc(sizeof(*apoll), GFP_ATOMIC);
 		if (!apoll)
@@ -707,22 +706,17 @@ int io_arm_poll_handler(struct io_kiocb *req, unsigned issue_flags)
 	return IO_APOLL_OK;
 }
 
-/*
- * Returns true if we found and killed one or more poll requests
- */
-__cold bool io_poll_remove_all(struct io_ring_ctx *ctx, struct io_uring_task *tctx,
-			       bool cancel_all)
+static bool __io_poll_remove_all(struct io_sq_cq *s, struct io_uring_task *tctx,
+				 bool cancel_all)
 {
-	unsigned nr_buckets = 1U << ctx->cancel_table.hash_bits;
+	unsigned nr_buckets = 1U << s->cancel_table.hash_bits;
 	struct hlist_node *tmp;
 	struct io_kiocb *req;
 	bool found = false;
 	int i;
 
-	lockdep_assert_held(&ctx->uring_lock);
-
 	for (i = 0; i < nr_buckets; i++) {
-		struct io_hash_bucket *hb = &ctx->cancel_table.hbs[i];
+		struct io_hash_bucket *hb = &s->cancel_table.hbs[i];
 
 		hlist_for_each_entry_safe(req, tmp, &hb->list, hash_node) {
 			if (io_match_task_safe(req, tctx, cancel_all)) {
@@ -735,12 +729,31 @@ __cold bool io_poll_remove_all(struct io_ring_ctx *ctx, struct io_uring_task *tc
 	return found;
 }
 
-static struct io_kiocb *io_poll_find(struct io_ring_ctx *ctx, bool poll_only,
+/*
+ * Returns true if we found and killed one or more poll requests
+ */
+__cold bool io_poll_remove_all(struct io_ring_ctx *ctx, struct io_uring_task *tctx,
+			       bool cancel_all)
+{
+	struct io_sq_cq *s;
+	bool found;
+	int i;
+
+	lockdep_assert_held(&ctx->uring_lock);
+
+	found = false;
+	io_for_each_s(ctx, s, i)
+		found |= __io_poll_remove_all(s, tctx, cancel_all);
+
+	return found;
+}
+
+static struct io_kiocb *__io_poll_find(struct io_sq_cq *s, bool poll_only,
 				     struct io_cancel_data *cd)
 {
 	struct io_kiocb *req;
-	u32 index = hash_long(cd->data, ctx->cancel_table.hash_bits);
-	struct io_hash_bucket *hb = &ctx->cancel_table.hbs[index];
+	u32 index = hash_long(cd->data, s->cancel_table.hash_bits);
+	struct io_hash_bucket *hb = &s->cancel_table.hbs[index];
 
 	hlist_for_each_entry(req, &hb->list, hash_node) {
 		if (cd->data != req->cqe.user_data)
@@ -756,21 +769,54 @@ static struct io_kiocb *io_poll_find(struct io_ring_ctx *ctx, bool poll_only,
 	return NULL;
 }
 
-static struct io_kiocb *io_poll_file_find(struct io_ring_ctx *ctx,
-					  struct io_cancel_data *cd)
+static struct io_kiocb *io_poll_find(struct io_ring_ctx *ctx, bool poll_only,
+				     struct io_cancel_data *cd)
 {
-	unsigned nr_buckets = 1U << ctx->cancel_table.hash_bits;
+	struct io_kiocb *req;
+	struct io_sq_cq *s;
+	int i;
+
+	io_for_each_s(ctx, s, i) {
+		req = __io_poll_find(s, poll_only, cd);
+		if (req)
+			return req;
+	}
+
+	return NULL;
+}
+
+static struct io_kiocb *__io_poll_file_find(struct io_sq_cq *s,
+					    struct io_cancel_data *cd)
+{
+	unsigned nr_buckets = 1U << s->cancel_table.hash_bits;
 	struct io_kiocb *req;
 	int i;
 
 	for (i = 0; i < nr_buckets; i++) {
-		struct io_hash_bucket *hb = &ctx->cancel_table.hbs[i];
+		struct io_hash_bucket *hb = &s->cancel_table.hbs[i];
 
 		hlist_for_each_entry(req, &hb->list, hash_node) {
 			if (io_cancel_req_match(req, cd))
 				return req;
 		}
 	}
+	return NULL;
+}
+
+
+static struct io_kiocb *io_poll_file_find(struct io_ring_ctx *ctx,
+					  struct io_cancel_data *cd)
+{
+	struct io_kiocb *req;
+	struct io_sq_cq *s;
+	int i;
+
+	io_for_each_s(ctx, s, i) {
+		req = __io_poll_file_find(s, cd);
+		if (req)
+			return req;
+	}
+
 	return NULL;
 }
 
@@ -807,9 +853,9 @@ int io_poll_cancel(struct io_ring_ctx *ctx, struct io_cancel_data *cd,
 {
 	int ret;
 
-	io_ring_submit_lock(ctx, issue_flags);
+	io_ring_submit_lock(ctx->s, issue_flags);
 	ret = __io_poll_cancel(ctx, cd);
-	io_ring_submit_unlock(ctx, issue_flags);
+	io_ring_submit_unlock(ctx->s, issue_flags);
 	return ret;
 }
 
@@ -901,7 +947,7 @@ int io_poll_remove(struct io_kiocb *req, unsigned int issue_flags)
 	struct io_kiocb *preq;
 	int ret2, ret = 0;
 
-	io_ring_submit_lock(ctx, issue_flags);
+	io_ring_submit_lock(req->sq, issue_flags);
 	preq = io_poll_find(ctx, true, &cd);
 	ret2 = io_poll_disarm(preq);
 	if (ret2) {
@@ -936,7 +982,7 @@ int io_poll_remove(struct io_kiocb *req, unsigned int issue_flags)
 	preq->io_task_work.func = io_req_task_complete;
 	io_req_task_work_add(preq);
 out:
-	io_ring_submit_unlock(ctx, issue_flags);
+	io_ring_submit_unlock(req->sq, issue_flags);
 	if (ret < 0) {
 		req_set_fail(req);
 		return ret;

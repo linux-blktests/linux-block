@@ -225,6 +225,79 @@ struct io_alloc_cache {
 	size_t			elem_size;
 };
 
+struct io_sq_cq {
+	struct task_struct	*submitter_task;
+
+	struct io_ring_ctx	*ctx;
+	unsigned int		ring_flags;
+
+	/*
+	 * Held over submit for this io_sq_cq, and protects the data
+	 * structures in here as well.
+	 */
+	struct mutex		ring_lock;
+
+	struct io_rings		*rings;
+
+	/*
+	 * Ring buffer of indices into array of io_uring_sqe, which is
+	 * mmapped by the application using the IORING_OFF_SQES offset.
+	 *
+	 * This indirection could e.g. be used to assign fixed
+	 * io_uring_sqe entries to operations and only submit them to
+	 * the queue when needed.
+	 *
+	 * The kernel modifies neither the indices array nor the entries
+	 * array.
+	 */
+	u32			*sq_array;
+	struct io_uring_sqe	*sq_sqes;
+	unsigned		cached_sq_head;
+	unsigned		sq_entries;
+
+	struct io_submit_state	submit_state;
+
+	struct io_alloc_cache	apoll_cache;
+	struct io_alloc_cache	netmsg_cache;
+	struct io_alloc_cache	rw_cache;
+	struct io_alloc_cache	uring_cache;
+#ifdef CONFIG_FUTEX
+	struct io_alloc_cache	futex_cache;
+#endif
+
+	struct io_alloc_cache		msg_cache;
+	spinlock_t			msg_lock;
+
+	/*
+	 * We cache a range of free CQEs we can use, once exhausted it
+	 * should go through a slower range setup, see __io_get_cqe()
+	 */
+	struct io_uring_cqe	*cqe_cached;
+	struct io_uring_cqe	*cqe_sentinel;
+
+	unsigned		cached_cq_tail;
+	unsigned		cq_entries;
+	unsigned		cq_extra;
+
+	struct io_hash_table	cancel_table;
+
+	/*
+	 * task_work and async notification delivery cacheline. Expected to
+	 * regularly bounce b/w CPUs.
+	 */
+	struct {
+		struct llist_head	work_llist;
+		struct llist_head	retry_llist;
+		unsigned long		check_cq;
+		atomic_t		cq_wait_nr;
+		atomic_t		cq_timeouts;
+		struct wait_queue_head	cq_wait;
+	} ____cacheline_aligned_in_smp;
+
+	struct io_mapped_region		sq_region;
+	struct io_mapped_region		ring_region;
+};
+
 struct io_ring_ctx {
 	/* const or read-mostly hot data */
 	struct {
@@ -243,8 +316,6 @@ struct io_ring_ctx {
 		unsigned int		compat: 1;
 		unsigned int		iowq_limits_set : 1;
 
-		struct task_struct	*submitter_task;
-		struct io_rings		*rings;
 		struct percpu_ref	refs;
 
 		clockid_t		clockid;
@@ -252,27 +323,16 @@ struct io_ring_ctx {
 
 		enum task_work_notify_mode	notify_method;
 		unsigned			sq_thread_idle;
+
+		unsigned int		nr_sq;
 	} ____cacheline_aligned_in_smp;
+
+	struct io_sq_cq __s;
+	struct io_sq_cq *s;
 
 	/* submission data */
 	struct {
 		struct mutex		uring_lock;
-
-		/*
-		 * Ring buffer of indices into array of io_uring_sqe, which is
-		 * mmapped by the application using the IORING_OFF_SQES offset.
-		 *
-		 * This indirection could e.g. be used to assign fixed
-		 * io_uring_sqe entries to operations and only submit them to
-		 * the queue when needed.
-		 *
-		 * The kernel modifies neither the indices array nor the entries
-		 * array.
-		 */
-		u32			*sq_array;
-		struct io_uring_sqe	*sq_sqes;
-		unsigned		cached_sq_head;
-		unsigned		sq_entries;
 
 		/*
 		 * Fixed resources fast path, should be accessed only under
@@ -289,10 +349,12 @@ struct io_ring_ctx {
 		bool			poll_multi_queue;
 		struct io_wq_work_list	iopoll_list;
 
+		/*
+		 * Read side protected by s->ring_lock, write side must grab
+		 * all ring locks.
+		 */
 		struct io_file_table	file_table;
 		struct io_rsrc_data	buf_table;
-
-		struct io_submit_state	submit_state;
 
 		/*
 		 * Modifications are protected by ->uring_lock and ->mmap_lock.
@@ -300,12 +362,6 @@ struct io_ring_ctx {
 		 * once published.
 		 */
 		struct xarray		io_bl_xa;
-
-		struct io_hash_table	cancel_table;
-		struct io_alloc_cache	apoll_cache;
-		struct io_alloc_cache	netmsg_cache;
-		struct io_alloc_cache	rw_cache;
-		struct io_alloc_cache	uring_cache;
 
 		/*
 		 * Any cancelable uring_cmd is added to this list in
@@ -320,33 +376,10 @@ struct io_ring_ctx {
 	} ____cacheline_aligned_in_smp;
 
 	struct {
-		/*
-		 * We cache a range of free CQEs we can use, once exhausted it
-		 * should go through a slower range setup, see __io_get_cqe()
-		 */
-		struct io_uring_cqe	*cqe_cached;
-		struct io_uring_cqe	*cqe_sentinel;
-
-		unsigned		cached_cq_tail;
-		unsigned		cq_entries;
 		struct io_ev_fd	__rcu	*io_ev_fd;
-		unsigned		cq_extra;
 
 		void			*cq_wait_arg;
 		size_t			cq_wait_size;
-	} ____cacheline_aligned_in_smp;
-
-	/*
-	 * task_work and async notification delivery cacheline. Expected to
-	 * regularly bounce b/w CPUs.
-	 */
-	struct {
-		struct llist_head	work_llist;
-		struct llist_head	retry_llist;
-		unsigned long		check_cq;
-		atomic_t		cq_wait_nr;
-		atomic_t		cq_timeouts;
-		struct wait_queue_head	cq_wait;
 	} ____cacheline_aligned_in_smp;
 
 	/* timeouts */
@@ -359,14 +392,16 @@ struct io_ring_ctx {
 
 	spinlock_t		completion_lock;
 
+	/* protected by ->completion_lock */
 	struct list_head	io_buffers_comp;
+
+	/* protected by ->uring_lock */
 	struct list_head	cq_overflow_list;
 
 	struct hlist_head	waitid_list;
 
 #ifdef CONFIG_FUTEX
 	struct hlist_head	futex_list;
-	struct io_alloc_cache	futex_cache;
 #endif
 
 	const struct cred	*sq_creds;	/* cred used for __io_sq_thread() */
@@ -405,10 +440,9 @@ struct io_ring_ctx {
 	u32				iowq_limits[2];
 
 	struct callback_head		poll_wq_task_work;
-	struct list_head		defer_list;
 
-	struct io_alloc_cache		msg_cache;
-	spinlock_t			msg_lock;
+	/* protected by ->completion_lock */
+	struct list_head		defer_list;
 
 #ifdef CONFIG_NET_RX_BUSY_POLL
 	struct list_head	napi_list;	/* track busy poll napi_id */
@@ -432,13 +466,12 @@ struct io_ring_ctx {
 	 */
 	struct mutex			mmap_lock;
 
-	struct io_mapped_region		sq_region;
-	struct io_mapped_region		ring_region;
 	/* used for optimised request parameter and wait argument passing  */
 	struct io_mapped_region		param_region;
 };
 
 struct io_tw_state {
+	struct io_sq_cq *sq;
 };
 
 enum {
@@ -632,6 +665,7 @@ struct io_kiocb {
 	struct io_cqe			cqe;
 
 	struct io_ring_ctx		*ctx;
+	struct io_sq_cq			*sq;
 	struct io_uring_task		*tctx;
 
 	union {

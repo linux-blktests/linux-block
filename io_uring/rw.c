@@ -165,7 +165,7 @@ static void io_rw_recycle(struct io_kiocb *req, unsigned int issue_flags)
 		return;
 	}
 	iov = rw->free_iovec;
-	if (io_alloc_cache_put(&req->ctx->rw_cache, rw)) {
+	if (io_alloc_cache_put(&req->sq->rw_cache, rw)) {
 		if (iov)
 			kasan_mempool_poison_object(iov);
 		req->async_data = NULL;
@@ -218,10 +218,9 @@ static void io_rw_async_data_init(void *obj)
 
 static int io_rw_alloc_async(struct io_kiocb *req)
 {
-	struct io_ring_ctx *ctx = req->ctx;
 	struct io_async_rw *rw;
 
-	rw = io_uring_alloc_async_data(&ctx->rw_cache, req, io_rw_async_data_init);
+	rw = io_uring_alloc_async_data(&req->sq->rw_cache, req, io_rw_async_data_init);
 	if (!rw)
 		return -ENOMEM;
 	if (rw->free_iovec) {
@@ -1280,9 +1279,10 @@ static int io_uring_hybrid_poll(struct io_kiocb *req,
 	return ret;
 }
 
-int io_do_iopoll(struct io_ring_ctx *ctx, bool force_nonspin)
+int io_do_iopoll(struct io_sq_cq *s, bool force_nonspin)
 {
 	struct io_wq_work_node *pos, *start, *prev;
+	struct io_ring_ctx *ctx = s->ctx;
 	unsigned int poll_flags = 0;
 	DEFINE_IO_COMP_BATCH(iob);
 	int nr_events = 0;
@@ -1345,10 +1345,10 @@ int io_do_iopoll(struct io_ring_ctx *ctx, bool force_nonspin)
 	pos = start ? start->next : ctx->iopoll_list.first;
 	wq_list_cut(&ctx->iopoll_list, prev, start);
 
-	if (WARN_ON_ONCE(!wq_list_empty(&ctx->submit_state.compl_reqs)))
+	if (WARN_ON_ONCE(!wq_list_empty(&s->submit_state.compl_reqs)))
 		return 0;
-	ctx->submit_state.compl_reqs.first = pos;
-	__io_submit_flush_completions(ctx);
+	s->submit_state.compl_reqs.first = pos;
+	__io_submit_flush_completions(s);
 	return nr_events;
 }
 

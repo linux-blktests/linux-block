@@ -190,9 +190,9 @@ int __io_close_fixed(struct io_ring_ctx *ctx, unsigned int issue_flags,
 {
 	int ret;
 
-	io_ring_submit_lock(ctx, issue_flags);
+	io_ring_submit_lock(ctx->s, issue_flags);
 	ret = io_fixed_fd_remove(ctx, offset);
-	io_ring_submit_unlock(ctx, issue_flags);
+	io_ring_submit_unlock(ctx->s, issue_flags);
 
 	return ret;
 }
