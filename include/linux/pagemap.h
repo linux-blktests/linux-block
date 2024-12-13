@@ -14,6 +14,7 @@
 #include <linux/gfp.h>
 #include <linux/bitops.h>
 #include <linux/hardirq.h> /* for in_interrupt() */
+#include <linux/writeback.h>
 #include <linux/hugetlb_inline.h>
 
 struct folio_batch;
@@ -67,6 +68,14 @@ static inline int filemap_write_and_wait(struct address_space *mapping)
 {
 	return filemap_write_and_wait_range(mapping, 0, LLONG_MAX);
 }
+
+/*
+ * Value passed in to ->write_begin() if IOCB_DONTCACHE is set for the write,
+ * and the ->write_begin() handler on a file system supporting FOP_DONTCACHE
+ * must check for this and pass FGP_DONTCACHE for folio creation.
+ */
+#define foliop_dropbehind			((struct folio *) 0xfee1c001)
+#define foliop_is_dropbehind(foliop)	(*(foliop) == foliop_dropbehind)
 
 /**
  * filemap_set_wb_err - set a writeback error on an address_space
