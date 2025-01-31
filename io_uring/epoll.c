@@ -25,6 +25,7 @@ struct io_epoll {
 struct io_epoll_wait {
 	struct file			*file;
 	int				maxevents;
+	int				flags;
 	struct epoll_event __user	*events;
 	struct wait_queue_entry		wait;
 };
@@ -127,11 +128,12 @@ static void io_epoll_retry(struct io_kiocb *req, struct io_tw_state *ts)
 	io_req_task_submit(req, ts);
 }
 
-static int io_epoll_execute(struct io_kiocb *req)
+static int io_epoll_execute(struct io_kiocb *req, __poll_t mask)
 {
 	struct io_epoll_wait *iew = io_kiocb_to_cmd(req, struct io_epoll_wait);
 
-	list_del_init_careful(&iew->wait.entry);
+	if (mask & EPOLL_URING_WAKE || !(req->flags & REQ_F_APOLL_MULTISHOT))
+		list_del_init_careful(&iew->wait.entry);
 	if (io_poll_get_ownership(req)) {
 		req->io_task_work.func = io_epoll_retry;
 		io_req_task_work_add(req);
@@ -140,13 +142,13 @@ static int io_epoll_execute(struct io_kiocb *req)
 	return 1;
 }
 
-static __cold int io_epoll_pollfree_wake(struct io_kiocb *req)
+static __cold int io_epoll_pollfree_wake(struct io_kiocb *req, __poll_t mask)
 {
 	struct io_epoll_wait *iew = io_kiocb_to_cmd(req, struct io_epoll_wait);
 
 	io_poll_mark_cancelled(req);
 	list_del_init_careful(&iew->wait.entry);
-	io_epoll_execute(req);
+	io_epoll_execute(req, mask);
 	return 1;
 }
 
@@ -156,21 +158,31 @@ static int io_epoll_wait_fn(struct wait_queue_entry *wait, unsigned mode,
 	struct io_kiocb *req = wait->private;
 	__poll_t mask = key_to_poll(key);
 
+	if (mask & EPOLL_SCAN_WAKE)
+		return 0;
 	if (unlikely(mask & POLLFREE))
-		return io_epoll_pollfree_wake(req);
+		return io_epoll_pollfree_wake(req, mask);
 
-	return io_epoll_execute(req);
+	return io_epoll_execute(req, mask);
 }
 
 int io_epoll_wait_prep(struct io_kiocb *req, const struct io_uring_sqe *sqe)
 {
 	struct io_epoll_wait *iew = io_kiocb_to_cmd(req, struct io_epoll_wait);
 
-	if (sqe->off || sqe->rw_flags || sqe->splice_fd_in)
+	if (sqe->off || sqe->splice_fd_in)
 		return -EINVAL;
 
 	iew->maxevents = READ_ONCE(sqe->len);
 	iew->events = u64_to_user_ptr(READ_ONCE(sqe->addr));
+	iew->flags = READ_ONCE(sqe->epoll_flags);
+	if (iew->flags & ~IORING_EPOLL_WAIT_MULTISHOT) {
+		return -EINVAL;
+	} else if (iew->flags & IORING_EPOLL_WAIT_MULTISHOT) {
+		if (!(req->flags & REQ_F_BUFFER_SELECT))
+			return -EINVAL;
+		req->flags |= REQ_F_APOLL_MULTISHOT;
+	}
 	if (req->flags & REQ_F_BUFFER_SELECT && iew->events)
 		return -EINVAL;
 
@@ -193,7 +205,7 @@ int io_epoll_wait(struct io_kiocb *req, unsigned int issue_flags)
 	int ret;
 
 	io_ring_submit_lock(ctx, issue_flags);
-
+retry:
 	if (io_do_buffer_select(req)) {
 		size_t len = maxevents * sizeof(*evs);
 
@@ -204,22 +216,42 @@ int io_epoll_wait(struct io_kiocb *req, unsigned int issue_flags)
 		maxevents = len / sizeof(*evs);
 	}
 
-	ret = epoll_queue(req->file, evs, maxevents, &iew->wait, false);
+	ret = epoll_queue(req->file, evs, maxevents, &iew->wait,
+				req->flags & REQ_F_APOLL_MULTISHOT);
 	if (ret == -EIOCBQUEUED) {
 		io_kbuf_recycle(req, 0);
+skip_complete:
 		if (hlist_unhashed(&req->hash_node))
 			hlist_add_head(&req->hash_node, &ctx->epoll_list);
 		io_ring_submit_unlock(ctx, issue_flags);
 		return IOU_ISSUE_SKIP_COMPLETE;
 	} else if (ret > 0) {
 		cflags = io_put_kbuf(req, ret * sizeof(*evs), 0);
+		if (req->flags & REQ_F_BL_EMPTY)
+			goto stop_multi;
+		if (req->flags & REQ_F_APOLL_MULTISHOT) {
+			if (io_req_post_cqe(req, ret, cflags | IORING_CQE_F_MORE)) {
+				if (ret == maxevents * sizeof(*evs))
+					goto retry;
+				goto skip_complete;
+			}
+			goto stop_multi;
+		}
 	} else if (!ret) {
 		io_kbuf_recycle(req, 0);
 	} else {
 err:
 		req_set_fail(req);
+		if (req->flags & REQ_F_APOLL_MULTISHOT) {
+stop_multi:
+			atomic_or(IO_POLL_FINISH_FLAG, &req->poll_refs);
+			io_poll_multishot_retry(req);
+			epoll_wait_remove(req->file, &iew->wait);
+			req->flags &= ~REQ_F_APOLL_MULTISHOT;
+		}
 	}
-	hlist_del_init(&req->hash_node);
+	if (!(req->flags & REQ_F_APOLL_MULTISHOT))
+		hlist_del_init(&req->hash_node);
 	io_ring_submit_unlock(ctx, issue_flags);
 	io_req_set_res(req, ret, cflags);
 	return IOU_OK;
