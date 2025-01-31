@@ -17,6 +17,7 @@
 #include "timeout.h"
 #include "waitid.h"
 #include "futex.h"
+#include "epoll.h"
 #include "cancel.h"
 
 struct io_cancel {
@@ -125,6 +126,10 @@ int io_try_cancel(struct io_uring_task *tctx, struct io_cancel_data *cd,
 		return ret;
 
 	ret = io_futex_cancel(ctx, cd, issue_flags);
+	if (ret != -ENOENT)
+		return ret;
+
+	ret = io_epoll_wait_cancel(ctx, cd, issue_flags);
 	if (ret != -ENOENT)
 		return ret;
 
