@@ -29,6 +29,9 @@ void eventpoll_release_file(struct file *file);
 int epoll_queue(struct file *file, struct epoll_event __user *events,
 		int maxevents, struct wait_queue_entry *wait, bool persist);
 
+/* Remove wait entry */
+int epoll_wait_remove(struct file *file, struct wait_queue_entry *wait);
+
 /*
  * This is called from inside fs/file_table.c:__fput() to unlink files
  * from the eventpoll interface. We need to have this facility to cleanup
