@@ -10,6 +10,7 @@
 #include <uapi/linux/io_uring.h>
 
 #include "io_uring.h"
+#include "kbuf.h"
 #include "epoll.h"
 #include "poll.h"
 
@@ -165,11 +166,13 @@ int io_epoll_wait_prep(struct io_kiocb *req, const struct io_uring_sqe *sqe)
 {
 	struct io_epoll_wait *iew = io_kiocb_to_cmd(req, struct io_epoll_wait);
 
-	if (sqe->off || sqe->rw_flags || sqe->buf_index || sqe->splice_fd_in)
+	if (sqe->off || sqe->rw_flags || sqe->splice_fd_in)
 		return -EINVAL;
 
 	iew->maxevents = READ_ONCE(sqe->len);
 	iew->events = u64_to_user_ptr(READ_ONCE(sqe->addr));
+	if (req->flags & REQ_F_BUFFER_SELECT && iew->events)
+		return -EINVAL;
 
 	iew->wait.flags = 0;
 	iew->wait.private = req;
@@ -183,22 +186,41 @@ int io_epoll_wait_prep(struct io_kiocb *req, const struct io_uring_sqe *sqe)
 int io_epoll_wait(struct io_kiocb *req, unsigned int issue_flags)
 {
 	struct io_epoll_wait *iew = io_kiocb_to_cmd(req, struct io_epoll_wait);
+	struct epoll_event __user *evs = iew->events;
 	struct io_ring_ctx *ctx = req->ctx;
+	int maxevents = iew->maxevents;
+	unsigned int cflags = 0;
 	int ret;
 
 	io_ring_submit_lock(ctx, issue_flags);
 
-	ret = epoll_queue(req->file, iew->events, iew->maxevents, &iew->wait, false);
+	if (io_do_buffer_select(req)) {
+		size_t len = maxevents * sizeof(*evs);
+
+		ret = -ENOBUFS;
+		evs = io_buffer_select(req, &len, 0);
+		if (unlikely(!evs))
+			goto err;
+		maxevents = len / sizeof(*evs);
+	}
+
+	ret = epoll_queue(req->file, evs, maxevents, &iew->wait, false);
 	if (ret == -EIOCBQUEUED) {
+		io_kbuf_recycle(req, 0);
 		if (hlist_unhashed(&req->hash_node))
 			hlist_add_head(&req->hash_node, &ctx->epoll_list);
 		io_ring_submit_unlock(ctx, issue_flags);
 		return IOU_ISSUE_SKIP_COMPLETE;
-	} else if (ret < 0) {
+	} else if (ret > 0) {
+		cflags = io_put_kbuf(req, ret * sizeof(*evs), 0);
+	} else if (!ret) {
+		io_kbuf_recycle(req, 0);
+	} else {
+err:
 		req_set_fail(req);
 	}
 	hlist_del_init(&req->hash_node);
 	io_ring_submit_unlock(ctx, issue_flags);
-	io_req_set_res(req, ret, 0);
+	io_req_set_res(req, ret, cflags);
 	return IOU_OK;
 }

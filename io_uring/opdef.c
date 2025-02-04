@@ -520,6 +520,7 @@ const struct io_issue_def io_issue_defs[] = {
 		.needs_file		= 1,
 		.unbound_nonreg_file	= 1,
 		.audit_skip		= 1,
+		.buffer_select		= 1,
 #if defined(CONFIG_EPOLL)
 		.prep			= io_epoll_wait_prep,
 		.issue			= io_epoll_wait,
