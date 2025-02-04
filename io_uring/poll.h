@@ -23,6 +23,7 @@ struct async_poll {
 
 #define IO_POLL_CANCEL_FLAG	BIT(31)
 #define IO_POLL_RETRY_FLAG	BIT(30)
+#define IO_POLL_FINISH_FLAG	IO_POLL_RETRY_FLAG
 #define IO_POLL_REF_MASK	GENMASK(29, 0)
 
 bool io_poll_get_ownership_slowpath(struct io_kiocb *req);
