@@ -1996,6 +1996,43 @@ static int ep_try_send_events(struct eventpoll *ep,
 	return res;
 }
 
+static int ep_poll_queue(struct eventpoll *ep,
+			 struct epoll_event __user *events, int maxevents,
+			 struct wait_queue_entry *wait, bool persist)
+{
+	int res = 0, eavail;
+
+	/* See ep_poll() for commentary */
+	eavail = ep_events_available(ep);
+	while (1) {
+		if (eavail) {
+retry:
+			res = ep_try_send_events(ep, events, maxevents);
+			if (res)
+				break;
+		}
+		eavail = ep_busy_loop(ep, true);
+		if (eavail)
+			continue;
+		break;
+	}
+
+	if (res < 0)
+		return res;
+	if ((persist || !res) && list_empty_careful(&wait->entry)) {
+		write_lock_irq(&ep->lock);
+		eavail = ep_events_available(ep);
+		if (!eavail || persist)
+			__add_wait_queue_exclusive(&ep->wq, wait);
+		write_unlock_irq(&ep->lock);
+		if (eavail)
+			goto retry;
+	}
+	if (!res)
+		return -EIOCBQUEUED;
+	return res;
+}
+
 /**
  * ep_poll - Retrieves ready events, and delivers them to the caller-supplied
  *           event buffer.
@@ -2472,6 +2509,18 @@ static int ep_check_params(struct file *file, struct epoll_event __user *evs,
 		return -EINVAL;
 
 	return 0;
+}
+
+int epoll_queue(struct file *file, struct epoll_event __user *events,
+		int maxevents, struct wait_queue_entry *wait, bool persist)
+{
+	int ret;
+
+	ret = ep_check_params(file, events, maxevents);
+	if (unlikely(ret))
+		return ret;
+
+	return ep_poll_queue(file->private_data, events, maxevents, wait, persist);
 }
 
 /*
