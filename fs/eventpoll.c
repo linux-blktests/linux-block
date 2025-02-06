@@ -787,10 +787,8 @@ static void ep_done_scan(struct eventpoll *ep,
 	list_splice(txlist, &ep->rdllist);
 	__pm_relax(ep->ws);
 
-	if (!list_empty(&ep->rdllist)) {
-		if (waitqueue_active(&ep->wq))
-			wake_up(&ep->wq);
-	}
+	if (!list_empty(&ep->rdllist) && waitqueue_active(&ep->wq))
+		__wake_up(&ep->wq, TASK_NORMAL, 1, poll_to_key(EPOLL_SCAN_WAKE));
 
 	write_unlock_irq(&ep->lock);
 }

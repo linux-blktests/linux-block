@@ -42,7 +42,7 @@
 #define EPOLLRDHUP	(__force __poll_t)0x00002000
 
 /*
- * Bit 27 reserved for internal use
+ * Bits 26..27 reserved for internal use
  */
 
 /* Set exclusive wakeup mode for the target file descriptor */
