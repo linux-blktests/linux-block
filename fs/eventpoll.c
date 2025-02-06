@@ -1658,6 +1658,9 @@ static int ep_insert(struct eventpoll *ep, const struct epoll_event *event,
 	struct ep_pqueue epq;
 	struct eventpoll *tep = NULL;
 
+	if (event->events & EPOLL_EVENT_INTERNAL)
+		return -EINVAL;
+
 	if (is_file_epoll(tfile))
 		tep = tfile->private_data;
 
