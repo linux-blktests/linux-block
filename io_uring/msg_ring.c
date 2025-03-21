@@ -83,7 +83,7 @@ static void io_msg_tw_complete(struct io_kiocb *req, io_tw_token_t tw)
 	}
 	if (req)
 		kmem_cache_free(req_cachep, req);
-	percpu_ref_put(&ctx->refs);
+	io_ring_ref_put(ctx);
 }
 
 static int io_msg_remote_post(struct io_ring_ctx *ctx, struct io_kiocb *req,
@@ -96,7 +96,7 @@ static int io_msg_remote_post(struct io_ring_ctx *ctx, struct io_kiocb *req,
 	req->opcode = IORING_OP_NOP;
 	req->cqe.user_data = user_data;
 	io_req_set_res(req, res, cflags);
-	percpu_ref_get(&ctx->refs);
+	io_ring_ref_get(ctx);
 	req->ctx = ctx;
 	req->tctx = NULL;
 	req->io_task_work.func = io_msg_tw_complete;

@@ -254,7 +254,7 @@ struct io_ring_ctx {
 
 		struct task_struct	*submitter_task;
 		struct io_rings		*rings;
-		struct percpu_ref	refs;
+		atomic_long_t		refs;
 
 		clockid_t		clockid;
 		enum tk_offsets		clock_offset;

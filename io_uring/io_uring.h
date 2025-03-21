@@ -13,6 +13,7 @@
 #include "slist.h"
 #include "filetable.h"
 #include "opdef.h"
+#include "refs.h"
 
 #ifndef CREATE_TRACE_POINTS
 #include <trace/events/io_uring.h>
@@ -142,7 +143,7 @@ static inline void io_lockdep_assert_cq_locked(struct io_ring_ctx *ctx)
 		 * Not from an SQE, as those cannot be submitted, but via
 		 * updating tagged resources.
 		 */
-		if (!percpu_ref_is_dying(&ctx->refs))
+		if (!io_ring_ref_is_dying(ctx))
 			lockdep_assert(current == ctx->submitter_task);
 	}
 #endif

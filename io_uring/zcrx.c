@@ -683,7 +683,7 @@ static int io_pp_zc_init(struct page_pool *pp)
 	if (ret)
 		return ret;
 
-	percpu_ref_get(&ifq->ctx->refs);
+	io_ring_ref_get(ifq->ctx);
 	return 0;
 }
 
@@ -694,7 +694,7 @@ static void io_pp_zc_destroy(struct page_pool *pp)
 
 	if (WARN_ON_ONCE(area->free_count != area->nia.num_niovs))
 		return;
-	percpu_ref_put(&ifq->ctx->refs);
+	io_ring_ref_put(ifq->ctx);
 }
 
 static int io_pp_nl_fill(void *mp_priv, struct sk_buff *rsp,

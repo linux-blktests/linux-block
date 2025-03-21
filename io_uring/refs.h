@@ -59,4 +59,47 @@ static inline void io_req_set_refcount(struct io_kiocb *req)
 {
 	__io_req_set_refcount(req, 1);
 }
+
+#define IO_RING_REF_DEAD	(1UL << (BITS_PER_LONG - 1))
+#define IO_RING_REF_MASK	(~IO_RING_REF_DEAD)
+
+static inline bool io_ring_ref_is_dying(struct io_ring_ctx *ctx)
+{
+	return atomic_long_read(&ctx->refs) & IO_RING_REF_DEAD;
+}
+
+static inline void io_ring_ref_put_many(struct io_ring_ctx *ctx, int nr_refs)
+{
+	unsigned long refs;
+
+	refs = atomic_long_sub_return(nr_refs, &ctx->refs);
+	if (!(refs & IO_RING_REF_MASK))
+		complete(&ctx->ref_comp);
+}
+
+static inline void io_ring_ref_put(struct io_ring_ctx *ctx)
+{
+	io_ring_ref_put_many(ctx, 1);
+}
+
+static inline void io_ring_ref_kill(struct io_ring_ctx *ctx)
+{
+	atomic_long_xor(IO_RING_REF_DEAD, &ctx->refs);
+	io_ring_ref_put(ctx);
+}
+
+static inline void io_ring_ref_init(struct io_ring_ctx *ctx)
+{
+	atomic_long_set(&ctx->refs, 1);
+}
+
+static inline void io_ring_ref_get_many(struct io_ring_ctx *ctx, int nr_refs)
+{
+	atomic_long_add(nr_refs, &ctx->refs);
+}
+
+static inline void io_ring_ref_get(struct io_ring_ctx *ctx)
+{
+	atomic_long_inc(&ctx->refs);
+}
 #endif
