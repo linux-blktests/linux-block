@@ -573,6 +573,16 @@ const struct io_issue_def io_issue_defs[] = {
 		.prep			= io_pipe_prep,
 		.issue			= io_pipe,
 	},
+	[IORING_OP_OPEN_BY_HANDLE] = {
+		.ioprio			= 1,
+		.async_size		= sizeof(struct io_open_handle_async),
+#if defined(CONFIG_FHANDLE)
+		.prep			= io_open_by_handle_prep,
+		.issue			= io_open_by_handle,
+#else
+		.prep			= io_eopnotsupp_prep,
+#endif
+	},
 };
 
 const struct io_cold_def io_cold_defs[] = {
@@ -821,6 +831,9 @@ const struct io_cold_def io_cold_defs[] = {
 	},
 	[IORING_OP_PIPE] = {
 		.name			= "PIPE",
+	},
+	[IORING_OP_OPEN_BY_HANDLE] = {
+		.name			= "OPEN_BY_HANDLE",
 	},
 };
 

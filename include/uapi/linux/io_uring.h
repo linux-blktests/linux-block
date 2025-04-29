@@ -289,6 +289,7 @@ enum io_uring_op {
 	IORING_OP_READV_FIXED,
 	IORING_OP_WRITEV_FIXED,
 	IORING_OP_PIPE,
+	IORING_OP_OPEN_BY_HANDLE,
 
 	/* this goes last, obviously */
 	IORING_OP_LAST,
@@ -449,6 +450,13 @@ enum io_uring_msg_ring_flags {
 #define IORING_NOP_FILE			(1U << 1)
 #define IORING_NOP_FIXED_FILE		(1U << 2)
 #define IORING_NOP_FIXED_BUFFER		(1U << 3)
+
+/*
+ * IORING_OP_OPEN_BY_HANDLE flags
+ *
+ * IORING_OPEN_HANDLE_FIXED	Use a fixed/registered file
+ */
+#define IORING_OPEN_HANDLE_FIXED	(1U << 0)
 
 /*
  * IO completion data structure (Completion Queue Entry)

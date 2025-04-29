@@ -8,6 +8,7 @@
 #include <linux/namei.h>
 #include <linux/pipe_fs_i.h>
 #include <linux/watch_queue.h>
+#include <linux/fs_struct.h>
 #include <linux/io_uring.h>
 
 #include <uapi/linux/io_uring.h>
@@ -36,6 +37,15 @@ struct io_close {
 struct io_fixed_install {
 	struct file			*file;
 	unsigned int			o_flags;
+};
+
+struct io_open_handle {
+	struct file			*file;
+	int				dirfd;
+	int				open_flags;
+	int				flags;
+	u32				file_slot;
+	struct handle_to_path_ctx	ctx;
 };
 
 static bool io_openat_force_async(struct io_open *open)
@@ -435,3 +445,145 @@ int io_pipe(struct io_kiocb *req, unsigned int issue_flags)
 		fput(files[1]);
 	return ret;
 }
+
+#if defined(CONFIG_FHANDLE)
+
+int io_open_by_handle_prep(struct io_kiocb *req, const struct io_uring_sqe *sqe)
+{
+	struct io_open_handle *h = io_kiocb_to_cmd(req, struct io_open_handle);
+	struct io_open_handle_async *ah;
+	struct file_handle __user *uh;
+
+	if (sqe->off || sqe->len)
+		return -EINVAL;
+	if (req->flags & REQ_F_FIXED_FILE)
+		return -EBADF;
+
+	memset(&h->ctx, 0, sizeof(h->ctx));
+
+	h->dirfd = READ_ONCE(sqe->fd);
+	h->open_flags = READ_ONCE(sqe->open_flags);
+	h->flags = READ_ONCE(sqe->ioprio);
+	if (h->flags & ~IORING_OPEN_HANDLE_FIXED)
+		return -EINVAL;
+
+	h->file_slot = READ_ONCE(sqe->file_index);
+	if (h->file_slot && !(h->flags & IORING_OPEN_HANDLE_FIXED))
+		return -EINVAL;
+
+	ah = io_uring_alloc_async_data(NULL, req);
+	if (!ah)
+		return -ENOMEM;
+
+	uh = u64_to_user_ptr(READ_ONCE(sqe->addr));
+	if (get_user(ah->handle.handle_bytes, &uh->handle_bytes) ||
+	    get_user(ah->handle.handle_type, &uh->handle_type))
+		return -EFAULT;
+
+	if (!ah->handle.handle_bytes || ah->handle.handle_bytes > MAX_HANDLE_SZ)
+		return -EINVAL;
+	if (ah->handle.handle_type < 0 ||
+	    FILEID_USER_FLAGS(ah->handle.handle_type) & ~FILEID_VALID_USER_FLAGS)
+		return -EINVAL;
+
+	if (copy_from_user(&ah->handle.f_handle, &uh->f_handle, ah->handle.handle_bytes))
+		return -EFAULT;
+
+	if (ah->handle.handle_type & FILEID_IS_CONNECTABLE) {
+		h->ctx.fh_flags |= EXPORT_FH_CONNECTABLE;
+		h->ctx.flags |= HANDLE_CHECK_SUBTREE;
+	}
+	if (ah->handle.handle_type & FILEID_IS_DIR)
+		h->ctx.fh_flags |= EXPORT_FH_DIR_ONLY;
+	ah->handle.handle_type &= ~FILEID_USER_FLAGS_MASK;
+	return 0;
+}
+
+static int __io_open_by_handle(struct io_kiocb *req, unsigned int issue_flags,
+			       const struct export_operations *eops)
+{
+	struct io_open_handle *h = io_kiocb_to_cmd(req, struct io_open_handle);
+	struct io_open_handle_async *ah = req->async_data;
+	struct path path __free(path_put) = { };
+	struct file *file;
+	int ret, fd;
+
+	ret = do_handle_to_path(&ah->handle, &path, &h->ctx);
+	path_put(&h->ctx.root);
+	if (ret < 0)
+		return ret;
+
+	if (!(h->flags & IORING_OPEN_HANDLE_FIXED)) {
+		fd = get_unused_fd_flags(O_CLOEXEC);
+		if (fd < 0)
+			return fd;
+	}
+
+	if (eops->open) {
+		if (issue_flags & IO_URING_F_NONBLOCK) {
+			file = ERR_PTR(-EAGAIN);
+			goto err;
+		}
+		file = eops->open(&path, h->open_flags);
+	} else {
+		struct open_flags op;
+		struct open_how how = build_open_how(h->open_flags, 0);
+
+		ret = build_open_flags(&how, &op);
+		if (ret)
+			return ret;
+		if (issue_flags & IO_URING_F_NONBLOCK) {
+			op.lookup_flags |= LOOKUP_CACHED;
+			op.open_flag |= O_NONBLOCK;
+		}
+		file = do_file_open_root(&path, "", &op);
+	}
+	if (IS_ERR(file)) {
+err:
+		if (!(h->flags & IORING_OPEN_HANDLE_FIXED))
+			put_unused_fd(fd);
+		return PTR_ERR(file);
+	}
+
+	if (!(h->flags & IORING_OPEN_HANDLE_FIXED)) {
+		fd_install(fd, file);
+		return fd;
+	}
+
+	return io_fixed_fd_install(req, issue_flags, file, h->file_slot);
+}
+
+int io_open_by_handle(struct io_kiocb *req, unsigned int issue_flags)
+{
+	struct io_open_handle *h = io_kiocb_to_cmd(req, struct io_open_handle);
+	const struct export_operations *eops;
+	int ret;
+
+	ret = get_path_from_fd(h->dirfd, &h->ctx.root);
+	if (ret < 0)
+		goto err;
+
+	eops = h->ctx.root.mnt->mnt_sb->s_export_op;
+	if (eops && eops->permission)
+		ret = eops->permission(&h->ctx, h->open_flags);
+	else
+		ret = may_decode_fh(&h->ctx, h->open_flags);
+	if (ret) {
+		path_put(&h->ctx.root);
+		goto err;
+	}
+
+	ret = __io_open_by_handle(req, issue_flags, eops);
+	io_req_set_res(req, ret, 0);
+	if (ret < 0) {
+err:
+		req_set_fail(req);
+		return ret;
+	}
+
+	kfree(req->async_data);
+	req->async_data = NULL;
+	req->flags &= ~REQ_F_ASYNC_DATA;
+	return IOU_COMPLETE;
+}
+#endif /* CONFIG_FHANDLE */
