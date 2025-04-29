@@ -168,7 +168,7 @@ SYSCALL_DEFINE5(name_to_handle_at, int, dfd, const char __user *, name,
 	return err;
 }
 
-static int get_path_from_fd(int fd, struct path *root)
+int get_path_from_fd(int fd, struct path *root)
 {
 	if (fd == AT_FDCWD) {
 		struct fs_struct *fs = current->fs;
@@ -245,8 +245,8 @@ static int vfs_dentry_acceptable(void *context, struct dentry *dentry)
 	return retval;
 }
 
-static int do_handle_to_path(struct file_handle *handle, struct path *path,
-			     struct handle_to_path_ctx *ctx)
+int do_handle_to_path(struct file_handle *handle, struct path *path,
+		      struct handle_to_path_ctx *ctx)
 {
 	int handle_dwords;
 	struct vfsmount *mnt = ctx->root.mnt;
@@ -268,8 +268,7 @@ static int do_handle_to_path(struct file_handle *handle, struct path *path,
 	return 0;
 }
 
-static inline int may_decode_fh(struct handle_to_path_ctx *ctx,
-				unsigned int o_flags)
+int may_decode_fh(struct handle_to_path_ctx *ctx, unsigned int o_flags)
 {
 	struct path *root = &ctx->root;
 

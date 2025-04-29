@@ -367,4 +367,10 @@ struct dentry *generic_fh_to_parent(struct super_block *sb,
 	struct fid *fid, int fh_len, int fh_type,
 	struct inode *(*get_inode) (struct super_block *sb, u64 ino, u32 gen));
 
+struct file_handle;
+int do_handle_to_path(struct file_handle *handle, struct path *path,
+		      struct handle_to_path_ctx *ctx);
+int may_decode_fh(struct handle_to_path_ctx *ctx, unsigned int o_flags);
+int get_path_from_fd(int fd, struct path *root);
+
 #endif /* LINUX_EXPORTFS_H */
