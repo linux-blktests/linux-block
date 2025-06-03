@@ -181,6 +181,17 @@ void io_uring_cmd_done(struct io_uring_cmd *ioucmd, ssize_t ret, u64 res2,
 }
 EXPORT_SYMBOL_GPL(io_uring_cmd_done);
 
+static void io_uring_cmd_sqe_copy(struct io_kiocb *req)
+{
+	struct io_uring_cmd *ioucmd = io_kiocb_to_cmd(req, struct io_uring_cmd);
+	struct io_async_cmd *ac = req->async_data;
+
+	if (ioucmd->sqe != ac->sqes) {
+		memcpy(ac->sqes, ioucmd->sqe, uring_sqe_size(req->ctx));
+		ioucmd->sqe = ac->sqes;
+	}
+}
+
 int io_uring_cmd_prep(struct io_kiocb *req, const struct io_uring_sqe *sqe)
 {
 	struct io_uring_cmd *ioucmd = io_kiocb_to_cmd(req, struct io_uring_cmd);
@@ -205,17 +216,27 @@ int io_uring_cmd_prep(struct io_kiocb *req, const struct io_uring_sqe *sqe)
 	if (!ac)
 		return -ENOMEM;
 	ac->data.op_data = NULL;
+	ioucmd->sqe = sqe;
 
-	/*
-	 * Unconditionally cache the SQE for now - this is only needed for
-	 * requests that go async, but prep handlers must ensure that any
-	 * sqe data is stable beyond prep. Since uring_cmd is special in
-	 * that it doesn't read in per-op data, play it safe and ensure that
-	 * any SQE data is stable beyond prep. This can later get relaxed.
-	 */
-	memcpy(ac->sqes, sqe, uring_sqe_size(req->ctx));
-	ioucmd->sqe = ac->sqes;
+	if (io_req_will_async_issue(req))
+		io_uring_cmd_sqe_copy(req);
 	return 0;
+}
+
+/*
+ * Basic SQE validity check - should never trigger, can be removed later on
+ */
+static bool io_uring_cmd_sqe_verify(struct io_kiocb *req,
+				    struct io_uring_cmd *ioucmd,
+				    unsigned int issue_flags)
+{
+	struct io_async_cmd *ac = req->async_data;
+
+	if (ioucmd->sqe == ac->sqes)
+		return true;
+	if (WARN_ON_ONCE(issue_flags & (IO_URING_F_IOWQ | IO_URING_F_UNLOCKED)))
+		return false;
+	return true;
 }
 
 int io_uring_cmd(struct io_kiocb *req, unsigned int issue_flags)
@@ -231,6 +252,9 @@ int io_uring_cmd(struct io_kiocb *req, unsigned int issue_flags)
 	ret = security_uring_cmd(ioucmd);
 	if (ret)
 		return ret;
+
+	if (unlikely(!io_uring_cmd_sqe_verify(req, ioucmd, issue_flags)))
+		return -EFAULT;
 
 	if (ctx->flags & IORING_SETUP_SQE128)
 		issue_flags |= IO_URING_F_SQE128;
@@ -251,8 +275,12 @@ int io_uring_cmd(struct io_kiocb *req, unsigned int issue_flags)
 	}
 
 	ret = file->f_op->uring_cmd(ioucmd, issue_flags);
-	if (ret == -EAGAIN || ret == -EIOCBQUEUED)
-		return ret;
+	if (ret == -EAGAIN) {
+		io_uring_cmd_sqe_copy(req);
+		return -EAGAIN;
+	} else if (ret == -EIOCBQUEUED) {
+		return -EIOCBQUEUED;
+	}
 	if (ret < 0)
 		req_set_fail(req);
 	io_req_uring_cleanup(req, issue_flags);
