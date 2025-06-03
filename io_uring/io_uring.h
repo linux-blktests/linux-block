@@ -524,4 +524,9 @@ static inline bool io_has_work(struct io_ring_ctx *ctx)
 	return test_bit(IO_CHECK_CQ_OVERFLOW_BIT, &ctx->check_cq) ||
 	       io_local_work_pending(ctx);
 }
+
+static inline bool io_req_will_async_issue(struct io_kiocb *req)
+{
+	return (req->flags & (REQ_F_FORCE_ASYNC | REQ_F_ASYNC_ISSUE));
+}
 #endif
