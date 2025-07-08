@@ -1257,10 +1257,8 @@ void blk_zone_write_plug_finish_request(struct request *req)
 	disk_put_zone_wplug(zwplug);
 }
 
-static void blk_zone_wplug_bio_work(struct work_struct *work)
+static void blk_zone_submit_one_bio(struct blk_zone_wplug *zwplug)
 {
-	struct blk_zone_wplug *zwplug =
-		container_of(work, struct blk_zone_wplug, bio_work);
 	struct block_device *bdev;
 	unsigned long flags;
 	struct bio *bio;
@@ -1276,7 +1274,7 @@ again:
 	if (!bio) {
 		zwplug->flags &= ~BLK_ZONE_WPLUG_PLUGGED;
 		spin_unlock_irqrestore(&zwplug->lock, flags);
-		goto put_zwplug;
+		return;
 	}
 
 	if (!blk_zone_wplug_prepare_bio(zwplug, bio)) {
@@ -1300,8 +1298,15 @@ again:
 	} else {
 		blk_mq_submit_bio(bio);
 	}
+}
 
-put_zwplug:
+static void blk_zone_wplug_bio_work(struct work_struct *work)
+{
+	struct blk_zone_wplug *zwplug =
+		container_of(work, struct blk_zone_wplug, bio_work);
+
+	blk_zone_submit_one_bio(zwplug);
+
 	/* Drop the reference we took in disk_zone_wplug_schedule_bio_work(). */
 	disk_put_zone_wplug(zwplug);
 }
