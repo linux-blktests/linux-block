@@ -3133,11 +3133,14 @@ void blk_mq_submit_bio(struct bio *bio)
 	unsigned int nr_segs;
 	struct request *rq;
 	blk_status_t ret;
+	int rq_cpu = -1;
 
 	/*
 	 * If the plug has a cached request for this queue, try to use it.
 	 */
 	rq = blk_mq_peek_cached_request(plug, q, bio->bi_opf);
+	if (rq)
+		rq_cpu = rq->mq_ctx->cpu;
 
 	/*
 	 * A BIO that was released from a zone write plug has already been
@@ -3187,10 +3190,9 @@ void blk_mq_submit_bio(struct bio *bio)
 	if (blk_mq_attempt_bio_merge(q, bio, nr_segs))
 		goto queue_exit;
 
-	if (bio_needs_zone_write_plugging(bio)) {
-		if (blk_zone_plug_bio(bio, nr_segs))
-			goto queue_exit;
-	}
+	if (bio_needs_zone_write_plugging(bio) &&
+	    blk_zone_plug_bio(bio, nr_segs, rq_cpu))
+		goto queue_exit;
 
 new_request:
 	if (rq) {
