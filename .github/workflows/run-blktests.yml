@@ -1,0 +1,147 @@
+# SPDX-License-Identifier: GPL-2.0-or-later
+#
+# Copyright (c) 2025 Western Digital Corporation or its affiliates.
+#
+# Authors: Dennis Maisenbacher (dennis.maisenbacher@wdc.com)
+
+name: Run blktests
+
+on:
+  pull_request:
+
+env:
+  KERNEL_REF: "${{ github.event.pull_request.head.sha }}"
+  KERNEL_TREE: "https://github.com/${{ github.repository }}"
+
+#This workflow requires an actions-runner-controllers (ARC) to be active.
+#The k8s cluster of this ARC needs KubeVirt to be installed.
+jobs:
+  build-and-test-kernel:
+    #This step runs in a container in the k8s cluster 
+    runs-on: arc-vm-linux-blktests
+    steps:
+      - name: Checkout blktests-ci
+        uses: actions/checkout@v4
+        with:
+          repository: linux-blktests/blktests-ci
+          path: blktests-ci
+
+      - name: Build kernel and package it into a containerimage
+        run: |
+          cd blktests-ci/playbooks/roles/kernel-builder-k8s-job/templates
+          docker build \
+            --build-arg KERNEL_TREE=${KERNEL_TREE} \
+            --build-arg KERNEL_REF=${KERNEL_REF} \
+            -t linux-kernel-containerdisk \
+            -f Dockerfile.linux-kernel-containerdisk . 2>&1 | tee build.log
+          #Setting KERNEL_VERSION var which is latern needed for notifying the VM what kernel to pick up
+          cat build.log | grep KERNEL_VERSION | awk '{print $3}' | grep KERNEL_VERSION >> $GITHUB_ENV
+
+      - name: Push the new Fedora containerimage with the freshly build kernel
+        run: |
+          docker tag linux-kernel-containerdisk registry-service.docker-registry.svc.cluster.local/linux-kernel-containerdisk:${KERNEL_VERSION}
+          docker push registry-service.docker-registry.svc.cluster.local/linux-kernel-containerdisk:${KERNEL_VERSION}
+
+      - name: Run in VM
+        uses: ./blktests-ci/.github/actions/kubevirt-action
+        with:
+          kernel_version: ${{ env.KERNEL_VERSION }}
+          run_cmds: |
+            #Print VM debug info
+            uname -a
+            cat /etc/os-release
+            lsblk
+
+            #Install build dependencies for blktests
+            sudo dnf install -y gcc \
+            clang \
+            make \
+            util-linux \
+            llvm \
+            gawk \
+            fio \
+            udev \
+            kmod \
+            coreutils \
+            gcc \
+            gzip \
+            e2fsprogs \
+            xfsprogs \
+            f2fs-tools \
+            btrfs-progs \
+            device-mapper-multipath \
+            blktrace \
+            kernel-headers \
+            liburing \
+            liburing-devel \
+            nbd \
+            device-mapper \
+            ktls-utils \
+            dosfstools \
+            mdadm \
+            bc \
+            libnl3-cli \
+            cryptsetup \
+            sg3_utils \
+            unzip \
+            jq \
+            nvme-cli \
+            git \
+            wget
+
+            git clone https://github.com/linux-blktests/blktests.git
+
+            cd blktests
+            make
+
+            #ATTENTION! This section formats all available NVMe devices. Be careful when changing the `runs-on` tag!
+            #This step runs in a VM with the previously compiled kernel in the k8s cluster
+
+            # Run blktests block group
+            cat > config << EOF
+            TEST_DEVS=(${BDEV0})
+            EOF
+            export RUN_ZONED_TESTS=1
+            sudo ./check block
+
+            # Run blktests nvme group
+            cat > config << EOF
+            TEST_DEVS=(${BDEV0})
+            NVMET_TRTYPES="loop rdma tcp"
+            EOF
+            sudo ./check nvme
+
+            # Run blktests scsi group
+            cat > config << EOF
+            TEST_DEVS=()
+            export RUN_ZONED_TESTS=1
+            EOF
+            sudo ./check scsi
+
+            # Run blktests misc groups
+            cat > config << EOF
+            TEST_DEVS=()
+            EOF
+            sudo ./check dm loop md nbd throtl ublk
+
+            # Run ZBD blktests without TEST_DEVS
+            cat > config << EOF
+            TEST_DEVS=()
+            EOF
+            export RUN_ZONED_TESTS=1
+            sudo ./check zbd
+
+            # Run ZBD blktests with TEST_DEVS
+            cat > config << EOF
+            TEST_DEVS=(${ZBD0})
+            DEVICE_ONLY=1
+            EOF
+
+            export RUN_ZONED_TESTS=1
+            sudo ./check zbd
+
+            # Run blktests srp group
+            cat > config << EOF
+            TEST_DEVS=()
+            EOF
+            sudo ./check srp
