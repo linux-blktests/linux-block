@@ -5984,10 +5984,6 @@ struct mddev *md_alloc(dev_t dev, char *name)
 
 	disk->events |= DISK_EVENT_MEDIA_CHANGE;
 	mddev->gendisk = disk;
-	error = add_disk(disk);
-	if (error)
-		goto out_put_disk;
-
 	kobject_init(&mddev->kobj, &md_ktype);
 	error = kobject_add(&mddev->kobj, &disk_to_dev(disk)->kobj, "%s", "md");
 	if (error) {
@@ -6005,6 +6001,9 @@ struct mddev *md_alloc(dev_t dev, char *name)
 	kobject_uevent(&mddev->kobj, KOBJ_ADD);
 	mddev->sysfs_state = sysfs_get_dirent_safe(mddev->kobj.sd, "array_state");
 	mddev->sysfs_level = sysfs_get_dirent_safe(mddev->kobj.sd, "level");
+	error = add_disk(disk);
+	if (error)
+		goto out_put_disk;
 	mutex_unlock(&disks_mutex);
 	return mddev;
 
