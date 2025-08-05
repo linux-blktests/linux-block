@@ -615,6 +615,8 @@ static inline enum nvme_use_sgl nvme_pci_use_sgls(struct nvme_dev *dev,
 			return SGL_FORCED;
 		if (req->nr_integrity_segments > 1)
 			return SGL_FORCED;
+		if (blk_rq_page_gaps(req) & (NVME_CTRL_PAGE_SIZE - 1))
+			return SGL_FORCED;
 		return SGL_SUPPORTED;
 	}
 
