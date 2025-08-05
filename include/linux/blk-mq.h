@@ -115,6 +115,7 @@ struct request {
 
 	/* the following two fields are internal, NEVER access directly */
 	unsigned int __data_len;	/* total data len */
+	unsigned int __page_gaps;	/* a mask of all the segment page gaps */
 	sector_t __sector;		/* sector cursor */
 
 	struct bio *bio;
@@ -1078,6 +1079,11 @@ struct req_iterator {
 static inline sector_t blk_rq_pos(const struct request *rq)
 {
 	return rq->__sector;
+}
+
+static inline unsigned int blk_rq_page_gaps(const struct request *rq)
+{
+	return rq->__page_gaps;
 }
 
 static inline unsigned int blk_rq_bytes(const struct request *rq)

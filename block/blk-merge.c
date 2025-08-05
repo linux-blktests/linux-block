@@ -278,6 +278,9 @@ static unsigned int bio_split_alignment(struct bio *bio,
 	return lim->logical_block_size;
 }
 
+#define bv_seg_gap(bv, bvprv) \
+	bv.bv_offset | ((bvprv.bv_offset + bvprv.bv_len) & (PAGE_SIZE - 1));
+
 /**
  * bio_split_rw_at - check if and where to split a read/write bio
  * @bio:  [in] bio to be split
@@ -293,17 +296,20 @@ static unsigned int bio_split_alignment(struct bio *bio,
 int bio_split_rw_at(struct bio *bio, const struct queue_limits *lim,
 		unsigned *segs, unsigned max_bytes)
 {
+	unsigned nsegs = 0, bytes = 0, page_gaps = 0;
 	struct bio_vec bv, bvprv, *bvprvp = NULL;
 	struct bvec_iter iter;
-	unsigned nsegs = 0, bytes = 0;
 
 	bio_for_each_bvec(bv, bio, iter) {
 		/*
 		 * If the queue doesn't support SG gaps and adding this
 		 * offset would create a gap, disallow it.
 		 */
-		if (bvprvp && bvec_gap_to_prev(lim, bvprvp, bv.bv_offset))
-			goto split;
+		if (bvprvp) {
+			if (bvec_gap_to_prev(lim, bvprvp, bv.bv_offset))
+				goto split;
+			page_gaps |= bv_seg_gap(bv, bvprv);
+		}
 
 		if (nsegs < lim->max_segments &&
 		    bytes + bv.bv_len <= max_bytes &&
@@ -321,6 +327,7 @@ int bio_split_rw_at(struct bio *bio, const struct queue_limits *lim,
 	}
 
 	*segs = nsegs;
+	bio->page_gaps = page_gaps;
 	return 0;
 split:
 	if (bio->bi_opf & REQ_ATOMIC)
@@ -348,6 +355,7 @@ split:
 	 * big IO can be trival, disable iopoll when split needed.
 	 */
 	bio_clear_polled(bio);
+	bio->page_gaps = page_gaps;
 	return bytes >> SECTOR_SHIFT;
 }
 EXPORT_SYMBOL_GPL(bio_split_rw_at);
@@ -691,6 +699,8 @@ static bool blk_atomic_write_mergeable_rqs(struct request *rq,
 static struct request *attempt_merge(struct request_queue *q,
 				     struct request *req, struct request *next)
 {
+	struct bio_vec bv, bvprv;
+
 	if (!rq_mergeable(req) || !rq_mergeable(next))
 		return NULL;
 
@@ -747,6 +757,10 @@ static struct request *attempt_merge(struct request_queue *q,
 	 */
 	if (next->start_time_ns < req->start_time_ns)
 		req->start_time_ns = next->start_time_ns;
+
+	bv = next->bio->bi_io_vec[0];
+	bvprv = req->biotail->bi_io_vec[req->biotail->bi_vcnt - 1];
+	req->__page_gaps |= blk_rq_page_gaps(next) | bv_seg_gap(bv, bvprv);
 
 	req->biotail->bi_next = next->bio;
 	req->biotail = next->biotail;
@@ -856,6 +870,7 @@ enum bio_merge_status bio_attempt_back_merge(struct request *req,
 		struct bio *bio, unsigned int nr_segs)
 {
 	const blk_opf_t ff = bio_failfast(bio);
+	struct bio_vec bv, bvprv;
 
 	if (!ll_back_merge_fn(req, bio, nr_segs))
 		return BIO_MERGE_FAILED;
@@ -871,6 +886,10 @@ enum bio_merge_status bio_attempt_back_merge(struct request *req,
 	if (req->rq_flags & RQF_ZONE_WRITE_PLUGGING)
 		blk_zone_write_plug_bio_merged(bio);
 
+	bv = bio->bi_io_vec[0];
+	bvprv = req->biotail->bi_io_vec[req->biotail->bi_vcnt - 1];
+	req->__page_gaps |= bio->page_gaps | bv_seg_gap(bv, bvprv);
+
 	req->biotail->bi_next = bio;
 	req->biotail = bio;
 	req->__data_len += bio->bi_iter.bi_size;
@@ -885,6 +904,7 @@ static enum bio_merge_status bio_attempt_front_merge(struct request *req,
 		struct bio *bio, unsigned int nr_segs)
 {
 	const blk_opf_t ff = bio_failfast(bio);
+	struct bio_vec bv, bvprv;
 
 	/*
 	 * A front merge for writes to sequential zones of a zoned block device
@@ -904,6 +924,10 @@ static enum bio_merge_status bio_attempt_front_merge(struct request *req,
 		blk_rq_set_mixed_merge(req);
 
 	blk_update_mixed_merge(req, bio, true);
+
+	bv = req->bio->bi_io_vec[0];
+	bvprv = bio->bi_io_vec[bio->bi_vcnt - 1];
+	req->__page_gaps |= bio->page_gaps | bv_seg_gap(bv, bvprv);
 
 	bio->bi_next = req->bio;
 	req->bio = bio;
