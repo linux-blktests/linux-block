@@ -114,9 +114,9 @@ static int __blk_mq_do_dispatch_sched(struct blk_mq_hw_ctx *hctx)
 			break;
 
 		if (blk_queue_sq_sched(q)) {
-			elevator_lock(e);
+			elevator_lock_irq(e);
 			rq = e->type->ops.dispatch_request(hctx);
-			elevator_unlock(e);
+			elevator_unlock_irq(e);
 		} else {
 			rq = e->type->ops.dispatch_request(hctx);
 		}
