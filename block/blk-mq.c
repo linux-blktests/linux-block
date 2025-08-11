@@ -2383,12 +2383,23 @@ void blk_mq_run_hw_queue(struct blk_mq_hw_ctx *hctx, bool async)
 EXPORT_SYMBOL(blk_mq_run_hw_queue);
 
 /*
- * Return prefered queue to dispatch from (if any) for non-mq aware IO
- * scheduler.
+ * Return prefered queue to dispatch from for single-queue IO schedulers.
  */
 static struct blk_mq_hw_ctx *blk_mq_get_sq_hctx(struct request_queue *q)
 {
-	struct blk_mq_ctx *ctx = blk_mq_get_ctx(q);
+	struct blk_mq_hw_ctx *hctx;
+	struct blk_mq_ctx *ctx;
+
+	if (!blk_queue_sq_sched(q))
+		return NULL;
+
+	if (blk_queue_is_zoned(q) &&
+	    q->limits.features & BLK_FEAT_ORDERED_HWQ &&
+	    test_bit(ELEVATOR_FLAG_SUPPORTS_ZONED_WRITE_PIPELINING,
+		     &q->elevator->flags))
+		return NULL;
+
+	ctx = blk_mq_get_ctx(q);
 	/*
 	 * If the IO scheduler does not respect hardware queues when
 	 * dispatching, we just don't bother with multiple HW queues and
@@ -2396,7 +2407,7 @@ static struct blk_mq_hw_ctx *blk_mq_get_sq_hctx(struct request_queue *q)
 	 * just causes lock contention inside the scheduler and pointless cache
 	 * bouncing.
 	 */
-	struct blk_mq_hw_ctx *hctx = ctx->hctxs[HCTX_TYPE_DEFAULT];
+	hctx = ctx->hctxs[HCTX_TYPE_DEFAULT];
 
 	if (!blk_mq_hctx_stopped(hctx))
 		return hctx;
@@ -2413,9 +2424,7 @@ void blk_mq_run_hw_queues(struct request_queue *q, bool async)
 	struct blk_mq_hw_ctx *hctx, *sq_hctx;
 	unsigned long i;
 
-	sq_hctx = NULL;
-	if (blk_queue_sq_sched(q))
-		sq_hctx = blk_mq_get_sq_hctx(q);
+	sq_hctx = blk_mq_get_sq_hctx(q);
 	queue_for_each_hw_ctx(q, hctx, i) {
 		if (blk_mq_hctx_stopped(hctx))
 			continue;
@@ -2441,9 +2450,7 @@ void blk_mq_delay_run_hw_queues(struct request_queue *q, unsigned long msecs)
 	struct blk_mq_hw_ctx *hctx, *sq_hctx;
 	unsigned long i;
 
-	sq_hctx = NULL;
-	if (blk_queue_sq_sched(q))
-		sq_hctx = blk_mq_get_sq_hctx(q);
+	sq_hctx = blk_mq_get_sq_hctx(q);
 	queue_for_each_hw_ctx(q, hctx, i) {
 		if (blk_mq_hctx_stopped(hctx))
 			continue;
