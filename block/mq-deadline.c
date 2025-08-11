@@ -311,10 +311,23 @@ static bool started_after(struct deadline_data *dd, struct request *rq,
 }
 
 /*
+ * If write pipelining is enabled, only dispatch zoned writes if
+ * rq->mq_hctx == hctx.
+ */
+static bool dd_check_hctx(struct blk_mq_hw_ctx *hctx, struct request *rq)
+{
+	struct request_queue *q = hctx->queue;
+
+	return !(q->limits.features & BLK_FEAT_PIPELINE_ZWR) ||
+		rq->mq_hctx == hctx || !blk_rq_is_seq_zoned_write(rq);
+}
+
+/*
  * deadline_dispatch_requests selects the best request according to
  * read/write expire, fifo_batch, etc and with a start time <= @latest_start.
  */
 static struct request *__dd_dispatch_request(struct deadline_data *dd,
+					     struct blk_mq_hw_ctx *hctx,
 					     struct dd_per_prio *per_prio,
 					     unsigned long latest_start)
 {
@@ -339,7 +352,7 @@ static struct request *__dd_dispatch_request(struct deadline_data *dd,
 	 * batches are currently reads XOR writes
 	 */
 	rq = deadline_next_request(dd, per_prio, dd->last_dir);
-	if (rq && dd->batching < dd->fifo_batch) {
+	if (rq && dd->batching < dd->fifo_batch && dd_check_hctx(hctx, rq)) {
 		/* we have a next request and are still entitled to batch */
 		data_dir = rq_data_dir(rq);
 		goto dispatch_request;
@@ -399,7 +412,7 @@ dispatch_find_request:
 		rq = next_rq;
 	}
 
-	if (!rq)
+	if (!rq || !dd_check_hctx(hctx, rq))
 		return NULL;
 
 	dd->last_dir = data_dir;
@@ -427,8 +440,9 @@ done:
  * Check whether there are any requests with priority other than DD_RT_PRIO
  * that were inserted more than prio_aging_expire jiffies ago.
  */
-static struct request *dd_dispatch_prio_aged_requests(struct deadline_data *dd,
-						      unsigned long now)
+static struct request *
+dd_dispatch_prio_aged_requests(struct deadline_data *dd,
+			       struct blk_mq_hw_ctx *hctx, unsigned long now)
 {
 	struct request *rq;
 	enum dd_prio prio;
@@ -442,7 +456,7 @@ static struct request *dd_dispatch_prio_aged_requests(struct deadline_data *dd,
 		return NULL;
 
 	for (prio = DD_BE_PRIO; prio <= DD_PRIO_MAX; prio++) {
-		rq = __dd_dispatch_request(dd, &dd->per_prio[prio],
+		rq = __dd_dispatch_request(dd, hctx, &dd->per_prio[prio],
 					   now - dd->prio_aging_expire);
 		if (rq)
 			return rq;
@@ -467,7 +481,7 @@ static struct request *dd_dispatch_request(struct blk_mq_hw_ctx *hctx)
 	enum dd_prio prio;
 
 	spin_lock(&dd->lock);
-	rq = dd_dispatch_prio_aged_requests(dd, now);
+	rq = dd_dispatch_prio_aged_requests(dd, hctx, now);
 	if (rq)
 		goto unlock;
 
@@ -476,7 +490,7 @@ static struct request *dd_dispatch_request(struct blk_mq_hw_ctx *hctx)
 	 * requests if any higher priority requests are pending.
 	 */
 	for (prio = 0; prio <= DD_PRIO_MAX; prio++) {
-		rq = __dd_dispatch_request(dd, &dd->per_prio[prio], now);
+		rq = __dd_dispatch_request(dd, hctx, &dd->per_prio[prio], now);
 		if (rq || dd_queued(dd, prio))
 			break;
 	}
@@ -585,6 +599,8 @@ static int dd_init_sched(struct request_queue *q, struct elevator_queue *eq)
 
 	/* We dispatch from request queue wide instead of hw queue */
 	blk_queue_flag_set(QUEUE_FLAG_SQ_SCHED, q);
+
+	set_bit(ELEVATOR_FLAG_SUPPORTS_ZONED_WRITE_PIPELINING, &eq->flags);
 
 	q->elevator = eq;
 	return 0;
@@ -741,11 +757,34 @@ static void dd_finish_request(struct request *rq)
 		atomic_inc(&per_prio->stats.completed);
 }
 
-static bool dd_has_work_for_prio(struct dd_per_prio *per_prio)
+static bool dd_has_write_work(struct deadline_data *dd,
+			      struct blk_mq_hw_ctx *hctx,
+			      struct list_head *list)
+{
+	struct request_queue *q = hctx->queue;
+	struct request *rq;
+
+	if (list_empty_careful(list))
+		return false;
+
+	if (!(q->limits.features & BLK_FEAT_PIPELINE_ZWR))
+		return true;
+
+	guard(spinlock)(&dd->lock);
+	list_for_each_entry(rq, list, queuelist)
+		if (!blk_rq_is_seq_zoned_write(rq) || rq->mq_hctx == hctx)
+			return true;
+
+	return false;
+}
+
+static bool dd_has_work_for_prio(struct deadline_data *dd,
+				 struct blk_mq_hw_ctx *hctx,
+				 struct dd_per_prio *per_prio)
 {
 	return !list_empty_careful(&per_prio->dispatch) ||
 		!list_empty_careful(&per_prio->fifo_list[DD_READ]) ||
-		!list_empty_careful(&per_prio->fifo_list[DD_WRITE]);
+		dd_has_write_work(dd, hctx, &per_prio->fifo_list[DD_WRITE]);
 }
 
 static bool dd_has_work(struct blk_mq_hw_ctx *hctx)
@@ -754,7 +793,7 @@ static bool dd_has_work(struct blk_mq_hw_ctx *hctx)
 	enum dd_prio prio;
 
 	for (prio = 0; prio <= DD_PRIO_MAX; prio++)
-		if (dd_has_work_for_prio(&dd->per_prio[prio]))
+		if (dd_has_work_for_prio(dd, hctx, &dd->per_prio[prio]))
 			return true;
 
 	return false;
