@@ -338,6 +338,15 @@ typedef unsigned int __bitwise blk_features_t;
 /* skip this queue in blk_mq_(un)quiesce_tagset */
 #define BLK_FEAT_SKIP_TAGSET_QUIESCE	((__force blk_features_t)(1u << 13))
 
+/*
+ * The request order is preserved per hardware queue by the block driver and by
+ * the block device. Set by the block driver.
+ */
+#define BLK_FEAT_ORDERED_HWQ		((__force blk_features_t)(1u << 14))
+
+/* Whether to pipeline zoned writes. Controlled by the block layer. */
+#define BLK_FEAT_PIPELINE_ZWR		((__force blk_features_t)(1u << 15))
+
 /* undocumented magic for bcache */
 #define BLK_FEAT_RAID_PARTIAL_STRIPES_EXPENSIVE \
 	((__force blk_features_t)(1u << 15))

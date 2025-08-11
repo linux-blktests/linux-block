@@ -637,6 +637,21 @@ Description:
 		I/O size is reported this file contains 0.
 
 
+What:		/sys/block/<disk>/queue/pipeline_zoned_writes
+Date:		August 2025
+Contact:	Bart Van Assche <bvanassche@acm.org>
+Description:
+		[RW] If this attribute is present it means that the block driver
+		and the storage controller both support preserving the order of
+		zoned writes per hardware queue. This attribute controls whether
+		or not pipelining zoned writes is enabled. If the value of this
+		attribute is zero, the block layer restricts the queue depth for
+		sequential writes per zone to one (zone append operations are
+		not affected). If the value of this attribute is one, the block
+		layer does not restrict the queue depth of sequential writes per
+		zone to one.
+
+
 What:		/sys/block/<disk>/queue/physical_block_size
 Date:		May 2009
 Contact:	Martin K. Petersen <martin.petersen@oracle.com>

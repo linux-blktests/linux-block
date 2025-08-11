@@ -273,6 +273,7 @@ QUEUE_SYSFS_FEATURE(rotational, BLK_FEAT_ROTATIONAL)
 QUEUE_SYSFS_FEATURE(add_random, BLK_FEAT_ADD_RANDOM)
 QUEUE_SYSFS_FEATURE(iostats, BLK_FEAT_IO_STAT)
 QUEUE_SYSFS_FEATURE(stable_writes, BLK_FEAT_STABLE_WRITES);
+QUEUE_SYSFS_FEATURE(pipeline_zwr, BLK_FEAT_PIPELINE_ZWR);
 
 #define QUEUE_SYSFS_FEATURE_SHOW(_name, _feature)			\
 static ssize_t queue_##_name##_show(struct gendisk *disk, char *page)	\
@@ -557,6 +558,7 @@ QUEUE_LIM_RO_ENTRY(queue_dax, "dax");
 QUEUE_RW_ENTRY(queue_io_timeout, "io_timeout");
 QUEUE_LIM_RO_ENTRY(queue_virt_boundary_mask, "virt_boundary_mask");
 QUEUE_LIM_RO_ENTRY(queue_dma_alignment, "dma_alignment");
+QUEUE_LIM_RW_ENTRY(queue_pipeline_zwr, "pipeline_zoned_writes");
 
 /* legacy alias for logical_block_size: */
 static struct queue_sysfs_entry queue_hw_sector_size_entry = {
@@ -703,6 +705,7 @@ static struct attribute *queue_attrs[] = {
 	&queue_dax_entry.attr,
 	&queue_virt_boundary_mask_entry.attr,
 	&queue_dma_alignment_entry.attr,
+	&queue_pipeline_zwr_entry.attr,
 	&queue_ra_entry.attr,
 
 	/*
@@ -747,6 +750,10 @@ static umode_t queue_attr_visible(struct kobject *kobj, struct attribute *attr,
 	if ((attr == &queue_max_open_zones_entry.attr ||
 	     attr == &queue_max_active_zones_entry.attr) &&
 	    !blk_queue_is_zoned(q))
+		return 0;
+
+	if (attr == &queue_pipeline_zwr_entry.attr &&
+	    !(q->limits.features & BLK_FEAT_ORDERED_HWQ))
 		return 0;
 
 	return attr->mode;
