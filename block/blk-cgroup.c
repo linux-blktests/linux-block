@@ -2001,7 +2001,7 @@ static void blkcg_maybe_throttle_blkg(struct blkcg_gq *blkg, bool use_memdelay)
 }
 
 /**
- * blkcg_maybe_throttle_current - throttle the current task if it has been marked
+ * __blkcg_maybe_throttle_current - throttle the current task if it has been marked
  *
  * This is only called if we've been marked with set_notify_resume().  Obviously
  * we can be set_notify_resume() for reasons other than blkcg throttling, so we
@@ -2010,7 +2010,7 @@ static void blkcg_maybe_throttle_blkg(struct blkcg_gq *blkg, bool use_memdelay)
  * to be called by people willy-nilly as it will actually do the work to
  * throttle the task if it is setup for throttling.
  */
-void blkcg_maybe_throttle_current(void)
+void __blkcg_maybe_throttle_current(void)
 {
 	struct gendisk *disk = current->throttle_disk;
 	struct blkcg *blkcg;

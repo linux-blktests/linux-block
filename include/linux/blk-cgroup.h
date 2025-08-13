@@ -14,6 +14,7 @@
  * 	              Nauman Rafique <nauman@google.com>
  */
 
+#include <linux/sched.h>
 #include <linux/types.h>
 
 struct bio;
@@ -26,7 +27,14 @@ struct gendisk;
 extern struct cgroup_subsys_state * const blkcg_root_css;
 
 void blkcg_schedule_throttle(struct gendisk *disk, bool use_memdelay);
-void blkcg_maybe_throttle_current(void);
+void __blkcg_maybe_throttle_current(void);
+
+static inline void blkcg_maybe_throttle_current(void)
+{
+	if (unlikely(current->throttle_disk))
+		__blkcg_maybe_throttle_current();
+}
+
 bool blk_cgroup_congested(void);
 void blkcg_pin_online(struct cgroup_subsys_state *blkcg_css);
 void blkcg_unpin_online(struct cgroup_subsys_state *blkcg_css);
