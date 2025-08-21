@@ -302,6 +302,12 @@ static unsigned int bio_split_alignment(struct bio *bio,
 	return lim->logical_block_size;
 }
 
+static inline unsigned int bvec_seg_gap(struct bio_vec *bv, struct bio_vec *bvprv)
+{
+	return ((bvprv->bv_offset + bvprv->bv_len) & (PAGE_SIZE - 1)) |
+			bv->bv_offset;
+}
+
 /**
  * bio_split_io_at - check if and where to split a bio
  * @bio:  [in] bio to be split
@@ -318,9 +324,9 @@ static unsigned int bio_split_alignment(struct bio *bio,
 int bio_split_io_at(struct bio *bio, const struct queue_limits *lim,
 		unsigned *segs, unsigned max_bytes, unsigned len_align_mask)
 {
+	unsigned nsegs = 0, bytes = 0, page_gaps = 0;
 	struct bio_vec bv, bvprv, *bvprvp = NULL;
 	struct bvec_iter iter;
-	unsigned nsegs = 0, bytes = 0;
 
 	bio_for_each_bvec(bv, bio, iter) {
 		if (bv.bv_offset & lim->dma_alignment ||
@@ -331,8 +337,11 @@ int bio_split_io_at(struct bio *bio, const struct queue_limits *lim,
 		 * If the queue doesn't support SG gaps and adding this
 		 * offset would create a gap, disallow it.
 		 */
-		if (bvprvp && bvec_gap_to_prev(lim, bvprvp, bv.bv_offset))
-			goto split;
+		if (bvprvp) {
+			if (bvec_gap_to_prev(lim, bvprvp, bv.bv_offset))
+				goto split;
+			page_gaps |= bvec_seg_gap(&bv, &bvprv);
+		}
 
 		if (nsegs < lim->max_segments &&
 		    bytes + bv.bv_len <= max_bytes &&
@@ -350,6 +359,7 @@ int bio_split_io_at(struct bio *bio, const struct queue_limits *lim,
 	}
 
 	*segs = nsegs;
+	bio->bi_pg_bit = ffs(page_gaps);
 	return 0;
 split:
 	if (bio->bi_opf & REQ_ATOMIC)
@@ -385,6 +395,7 @@ split:
 	 * big IO can be trival, disable iopoll when split needed.
 	 */
 	bio_clear_polled(bio);
+	bio->bi_pg_bit = ffs(page_gaps);
 	return bytes >> SECTOR_SHIFT;
 }
 EXPORT_SYMBOL_GPL(bio_split_io_at);
@@ -721,6 +732,24 @@ static bool blk_atomic_write_mergeable_rqs(struct request *rq,
 	return (rq->cmd_flags & REQ_ATOMIC) == (next->cmd_flags & REQ_ATOMIC);
 }
 
+static inline unsigned int bio_seg_gap(struct request_queue *q,
+				struct bio *next, struct bio *prev)
+{
+	unsigned int page_gaps = 0;
+	struct bio_vec pb, nb;
+
+	if (prev->bi_pg_bit)
+		page_gaps |= 1 << (prev->bi_pg_bit - 1);
+	if (next->bi_pg_bit)
+		page_gaps |= 1 << (next->bi_pg_bit - 1);
+
+	bio_get_last_bvec(prev, &pb);
+	bio_get_first_bvec(next, &nb);
+	if (!biovec_phys_mergeable(q, &pb, &nb))
+		page_gaps |= bvec_seg_gap(&nb, &pb);
+	return page_gaps;
+}
+
 /*
  * For non-mq, this has to be called with the request spinlock acquired.
  * For mq with scheduling, the appropriate queue wide lock should be held.
@@ -785,6 +814,8 @@ static struct request *attempt_merge(struct request_queue *q,
 	if (next->start_time_ns < req->start_time_ns)
 		req->start_time_ns = next->start_time_ns;
 
+	req->page_gap |= bio_seg_gap(req->q, next->bio, req->biotail) |
+			   next->page_gap;
 	req->biotail->bi_next = next->bio;
 	req->biotail = next->biotail;
 
@@ -908,6 +939,7 @@ enum bio_merge_status bio_attempt_back_merge(struct request *req,
 	if (req->rq_flags & RQF_ZONE_WRITE_PLUGGING)
 		blk_zone_write_plug_bio_merged(bio);
 
+	req->page_gap |= bio_seg_gap(req->q, bio, req->biotail);
 	req->biotail->bi_next = bio;
 	req->biotail = bio;
 	req->__data_len += bio->bi_iter.bi_size;
@@ -942,6 +974,7 @@ static enum bio_merge_status bio_attempt_front_merge(struct request *req,
 
 	blk_update_mixed_merge(req, bio, true);
 
+	req->page_gap |= bio_seg_gap(req->q, req->bio, bio);
 	bio->bi_next = req->bio;
 	req->bio = bio;
 

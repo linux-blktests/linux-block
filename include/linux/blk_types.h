@@ -218,6 +218,14 @@ struct bio {
 	enum rw_hint		bi_write_hint;
 	u8			bi_write_stream;
 	blk_status_t		bi_status;
+
+	/*
+	 * The page gap bit indicates the lowest set bit in any page address
+	 * offset between all bi_io_vecs. This field is initialized only after
+	 * splitting to the hardware limits.
+	 */
+	u8			bi_pg_bit;
+
 	atomic_t		__bi_remaining;
 
 	struct bvec_iter	bi_iter;
