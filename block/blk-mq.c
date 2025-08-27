@@ -2387,8 +2387,7 @@ void blk_mq_run_hw_queue(struct blk_mq_hw_ctx *hctx, bool async)
 EXPORT_SYMBOL(blk_mq_run_hw_queue);
 
 /*
- * Return prefered queue to dispatch from (if any) for non-mq aware IO
- * scheduler.
+ * Return preferred queue to dispatch from for single-queue IO schedulers.
  */
 static struct blk_mq_hw_ctx *blk_mq_get_sq_hctx(struct request_queue *q)
 {
@@ -2396,6 +2395,11 @@ static struct blk_mq_hw_ctx *blk_mq_get_sq_hctx(struct request_queue *q)
 	struct blk_mq_ctx *ctx;
 
 	if (!blk_queue_sq_sched(q))
+		return NULL;
+
+	if (blk_queue_is_zoned(q) && blk_pipeline_zwr(q) &&
+	    test_bit(ELEVATOR_FLAG_SUPPORTS_ZONED_WRITE_PIPELINING,
+		     &q->elevator->flags))
 		return NULL;
 
 	ctx = blk_mq_get_ctx(q);
