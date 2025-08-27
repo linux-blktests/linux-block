@@ -854,6 +854,8 @@ static inline unsigned int disk_nr_zones(struct gendisk *disk)
 	return disk->nr_zones;
 }
 
+bool blk_pipeline_zwr(struct request_queue *q);
+
 /**
  * bio_needs_zone_write_plugging - Check if a BIO needs to be handled with zone
  *				   write plugging
@@ -930,6 +932,11 @@ static inline unsigned int bdev_zone_capacity(struct block_device *bdev,
 static inline unsigned int disk_nr_zones(struct gendisk *disk)
 {
 	return 0;
+}
+
+static inline bool blk_pipeline_zwr(struct request_queue *q)
+{
+	return false;
 }
 
 static inline bool bio_needs_zone_write_plugging(struct bio *bio)
