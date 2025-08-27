@@ -311,10 +311,24 @@ static bool started_after(struct deadline_data *dd, struct request *rq,
 }
 
 /*
+ * If write pipelining is enabled, only dispatch sequential zoned writes if
+ * rq->mq_hctx == hctx.
+ */
+static bool dd_dispatch_from_hctx(struct blk_mq_hw_ctx *hctx,
+				  struct request *rq)
+{
+	struct request_queue *q = hctx->queue;
+
+	return !(q->limits.features & BLK_FEAT_ORDERED_HWQ) ||
+		rq->mq_hctx == hctx || !blk_rq_is_seq_zoned_write(rq);
+}
+
+/*
  * deadline_dispatch_requests selects the best request according to
  * read/write expire, fifo_batch, etc and with a start time <= @latest_start.
  */
 static struct request *__dd_dispatch_request(struct deadline_data *dd,
+					     struct blk_mq_hw_ctx *hctx,
 					     struct dd_per_prio *per_prio,
 					     unsigned long latest_start)
 {
@@ -339,7 +353,8 @@ static struct request *__dd_dispatch_request(struct deadline_data *dd,
 	 * batches are currently reads XOR writes
 	 */
 	rq = deadline_next_request(dd, per_prio, dd->last_dir);
-	if (rq && dd->batching < dd->fifo_batch) {
+	if (rq && dd->batching < dd->fifo_batch &&
+	    dd_dispatch_from_hctx(hctx, rq)) {
 		/* we have a next request and are still entitled to batch */
 		data_dir = rq_data_dir(rq);
 		goto dispatch_request;
@@ -399,7 +414,7 @@ dispatch_find_request:
 		rq = next_rq;
 	}
 
-	if (!rq)
+	if (!rq || !dd_dispatch_from_hctx(hctx, rq))
 		return NULL;
 
 	dd->last_dir = data_dir;
@@ -427,8 +442,9 @@ done:
  * Check whether there are any requests with priority other than DD_RT_PRIO
  * that were inserted more than prio_aging_expire jiffies ago.
  */
-static struct request *dd_dispatch_prio_aged_requests(struct deadline_data *dd,
-						      unsigned long now)
+static struct request *
+dd_dispatch_prio_aged_requests(struct deadline_data *dd,
+			       struct blk_mq_hw_ctx *hctx, unsigned long now)
 {
 	struct request *rq;
 	enum dd_prio prio;
@@ -442,7 +458,7 @@ static struct request *dd_dispatch_prio_aged_requests(struct deadline_data *dd,
 		return NULL;
 
 	for (prio = DD_BE_PRIO; prio <= DD_PRIO_MAX; prio++) {
-		rq = __dd_dispatch_request(dd, &dd->per_prio[prio],
+		rq = __dd_dispatch_request(dd, hctx, &dd->per_prio[prio],
 					   now - dd->prio_aging_expire);
 		if (rq)
 			return rq;
@@ -466,8 +482,8 @@ static struct request *dd_dispatch_request(struct blk_mq_hw_ctx *hctx)
 	struct request *rq;
 	enum dd_prio prio;
 
-	spin_lock(&dd->lock);
-	rq = dd_dispatch_prio_aged_requests(dd, now);
+	spin_lock_irq(&dd->lock);
+	rq = dd_dispatch_prio_aged_requests(dd, hctx, now);
 	if (rq)
 		goto unlock;
 
@@ -476,13 +492,13 @@ static struct request *dd_dispatch_request(struct blk_mq_hw_ctx *hctx)
 	 * requests if any higher priority requests are pending.
 	 */
 	for (prio = 0; prio <= DD_PRIO_MAX; prio++) {
-		rq = __dd_dispatch_request(dd, &dd->per_prio[prio], now);
+		rq = __dd_dispatch_request(dd, hctx, &dd->per_prio[prio], now);
 		if (rq || dd_queued(dd, prio))
 			break;
 	}
 
 unlock:
-	spin_unlock(&dd->lock);
+	spin_unlock_irq(&dd->lock);
 
 	return rq;
 }
@@ -538,9 +554,9 @@ static void dd_exit_sched(struct elevator_queue *e)
 		WARN_ON_ONCE(!list_empty(&per_prio->fifo_list[DD_READ]));
 		WARN_ON_ONCE(!list_empty(&per_prio->fifo_list[DD_WRITE]));
 
-		spin_lock(&dd->lock);
+		spin_lock_irq(&dd->lock);
 		queued = dd_queued(dd, prio);
-		spin_unlock(&dd->lock);
+		spin_unlock_irq(&dd->lock);
 
 		WARN_ONCE(queued != 0,
 			  "statistics for priority %d: i %u m %u d %u c %u\n",
@@ -585,6 +601,8 @@ static int dd_init_sched(struct request_queue *q, struct elevator_queue *eq)
 
 	/* We dispatch from request queue wide instead of hw queue */
 	blk_queue_flag_set(QUEUE_FLAG_SQ_SCHED, q);
+
+	set_bit(ELEVATOR_FLAG_SUPPORTS_ZONED_WRITE_PIPELINING, &eq->flags);
 
 	q->elevator = eq;
 	return 0;
@@ -633,9 +651,9 @@ static bool dd_bio_merge(struct request_queue *q, struct bio *bio,
 	struct request *free = NULL;
 	bool ret;
 
-	spin_lock(&dd->lock);
+	spin_lock_irq(&dd->lock);
 	ret = blk_mq_sched_try_merge(q, bio, nr_segs, &free);
-	spin_unlock(&dd->lock);
+	spin_unlock_irq(&dd->lock);
 
 	if (free)
 		blk_mq_free_request(free);
@@ -706,7 +724,7 @@ static void dd_insert_requests(struct blk_mq_hw_ctx *hctx,
 	struct deadline_data *dd = q->elevator->elevator_data;
 	LIST_HEAD(free);
 
-	spin_lock(&dd->lock);
+	spin_lock_irq(&dd->lock);
 	while (!list_empty(list)) {
 		struct request *rq;
 
@@ -714,7 +732,7 @@ static void dd_insert_requests(struct blk_mq_hw_ctx *hctx,
 		list_del_init(&rq->queuelist);
 		dd_insert_request(hctx, rq, flags, &free);
 	}
-	spin_unlock(&dd->lock);
+	spin_unlock_irq(&dd->lock);
 
 	blk_mq_free_requests(&free);
 }
@@ -741,11 +759,41 @@ static void dd_finish_request(struct request *rq)
 		atomic_inc(&per_prio->stats.completed);
 }
 
-static bool dd_has_work_for_prio(struct dd_per_prio *per_prio)
+/* May be called from interrupt context. */
+static bool dd_has_write_work(struct deadline_data *dd,
+			      struct blk_mq_hw_ctx *hctx,
+			      struct list_head *list)
+{
+	struct request_queue *q = hctx->queue;
+	unsigned long flags;
+	struct request *rq;
+	bool has_work = false;
+
+	if (list_empty_careful(list))
+		return false;
+
+	if (!(q->limits.features & BLK_FEAT_ORDERED_HWQ))
+		return true;
+
+	spin_lock_irqsave(&dd->lock, flags);
+	list_for_each_entry(rq, list, queuelist) {
+		if (rq->mq_hctx == hctx) {
+			has_work = true;
+			break;
+		}
+	}
+	spin_unlock_irqrestore(&dd->lock, flags);
+
+	return has_work;
+}
+
+static bool dd_has_work_for_prio(struct deadline_data *dd,
+				 struct blk_mq_hw_ctx *hctx,
+				 struct dd_per_prio *per_prio)
 {
 	return !list_empty_careful(&per_prio->dispatch) ||
 		!list_empty_careful(&per_prio->fifo_list[DD_READ]) ||
-		!list_empty_careful(&per_prio->fifo_list[DD_WRITE]);
+		dd_has_write_work(dd, hctx, &per_prio->fifo_list[DD_WRITE]);
 }
 
 static bool dd_has_work(struct blk_mq_hw_ctx *hctx)
@@ -754,7 +802,7 @@ static bool dd_has_work(struct blk_mq_hw_ctx *hctx)
 	enum dd_prio prio;
 
 	for (prio = 0; prio <= DD_PRIO_MAX; prio++)
-		if (dd_has_work_for_prio(&dd->per_prio[prio]))
+		if (dd_has_work_for_prio(dd, hctx, &dd->per_prio[prio]))
 			return true;
 
 	return false;
@@ -836,7 +884,7 @@ static void *deadline_##name##_fifo_start(struct seq_file *m,		\
 	struct deadline_data *dd = q->elevator->elevator_data;		\
 	struct dd_per_prio *per_prio = &dd->per_prio[prio];		\
 									\
-	spin_lock(&dd->lock);						\
+	spin_lock_irq(&dd->lock);						\
 	return seq_list_start(&per_prio->fifo_list[data_dir], *pos);	\
 }									\
 									\
@@ -856,7 +904,7 @@ static void deadline_##name##_fifo_stop(struct seq_file *m, void *v)	\
 	struct request_queue *q = m->private;				\
 	struct deadline_data *dd = q->elevator->elevator_data;		\
 									\
-	spin_unlock(&dd->lock);						\
+	spin_unlock_irq(&dd->lock);						\
 }									\
 									\
 static const struct seq_operations deadline_##name##_fifo_seq_ops = {	\
@@ -922,11 +970,11 @@ static int dd_queued_show(void *data, struct seq_file *m)
 	struct deadline_data *dd = q->elevator->elevator_data;
 	u32 rt, be, idle;
 
-	spin_lock(&dd->lock);
+	spin_lock_irq(&dd->lock);
 	rt = dd_queued(dd, DD_RT_PRIO);
 	be = dd_queued(dd, DD_BE_PRIO);
 	idle = dd_queued(dd, DD_IDLE_PRIO);
-	spin_unlock(&dd->lock);
+	spin_unlock_irq(&dd->lock);
 
 	seq_printf(m, "%u %u %u\n", rt, be, idle);
 
@@ -950,11 +998,11 @@ static int dd_owned_by_driver_show(void *data, struct seq_file *m)
 	struct deadline_data *dd = q->elevator->elevator_data;
 	u32 rt, be, idle;
 
-	spin_lock(&dd->lock);
+	spin_lock_irq(&dd->lock);
 	rt = dd_owned_by_driver(dd, DD_RT_PRIO);
 	be = dd_owned_by_driver(dd, DD_BE_PRIO);
 	idle = dd_owned_by_driver(dd, DD_IDLE_PRIO);
-	spin_unlock(&dd->lock);
+	spin_unlock_irq(&dd->lock);
 
 	seq_printf(m, "%u %u %u\n", rt, be, idle);
 
@@ -970,7 +1018,7 @@ static void *deadline_dispatch##prio##_start(struct seq_file *m,	\
 	struct deadline_data *dd = q->elevator->elevator_data;		\
 	struct dd_per_prio *per_prio = &dd->per_prio[prio];		\
 									\
-	spin_lock(&dd->lock);						\
+	spin_lock_irq(&dd->lock);					\
 	return seq_list_start(&per_prio->dispatch, *pos);		\
 }									\
 									\
@@ -990,7 +1038,7 @@ static void deadline_dispatch##prio##_stop(struct seq_file *m, void *v)	\
 	struct request_queue *q = m->private;				\
 	struct deadline_data *dd = q->elevator->elevator_data;		\
 									\
-	spin_unlock(&dd->lock);						\
+	spin_unlock_irq(&dd->lock);					\
 }									\
 									\
 static const struct seq_operations deadline_dispatch##prio##_seq_ops = { \
