@@ -459,6 +459,7 @@ int blk_rq_append_bio(struct request *rq, struct bio *bio)
 	if (rq->bio) {
 		if (!ll_back_merge_fn(rq, bio, nr_segs))
 			return -EINVAL;
+		rq->phys_gap |= bio_seg_gap(rq->q, rq->biotail, bio);
 		rq->biotail->bi_next = bio;
 		rq->biotail = bio;
 		rq->__data_len += bio->bi_iter.bi_size;
@@ -469,6 +470,8 @@ int blk_rq_append_bio(struct request *rq, struct bio *bio)
 	rq->nr_phys_segments = nr_segs;
 	rq->bio = rq->biotail = bio;
 	rq->__data_len = bio->bi_iter.bi_size;
+	if (bio->bi_bvec_gap_bit)
+		rq->phys_gap = 1 << (bio->bi_bvec_gap_bit - 1);
 	return 0;
 }
 EXPORT_SYMBOL(blk_rq_append_bio);
