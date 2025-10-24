@@ -320,8 +320,10 @@ static int mark_swapfiles(struct swap_map_handle *handle, unsigned int flags)
 		swsusp_header->flags = flags;
 		if (flags & SF_CRC32_MODE)
 			swsusp_header->crc32 = handle->crc32;
-		error = hib_submit_io_sync(REQ_OP_WRITE | REQ_SYNC,
+		error = hib_submit_io_sync(REQ_OP_WRITE | REQ_SYNC | REQ_PREFLUSH,
 				      swsusp_resume_block, swsusp_header);
+		if (!error)
+			error = blkdev_issue_flush(file_bdev(hib_resume_bdev_file));
 	} else {
 		pr_err("Swap header not found!\n");
 		error = -ENODEV;
