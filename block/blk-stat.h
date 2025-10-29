@@ -17,7 +17,7 @@
  * timer fires, @cpu_stat is flushed to @stat and @timer_fn is invoked.
  */
 struct blk_stat_callback {
-	/*
+	/**
 	 * @list: RCU list of callbacks for a &struct request_queue.
 	 */
 	struct list_head list;
@@ -50,7 +50,7 @@ struct blk_stat_callback {
 	struct blk_rq_stat *stat;
 
 	/**
-	 * @fn: Callback function.
+	 * @timer_fn: Callback function.
 	 */
 	void (*timer_fn)(struct blk_stat_callback *);
 
@@ -59,6 +59,9 @@ struct blk_stat_callback {
 	 */
 	void *data;
 
+	/**
+	 * @rcu: rcu list head
+	 */
 	struct rcu_head rcu;
 };
 
