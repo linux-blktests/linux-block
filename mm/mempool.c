@@ -381,23 +381,29 @@ out:
 EXPORT_SYMBOL(mempool_resize);
 
 /**
- * mempool_alloc - allocate an element from a memory pool
+ * mempool_alloc_bulk - allocate multiple elements from a memory pool
  * @pool:	pointer to the memory pool
+ * @elem:	partially or fully populated elements array
+ * @count:	size (in entries) of @elem
  * @gfp_mask:	GFP_* flags.
+ *
+ * Allocate elements for each slot in @elem that is non-%NULL.
  *
  * Note: This function only sleeps if the alloc_fn callback sleeps or returns
  * %NULL.  Using __GFP_ZERO is not supported.
  *
- * Return: pointer to the allocated element or %NULL on error. This function
- * never returns %NULL when @gfp_mask allows sleeping.
+ * Return: 0 if successful, else -ENOMEM.  This function never returns -ENOMEM
+ * when @gfp_mask allows sleeping.
  */
-void *mempool_alloc_noprof(mempool_t *pool, gfp_t gfp_mask)
+int mempool_alloc_bulk_noprof(struct mempool *pool, void **elem,
+		unsigned int count, gfp_t gfp_mask, unsigned long caller_ip)
 {
-	void *element;
 	unsigned long flags;
 	wait_queue_entry_t wait;
 	gfp_t gfp_temp;
+	unsigned int i;
 
+	VM_WARN_ON_ONCE(count > pool->min_nr);
 	VM_WARN_ON_ONCE(gfp_mask & __GFP_ZERO);
 	might_alloc(gfp_mask);
 
@@ -407,20 +413,31 @@ void *mempool_alloc_noprof(mempool_t *pool, gfp_t gfp_mask)
 
 	gfp_temp = gfp_mask & ~(__GFP_DIRECT_RECLAIM|__GFP_IO);
 
+	i = 0;
 repeat_alloc:
-	if (should_fail_ex(&fail_mempool_alloc, 1, FAULT_NOWARN)) {
-		pr_info("forcing mempool usage for pool %pS\n",
-				(void *)_RET_IP_);
-		element = NULL;
-	} else {
-		element = pool->alloc(gfp_temp, pool->pool_data);
-		if (likely(element != NULL))
-			return element;
+	for (; i < count; i++) {
+		if (!elem[i]) {
+			if (should_fail_ex(&fail_mempool_alloc, 1,
+					FAULT_NOWARN)) {
+				pr_info("forcing pool usage for pool %pS\n",
+					(void *)caller_ip);
+				goto use_pool;
+			}
+			elem[i] = pool->alloc(gfp_temp, pool->pool_data);
+			if (unlikely(!elem[i]))
+				goto use_pool;
+		}
 	}
 
+	return 0;
+
+use_pool:
 	spin_lock_irqsave(&pool->lock, flags);
-	if (likely(pool->curr_nr)) {
-		element = remove_element(pool);
+	if (likely(pool->curr_nr >= count - i)) {
+		for (; i < count; i++) {
+			if (!elem[i])
+				elem[i] = remove_element(pool);
+		}
 		spin_unlock_irqrestore(&pool->lock, flags);
 		/* paired with rmb in mempool_free(), read comment there */
 		smp_wmb();
@@ -428,8 +445,9 @@ repeat_alloc:
 		 * Update the allocation stack trace as this is more useful
 		 * for debugging.
 		 */
-		kmemleak_update_trace(element);
-		return element;
+		for (i = 0; i < count; i++)
+			kmemleak_update_trace(elem[i]);
+		return 0;
 	}
 
 	/*
@@ -445,10 +463,12 @@ repeat_alloc:
 	/* We must not sleep if !__GFP_DIRECT_RECLAIM */
 	if (!(gfp_mask & __GFP_DIRECT_RECLAIM)) {
 		spin_unlock_irqrestore(&pool->lock, flags);
-		return NULL;
+		if (i > 0)
+			mempool_free_bulk(pool, elem + i, count - i);
+		return -ENOMEM;
 	}
 
-	/* Let's wait for someone else to return an element to @pool */
+	/* Let's wait for someone else to return elements to @pool */
 	init_wait(&wait);
 	prepare_to_wait(&pool->wait, &wait, TASK_UNINTERRUPTIBLE);
 
@@ -462,6 +482,27 @@ repeat_alloc:
 
 	finish_wait(&pool->wait, &wait);
 	goto repeat_alloc;
+}
+EXPORT_SYMBOL_GPL(mempool_alloc_bulk_noprof);
+
+/**
+ * mempool_alloc - allocate an element from a memory pool
+ * @pool:	pointer to the memory pool
+ * @gfp_mask:	GFP_* flags.
+ *
+ * Note: This function only sleeps if the alloc_fn callback sleeps or returns
+ * %NULL.  Using __GFP_ZERO is not supported.
+ *
+ * Return: pointer to the allocated element or %NULL on error. This function
+ * never returns %NULL when @gfp_mask allows sleeping.
+ */
+void *mempool_alloc_noprof(struct mempool *pool, gfp_t gfp_mask)
+{
+	void *elem[1] = { };
+
+	if (mempool_alloc_bulk_noprof(pool, elem, 1, gfp_mask, _RET_IP_) < 0)
+		return NULL;
+	return elem[0];
 }
 EXPORT_SYMBOL(mempool_alloc_noprof);
 
@@ -502,21 +543,26 @@ void *mempool_alloc_preallocated(mempool_t *pool)
 EXPORT_SYMBOL(mempool_alloc_preallocated);
 
 /**
- * mempool_free - return an element to a mempool
- * @element:	pointer to element
+ * mempool_free_bulk - return elements to a mempool
  * @pool:	pointer to the memory pool
+ * @elem:	elements to return
+ * @count:	number of elements to return
  *
- * Returns @elem to @pool if its needs replenishing, else free it using
- * the free_fn callback in @pool.
+ * Returns elements from @elem to @pool if its needs replenishing and sets
+ * their slot in @elem to NULL.  Other elements are left in @elem.
+ *
+ * Return: number of elements transferred to @pool.  Elements are always
+ * transferred from the beginning of @elem, so the return value can be used as
+ * an offset into @elem for the freeing the remaining elements in the caller.
  *
  * This function only sleeps if the free_fn callback sleeps.
  */
-void mempool_free(void *element, mempool_t *pool)
+unsigned int mempool_free_bulk(struct mempool *pool, void **elem,
+		unsigned int count)
 {
 	unsigned long flags;
-
-	if (unlikely(element == NULL))
-		return;
+	bool added = false;
+	unsigned int freed = 0;
 
 	/*
 	 * Paired with the wmb in mempool_alloc().  The preceding read is
@@ -553,15 +599,11 @@ void mempool_free(void *element, mempool_t *pool)
 	 */
 	if (unlikely(READ_ONCE(pool->curr_nr) < pool->min_nr)) {
 		spin_lock_irqsave(&pool->lock, flags);
-		if (likely(pool->curr_nr < pool->min_nr)) {
-			add_element(pool, element);
-			spin_unlock_irqrestore(&pool->lock, flags);
-			if (wq_has_sleeper(&pool->wait))
-				wake_up(&pool->wait);
-			return;
+		while (pool->curr_nr < pool->min_nr && freed < count) {
+			add_element(pool, elem[freed++]);
+			added = true;
 		}
 		spin_unlock_irqrestore(&pool->lock, flags);
-	}
 
 	/*
 	 * Handle the min_nr = 0 edge case:
@@ -572,20 +614,41 @@ void mempool_free(void *element, mempool_t *pool)
 	 * allocation of element when both min_nr and curr_nr are 0, and
 	 * any active waiters are properly awakened.
 	 */
-	if (unlikely(pool->min_nr == 0 &&
+	} else if (unlikely(pool->min_nr == 0 &&
 		     READ_ONCE(pool->curr_nr) == 0)) {
 		spin_lock_irqsave(&pool->lock, flags);
 		if (likely(pool->curr_nr == 0)) {
-			add_element(pool, element);
-			spin_unlock_irqrestore(&pool->lock, flags);
-			if (wq_has_sleeper(&pool->wait))
-				wake_up(&pool->wait);
-			return;
+			add_element(pool, elem[freed++]);
+			added = true;
 		}
 		spin_unlock_irqrestore(&pool->lock, flags);
 	}
 
-	pool->free(element, pool->pool_data);
+	if (unlikely(added) && wq_has_sleeper(&pool->wait))
+		wake_up(&pool->wait);
+
+	return freed;
+}
+EXPORT_SYMBOL_GPL(mempool_free_bulk);
+
+/**
+ * mempool_free - return an element to the pool.
+ * @element:	element to return
+ * @pool:	pointer to the memory pool
+ *
+ * Returns @elem to @pool if its needs replenishing, else free it using
+ * the free_fn callback in @pool.
+ *
+ * This function only sleeps if the free_fn callback sleeps.
+ */
+void mempool_free(void *element, struct mempool *pool)
+{
+	if (likely(element)) {
+		void *elem[1] = { element };
+
+		if (!mempool_free_bulk(pool, elem, 1))
+			pool->free(element, pool->pool_data);
+	}
 }
 EXPORT_SYMBOL(mempool_free);
 
