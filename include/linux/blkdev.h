@@ -1676,6 +1676,11 @@ struct block_device_operations {
 	 * driver.
 	 */
 	int (*alternative_gpt_sector)(struct gendisk *disk, sector_t *sector);
+
+	/*
+	 * This invalidates the device cache when hibernating.
+	 */
+	int (*hibernate)(struct gendisk *disk);
 };
 
 #ifdef CONFIG_COMPAT
@@ -1874,5 +1879,12 @@ static inline int bio_split_rw_at(struct bio *bio,
 }
 
 #define DEFINE_IO_COMP_BATCH(name)	struct io_comp_batch name = { }
+
+static inline int bdev_hibernate(struct block_device *bdev)
+{
+	if (!bdev->bd_disk->fops->hibernate)
+		return 0;
+	return bdev->bd_disk->fops->hibernate(bdev->bd_disk);
+}
 
 #endif /* _LINUX_BLKDEV_H */

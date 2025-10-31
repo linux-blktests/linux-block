@@ -827,6 +827,10 @@ int hibernate(void)
 	if (error)
 		goto Exit;
 
+	error = notify_swap_device();
+	if (error)
+		goto Thaw;
+
 	lock_device_hotplug();
 	/* Allocate memory management structures */
 	error = create_basic_memory_bitmaps();

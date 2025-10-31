@@ -1595,6 +1595,9 @@ int swsusp_check(bool exclusive)
 			error = hib_submit_io_sync(REQ_OP_WRITE | REQ_SYNC | REQ_FUA,
 						swsusp_resume_block,
 						swsusp_header);
+
+			/* Flush device-mapper related metadata */
+			bdev_hibernate(file_bdev(hib_resume_bdev_file));
 		} else {
 			error = -EINVAL;
 		}
@@ -1632,6 +1635,23 @@ void swsusp_close(void)
 	}
 
 	fput(hib_resume_bdev_file);
+}
+
+int notify_swap_device(void)
+{
+	int error;
+
+	error = swsusp_swap_check();
+	if (error)
+		return error;
+
+	error = bdev_hibernate(file_bdev(hib_resume_bdev_file));
+	if (error)
+		pr_err("Swap is on unsupported device\n");
+
+	swsusp_close();
+
+	return error;
 }
 
 /**

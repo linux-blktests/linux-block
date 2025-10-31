@@ -4053,6 +4053,45 @@ static void dm_integrity_io_hints(struct dm_target *ti, struct queue_limits *lim
 	limits->max_integrity_segments = USHRT_MAX;
 }
 
+static int dm_integrity_hibernate(struct dm_target *ti)
+{
+	struct dm_integrity_c *ic = ti->private;
+	int r;
+
+	timer_delete_sync(&ic->autocommit_timer);
+
+	if (ic->recalc_wq)
+		drain_workqueue(ic->recalc_wq);		/* !!! FIXME */
+
+	if (ic->mode == 'B')
+		cancel_delayed_work_sync(&ic->bitmap_flush_work);
+
+	queue_work(ic->commit_wq, &ic->commit_work);
+	drain_workqueue(ic->commit_wq);
+
+	if (ic->mode == 'J') {
+		queue_work(ic->writer_wq, &ic->writer_work);
+		drain_workqueue(ic->writer_wq);
+		dm_integrity_flush_buffers(ic, true);
+		init_journal(ic, ic->free_section,
+			     ic->journal_sections - ic->free_section, ic->commit_seq);
+		if (ic->free_section) {
+			init_journal(ic, 0, ic->free_section,
+				     next_commit_seq(ic->commit_seq));
+		}
+	}
+
+	dm_bufio_client_reset(ic->bufio);
+
+	if (ic->meta_dev) {
+		r = bdev_hibernate(ic->meta_dev->bdev);
+		if (r)
+			return r;
+	}
+
+	return 0;
+}
+
 static void calculate_journal_section_size(struct dm_integrity_c *ic)
 {
 	unsigned int sector_space = JOURNAL_SECTOR_DATA;
@@ -5414,7 +5453,7 @@ static struct target_type integrity_target = {
 	.name			= "integrity",
 	.version		= {1, 14, 0},
 	.module			= THIS_MODULE,
-	.features		= DM_TARGET_SINGLETON | DM_TARGET_INTEGRITY,
+	.features		= DM_TARGET_SINGLETON | DM_TARGET_INTEGRITY | DM_TARGET_HIBERNATE,
 	.ctr			= dm_integrity_ctr,
 	.dtr			= dm_integrity_dtr,
 	.map			= dm_integrity_map,
@@ -5424,6 +5463,7 @@ static struct target_type integrity_target = {
 	.status			= dm_integrity_status,
 	.iterate_devices	= dm_integrity_iterate_devices,
 	.io_hints		= dm_integrity_io_hints,
+	.hibernate		= dm_integrity_hibernate,
 };
 
 static int __init dm_integrity_init(void)

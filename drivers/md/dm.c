@@ -3439,6 +3439,50 @@ out:
 	return ret;
 }
 
+static int __dm_hibernate(struct dm_target *ti, struct dm_dev *dev,
+			  sector_t start, sector_t len, void *data)
+{
+	return bdev_hibernate(dev->bdev);
+}
+
+static int dm_blk_hibernate(struct gendisk *disk)
+{
+	struct mapped_device *md = disk->private_data;
+	int srcu_idx;
+	struct dm_table *map;
+	int r = 0;
+
+	map = dm_get_live_table(md, &srcu_idx);
+	if (unlikely(!map))
+		goto out;
+
+	for (unsigned int i = 0; i < map->num_targets; i++) {
+		struct dm_target *ti = dm_table_get_target(map, i);
+
+		if (!dm_target_supports_hibernate(ti->type)) {
+			r = -EOPNOTSUPP;
+			goto out;
+		}
+
+		if (ti->type->hibernate) {
+			r = ti->type->hibernate(ti);
+			if (r)
+				goto out;
+		}
+
+		if (ti->type->iterate_devices) {
+			r = ti->type->iterate_devices(ti, __dm_hibernate, NULL);
+			if (r)
+				goto out;
+		}
+	}
+
+out:
+	dm_put_live_table(md, srcu_idx);
+
+	return r;
+}
+
 struct dm_pr {
 	u64	old_key;
 	u64	new_key;
@@ -3768,6 +3812,7 @@ static const struct block_device_operations dm_blk_dops = {
 	.getgeo = dm_blk_getgeo,
 	.report_zones = dm_blk_report_zones,
 	.get_unique_id = dm_blk_get_unique_id,
+	.hibernate = dm_blk_hibernate,
 	.pr_ops = &dm_pr_ops,
 	.owner = THIS_MODULE
 };

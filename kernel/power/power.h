@@ -68,6 +68,8 @@ extern int hibernation_snapshot(int platform_mode);
 extern int hibernation_restore(int platform_mode);
 extern int hibernation_platform_enter(void);
 
+extern int notify_swap_device(void);
+
 #ifdef CONFIG_STRICT_KERNEL_RWX
 /* kernel/power/snapshot.c */
 extern void enable_restore_image_protection(void);

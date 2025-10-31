@@ -142,6 +142,8 @@ typedef int (*dm_iterate_devices_fn) (struct dm_target *ti,
 typedef void (*dm_io_hints_fn) (struct dm_target *ti,
 				struct queue_limits *limits);
 
+typedef int (*dm_hibernate_fn) (struct dm_target *ti);
+
 /*
  * Returns:
  *    0: The target can handle the next I/O immediately.
@@ -219,6 +221,7 @@ struct target_type {
 	dm_busy_fn busy;
 	dm_iterate_devices_fn iterate_devices;
 	dm_io_hints_fn io_hints;
+	dm_hibernate_fn hibernate;
 	dm_dax_direct_access_fn direct_access;
 	dm_dax_zero_page_range_fn dax_zero_page_range;
 	dm_dax_recovery_write_fn dax_recovery_write;
@@ -308,6 +311,9 @@ struct target_type {
 
 #define DM_TARGET_ATOMIC_WRITES		0x00000400
 #define dm_target_supports_atomic_writes(type) ((type)->features & DM_TARGET_ATOMIC_WRITES)
+
+#define DM_TARGET_HIBERNATE		0x00000800
+#define dm_target_supports_hibernate(type) ((type)->features & DM_TARGET_HIBERNATE)
 
 struct dm_target {
 	struct dm_table *table;
