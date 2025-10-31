@@ -171,6 +171,22 @@ static inline bool bio_has_crypt_ctx(struct bio *bio)
 
 #endif /* CONFIG_BLK_INLINE_ENCRYPTION */
 
+bool __blk_crypto_submit_bio(struct bio *bio);
+
+/**
+ * blk_crypto_submit_bio - Submit a bio using inline encryption
+ * @bio: bio to submit
+ *
+ * If the bio crypt context attached to @bio is supported by the underlying
+ * device's inline encryption hardware, just submit @bio.  Otherwise, try to
+ * perform en/decryption for this bio by falling back to the kernel crypto API.
+ */
+static inline void blk_crypto_submit_bio(struct bio *bio)
+{
+	if (!bio_has_crypt_ctx(bio) || __blk_crypto_submit_bio(bio))
+		submit_bio(bio);
+}
+
 int __bio_crypt_clone(struct bio *dst, struct bio *src, gfp_t gfp_mask);
 /**
  * bio_crypt_clone - clone bio encryption context

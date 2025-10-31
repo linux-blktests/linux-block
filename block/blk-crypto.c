@@ -258,57 +258,36 @@ void __blk_crypto_free_request(struct request *rq)
 	rq->crypt_ctx = NULL;
 }
 
-/**
- * __blk_crypto_bio_prep - Prepare bio for inline encryption
- *
- * @bio_ptr: pointer to original bio pointer
- *
- * If the bio crypt context provided for the bio is supported by the underlying
- * device's inline encryption hardware, do nothing.
- *
- * Otherwise, try to perform en/decryption for this bio by falling back to the
- * kernel crypto API. When the crypto API fallback is used for encryption,
- * blk-crypto may choose to split the bio into 2 - the first one that will
- * continue to be processed and the second one that will be resubmitted via
- * submit_bio_noacct. A bounce bio will be allocated to encrypt the contents
- * of the aforementioned "first one", and *bio_ptr will be updated to this
- * bounce bio.
- *
- * Caller must ensure bio has bio_crypt_ctx.
- *
- * Return: true on success; false on error (and bio->bi_status will be set
- *	   appropriately, and bio_endio() will have been called so bio
- *	   submission should abort).
- */
-bool __blk_crypto_bio_prep(struct bio **bio_ptr)
+bool __blk_crypto_submit_bio(struct bio *bio)
 {
-	struct bio *bio = *bio_ptr;
 	const struct blk_crypto_key *bc_key = bio->bi_crypt_context->bc_key;
 
-	/* Error if bio has no data. */
-	if (WARN_ON_ONCE(!bio_has_data(bio))) {
-		bio->bi_status = BLK_STS_IOERR;
-		goto fail;
-	}
-
 	if (!bio_crypt_check_alignment(bio)) {
-		bio->bi_status = BLK_STS_IOERR;
-		goto fail;
+		bio_io_error(bio);
+		return false;
 	}
 
-	/*
-	 * Success if device supports the encryption context, or if we succeeded
-	 * in falling back to the crypto API.
-	 */
-	if (blk_crypto_config_supported_natively(bio->bi_bdev,
-						 &bc_key->crypto_cfg))
-		return true;
-	if (blk_crypto_fallback_bio_prep(bio_ptr))
-		return true;
-fail:
-	bio_endio(*bio_ptr);
-	return false;
+	if (!blk_crypto_config_supported_natively(bio->bi_bdev,
+			&bc_key->crypto_cfg)) {
+		if (!IS_ENABLED(CONFIG_BLK_INLINE_ENCRYPTION_FALLBACK)) {
+			pr_warn_once("crypto API fallback disabled; failing request.\n");
+			bio->bi_status = BLK_STS_NOTSUPP;
+			bio_endio(bio);
+			return false;
+		}
+
+		if (bio_data_dir(bio) == WRITE) {
+			blk_crypto_fallback_encrypt_bio(bio);
+			return false;
+		}
+
+		if (!blk_crypto_fallback_prep_decrypt_bio(bio))
+			return false;
+	}
+
+	return true;
 }
+EXPORT_SYMBOL_GPL(__blk_crypto_submit_bio);
 
 int __blk_crypto_rq_bio_prep(struct request *rq, struct bio *bio,
 			     gfp_t gfp_mask)
