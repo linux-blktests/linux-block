@@ -320,7 +320,7 @@ static int mark_swapfiles(struct swap_map_handle *handle, unsigned int flags)
 		swsusp_header->flags = flags;
 		if (flags & SF_CRC32_MODE)
 			swsusp_header->crc32 = handle->crc32;
-		error = hib_submit_io_sync(REQ_OP_WRITE | REQ_SYNC,
+		error = hib_submit_io_sync(REQ_OP_WRITE | REQ_SYNC | REQ_PREFLUSH | REQ_FUA,
 				      swsusp_resume_block, swsusp_header);
 	} else {
 		pr_err("Swap header not found!\n");
@@ -486,11 +486,12 @@ static int flush_swap_writer(struct swap_map_handle *handle)
 static int swap_writer_finish(struct swap_map_handle *handle,
 		unsigned int flags, int error)
 {
+	if (!error)
+		error = flush_swap_writer(handle);
 	if (!error) {
 		pr_info("S");
 		error = mark_swapfiles(handle, flags);
 		pr_cont("|\n");
-		flush_swap_writer(handle);
 	}
 
 	if (error)
@@ -1591,7 +1592,7 @@ int swsusp_check(bool exclusive)
 			memcpy(swsusp_header->sig, swsusp_header->orig_sig, 10);
 			swsusp_header_flags = swsusp_header->flags;
 			/* Reset swap signature now */
-			error = hib_submit_io_sync(REQ_OP_WRITE | REQ_SYNC,
+			error = hib_submit_io_sync(REQ_OP_WRITE | REQ_SYNC | REQ_FUA,
 						swsusp_resume_block,
 						swsusp_header);
 		} else {
@@ -1645,7 +1646,7 @@ int swsusp_unmark(void)
 	hib_submit_io_sync(REQ_OP_READ, swsusp_resume_block, swsusp_header);
 	if (!memcmp(HIBERNATE_SIG,swsusp_header->sig, 10)) {
 		memcpy(swsusp_header->sig,swsusp_header->orig_sig, 10);
-		error = hib_submit_io_sync(REQ_OP_WRITE | REQ_SYNC,
+		error = hib_submit_io_sync(REQ_OP_WRITE | REQ_SYNC | REQ_FUA,
 					swsusp_resume_block,
 					swsusp_header);
 	} else {
