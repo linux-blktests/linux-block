@@ -919,6 +919,19 @@ static inline bool blkdev_has_cached_report_zones(struct block_device *bdev)
 		 !test_bit(GD_ZONE_APPEND_USED, &bdev->bd_disk->state));
 }
 
+/*
+ * For devices that natively support zone append operations, we do not use zone
+ * write plugging for zone append writes, which makes the zone condition
+ * tracking invalid once zone append was used.  In that case fall back to a
+ * regular report zones to get correct information.
+ */
+static inline bool blkdev_has_cached_report_zones(struct block_device *bdev)
+{
+	return disk_need_zone_resources(bdev->bd_disk) &&
+		(bdev_emulates_zone_append(bdev) ||
+		 !test_bit(GD_ZONE_APPEND_USED, &bdev->bd_disk->state));
+}
+
 /**
  * blkdev_get_zone_info - Get a single zone information from cached data
  * @bdev:   Target block device
@@ -951,6 +964,9 @@ int blkdev_get_zone_info(struct block_device *bdev, sector_t sector,
 
 	memset(zone, 0, sizeof(*zone));
 	sector = bdev_zone_start(bdev, sector);
+
+	if (!blkdev_has_cached_report_zones(bdev))
+		return blkdev_report_zone_fallback(bdev, sector, zone);
 
 	if (!blkdev_has_cached_report_zones(bdev))
 		return blkdev_report_zone_fallback(bdev, sector, zone);
