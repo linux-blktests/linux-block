@@ -934,7 +934,7 @@ static inline bool blkdev_has_cached_report_zones(struct block_device *bdev)
  *
  *    Returns 0 on success and a negative error code on failure.
  */
-int blkdev_get_zone_info(struct block_device *bdev, sector_t sector,
+static int blkdev_get_zone_info(struct block_device *bdev, sector_t sector,
 			 struct blk_zone *zone)
 {
 	struct gendisk *disk = bdev->bd_disk;
@@ -1024,7 +1024,6 @@ int blkdev_get_zone_info(struct block_device *bdev, sector_t sector,
 
 	return 0;
 }
-EXPORT_SYMBOL_GPL(blkdev_get_zone_info);
 
 /**
  * blkdev_report_zones_cached - Get cached zones information
