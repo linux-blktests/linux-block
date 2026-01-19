@@ -311,7 +311,7 @@ static int iomap_dio_bio_iter(struct iomap_iter *iter, struct iomap_dio *dio)
 	blk_opf_t bio_opf = REQ_SYNC | REQ_IDLE;
 	struct bio *bio;
 	bool need_zeroout = false;
-	int nr_pages, ret = 0;
+	int ret = 0;
 	u64 copied = 0;
 	size_t orig_count;
 	unsigned int alignment;
@@ -439,7 +439,6 @@ static int iomap_dio_bio_iter(struct iomap_iter *iter, struct iomap_dio *dio)
 			goto out;
 	}
 
-	nr_pages = bio_iov_vecs_to_alloc(dio->submit.iter, BIO_MAX_VECS);
 	do {
 		size_t n;
 
@@ -452,7 +451,9 @@ static int iomap_dio_bio_iter(struct iomap_iter *iter, struct iomap_dio *dio)
 			goto out;
 		}
 
-		bio = iomap_dio_alloc_bio(iter, dio, nr_pages, bio_opf);
+		bio = iomap_dio_alloc_bio(iter, dio,
+				bio_iov_vecs_to_alloc(dio->submit.iter,
+						BIO_MAX_VECS), bio_opf);
 		fscrypt_set_bio_crypt_ctx(bio, inode, pos >> inode->i_blkbits,
 					  GFP_KERNEL);
 		bio->bi_iter.bi_sector = iomap_sector(iomap, pos);
@@ -494,16 +495,14 @@ static int iomap_dio_bio_iter(struct iomap_iter *iter, struct iomap_dio *dio)
 		dio->size += n;
 		copied += n;
 
-		nr_pages = bio_iov_vecs_to_alloc(dio->submit.iter,
-						 BIO_MAX_VECS);
 		/*
 		 * We can only poll for single bio I/Os.
 		 */
-		if (nr_pages)
+		if (iov_iter_count(dio->submit.iter))
 			dio->iocb->ki_flags &= ~IOCB_HIPRI;
 		iomap_dio_submit_bio(iter, dio, bio, pos);
 		pos += n;
-	} while (nr_pages);
+	} while (iov_iter_count(dio->submit.iter));
 
 	/*
 	 * We need to zeroout the tail of a sub-block write if the extent type
