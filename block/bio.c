@@ -921,7 +921,7 @@ static inline bool bio_full(struct bio *bio, unsigned len)
 {
 	if (bio->bi_vcnt >= bio->bi_max_vecs)
 		return true;
-	if (bio->bi_iter.bi_size > UINT_MAX - len)
+	if (bio->bi_iter.bi_size > BIO_MAX_SIZE - len)
 		return true;
 	return false;
 }
@@ -1027,7 +1027,7 @@ int bio_add_page(struct bio *bio, struct page *page,
 {
 	if (WARN_ON_ONCE(bio_flagged(bio, BIO_CLONED)))
 		return 0;
-	if (bio->bi_iter.bi_size > UINT_MAX - len)
+	if (bio->bi_iter.bi_size > BIO_MAX_SIZE - len)
 		return 0;
 
 	if (bio->bi_vcnt > 0) {
@@ -1054,7 +1054,7 @@ void bio_add_folio_nofail(struct bio *bio, struct folio *folio, size_t len,
 {
 	unsigned long nr = off / PAGE_SIZE;
 
-	WARN_ON_ONCE(len > UINT_MAX);
+	WARN_ON_ONCE(len > BIO_MAX_SIZE);
 	__bio_add_page(bio, folio_page(folio, nr), len, off % PAGE_SIZE);
 }
 EXPORT_SYMBOL_GPL(bio_add_folio_nofail);
@@ -1078,7 +1078,7 @@ bool bio_add_folio(struct bio *bio, struct folio *folio, size_t len,
 {
 	unsigned long nr = off / PAGE_SIZE;
 
-	if (len > UINT_MAX)
+	if (len > BIO_MAX_SIZE)
 		return false;
 	return bio_add_page(bio, folio_page(folio, nr), len, off % PAGE_SIZE) > 0;
 }
@@ -1235,7 +1235,7 @@ static int __bio_iov_iter_get_pages(struct bio *bio, struct iov_iter *iter)
 		extraction_flags |= ITER_ALLOW_P2PDMA;
 
 	size = iov_iter_extract_pages(iter, &pages,
-				      UINT_MAX - bio->bi_iter.bi_size,
+				      BIO_MAX_SIZE - bio->bi_iter.bi_size,
 				      nr_pages, extraction_flags, &offset);
 	if (unlikely(size <= 0))
 		return size ? size : -EFAULT;
