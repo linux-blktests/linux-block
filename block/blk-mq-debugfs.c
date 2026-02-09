@@ -623,9 +623,19 @@ static void debugfs_create_files(struct request_queue *q, struct dentry *parent,
 	if (IS_ERR_OR_NULL(parent))
 		return;
 
+	/*
+	 * Avoid creating debugfs files while the queue is frozen, wait for
+	 * the queue to be unfrozen and prevent new freeze while creating
+	 * debugfs files.
+	 */
+	if (blk_queue_enter(q, 0))
+		return;
+
 	for (; attr->name; attr++)
 		debugfs_create_file_aux(attr->name, attr->mode, parent,
 				    (void *)attr, data, &blk_mq_debugfs_fops);
+
+	blk_queue_exit(q);
 }
 
 void blk_mq_debugfs_register(struct request_queue *q)
