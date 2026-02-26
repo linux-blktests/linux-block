@@ -1621,10 +1621,6 @@ static void zram_debugfs_unregister(struct zram *zram) {};
 
 static void comp_algorithm_set(struct zram *zram, u32 prio, const char *alg)
 {
-	/* Do not free statically defined compression algorithms */
-	if (zram->comp_algs[prio] != default_compressor)
-		kfree(zram->comp_algs[prio]);
-
 	zram->comp_algs[prio] = alg;
 }
 
@@ -1632,6 +1628,7 @@ static int __comp_algorithm_store(struct zram *zram, u32 prio, const char *buf)
 {
 	char *compressor;
 	size_t sz;
+	const char *alg;
 
 	sz = strlen(buf);
 	if (sz >= ZRAM_MAX_ALGO_NAME_SZ)
@@ -1645,10 +1642,10 @@ static int __comp_algorithm_store(struct zram *zram, u32 prio, const char *buf)
 	if (sz > 0 && compressor[sz - 1] == '\n')
 		compressor[sz - 1] = 0x00;
 
-	if (!zcomp_available_algorithm(compressor)) {
-		kfree(compressor);
+	alg = zcomp_lookup_backend_name(compressor);
+	kfree(compressor);
+	if (!alg)
 		return -EINVAL;
-	}
 
 	guard(rwsem_write)(&zram->dev_lock);
 	if (init_done(zram)) {
@@ -1657,7 +1654,7 @@ static int __comp_algorithm_store(struct zram *zram, u32 prio, const char *buf)
 		return -EBUSY;
 	}
 
-	comp_algorithm_set(zram, prio, compressor);
+	comp_algorithm_set(zram, prio, alg);
 	return 0;
 }
 
@@ -2840,12 +2837,8 @@ static void zram_destroy_comps(struct zram *zram)
 		zram->num_active_comps--;
 	}
 
-	for (prio = ZRAM_PRIMARY_COMP; prio < ZRAM_MAX_COMPS; prio++) {
-		/* Do not free statically defined compression algorithms */
-		if (zram->comp_algs[prio] != default_compressor)
-			kfree(zram->comp_algs[prio]);
+	for (prio = ZRAM_PRIMARY_COMP; prio < ZRAM_MAX_COMPS; prio++)
 		zram->comp_algs[prio] = NULL;
-	}
 
 	zram_comp_params_reset(zram);
 }
