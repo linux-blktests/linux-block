@@ -4174,7 +4174,7 @@ static void set_default_phy_complete(struct hci_dev *hdev, void *data, int err)
 		mgmt_phy_configuration_changed(hdev, cmd->sk);
 	}
 
-	if (skb && !IS_ERR(skb))
+	if (!IS_ERR_OR_NULL(skb))
 		kfree_skb(skb);
 
 	mgmt_pending_free(cmd);
@@ -5735,7 +5735,7 @@ static void read_local_oob_data_complete(struct hci_dev *hdev, void *data,
 			  MGMT_STATUS_SUCCESS, &mgmt_rp, rp_size);
 
 remove:
-	if (skb && !IS_ERR(skb))
+	if (!IS_ERR_OR_NULL(skb))
 		kfree_skb(skb);
 
 	mgmt_pending_free(cmd);
@@ -8285,7 +8285,7 @@ send_rsp:
 				 mgmt_rp, sizeof(*mgmt_rp) + eir_len,
 				 HCI_MGMT_OOB_DATA_EVENTS, cmd->sk);
 done:
-	if (skb && !IS_ERR(skb))
+	if (!IS_ERR_OR_NULL(skb))
 		kfree_skb(skb);
 
 	kfree(mgmt_rp);
