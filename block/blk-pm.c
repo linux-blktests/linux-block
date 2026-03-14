@@ -181,7 +181,6 @@ void blk_post_runtime_resume(struct request_queue *q)
 	spin_lock_irq(&q->queue_lock);
 	old_status = q->rpm_status;
 	q->rpm_status = RPM_ACTIVE;
-	pm_runtime_mark_last_busy(q->dev);
 	pm_request_autosuspend(q->dev);
 	spin_unlock_irq(&q->queue_lock);
 
