@@ -247,6 +247,7 @@ static inline void *bvec_kmap_local(struct bio_vec *bvec)
 
 /**
  * memcpy_from_bvec - copy data from a bvec
+ * @to: destination buffer
  * @bvec: bvec to copy from
  *
  * Must be called on single-page bvecs only.
@@ -259,6 +260,7 @@ static inline void memcpy_from_bvec(char *to, struct bio_vec *bvec)
 /**
  * memcpy_to_bvec - copy data to a bvec
  * @bvec: bvec to copy to
+ * @from: source buffer
  *
  * Must be called on single-page bvecs only.
  */
