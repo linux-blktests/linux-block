@@ -2414,7 +2414,8 @@ static void ioc_timer_fn(struct timer_list *timer)
 		/* clearly missing QoS targets, slow down vrate */
 		ioc->busy_level = max(ioc->busy_level, 0);
 		ioc->busy_level++;
-	} else if (rq_wait_pct <= RQ_WAIT_BUSY_PCT * UNBUSY_THR_PCT / 100 &&
+	} else if (nr_done &&
+		   rq_wait_pct <= RQ_WAIT_BUSY_PCT * UNBUSY_THR_PCT / 100 &&
 		   missed_ppm[READ] <= ppm_rthr * UNBUSY_THR_PCT / 100 &&
 		   missed_ppm[WRITE] <= ppm_wthr * UNBUSY_THR_PCT / 100) {
 		/* QoS targets are being met with >25% margin */
@@ -2440,7 +2441,7 @@ static void ioc_timer_fn(struct timer_list *timer)
 			 */
 			ioc->busy_level = 0;
 		}
-	} else {
+	} else if (nr_done) {
 		/* inside the hysterisis margin, we're good */
 		ioc->busy_level = 0;
 	}
