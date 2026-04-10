@@ -10,11 +10,119 @@ use crate::{
     error::{from_result, Result},
     prelude::*,
     sync::{aref::ARef, Refcount},
-    types::ForeignOwnable,
+    types::{ForeignOwnable, Opaque},
 };
 use core::marker::PhantomData;
 
 type ForeignBorrowed<'a, T> = <T as ForeignOwnable>::Borrowed<'a>;
+
+/// A borrowed blk-mq hardware queue context.
+///
+/// # Invariants
+///
+/// [`HwCtx`] is a transparent wrapper around a live `bindings::blk_mq_hw_ctx`.
+#[repr(transparent)]
+pub struct HwCtx(Opaque<bindings::blk_mq_hw_ctx>);
+
+impl HwCtx {
+    /// Creates a reference to an [`HwCtx`] from a valid raw pointer.
+    ///
+    /// # Safety
+    ///
+    /// The caller must ensure that `ptr` points to a live
+    /// `bindings::blk_mq_hw_ctx` for the duration of `'a`.
+    ///
+    /// The caller must also ensure that the returned reference is the only
+    /// Rust view used to access the underlying hardware context for the
+    /// duration of `'a`.
+    pub(crate) unsafe fn from_raw<'a>(ptr: *mut bindings::blk_mq_hw_ctx) -> &'a Self {
+        // SAFETY: `Self` is a transparent wrapper around `bindings::blk_mq_hw_ctx`.
+        unsafe { &*ptr.cast() }
+    }
+
+    /// Returns a raw pointer to the underlying `struct blk_mq_hw_ctx`.
+    pub fn as_ptr(&self) -> *mut bindings::blk_mq_hw_ctx {
+        self as *const Self as *mut bindings::blk_mq_hw_ctx
+    }
+
+    /// Returns the index of this hardware queue.
+    pub fn queue_num(&self) -> u32 {
+        // SAFETY: By the type invariant, `self` wraps a live hardware context.
+        unsafe { (*self.as_ptr()).queue_num }
+    }
+}
+
+/// A borrowed blk-mq completion batching context.
+///
+/// # Invariants
+///
+/// [`IoCompBatch`] is a transparent wrapper around a live
+/// `bindings::io_comp_batch`.
+#[repr(transparent)]
+pub struct IoCompBatch(Opaque<bindings::io_comp_batch>);
+
+impl IoCompBatch {
+    /// Creates an optional reference to an [`IoCompBatch`] from a raw pointer.
+    ///
+    /// # Safety
+    ///
+    /// If `ptr` is non-null, the caller must ensure that it points to a live
+    /// `bindings::io_comp_batch` for the duration of `'a`.
+    ///
+    /// The caller must also ensure that the returned reference is the only
+    /// Rust view used to access the underlying completion batch for the
+    /// duration of `'a`.
+    pub(crate) unsafe fn from_raw<'a>(ptr: *mut bindings::io_comp_batch) -> Option<&'a Self> {
+        if ptr.is_null() {
+            None
+        } else {
+            // SAFETY: `Self` is a transparent wrapper around `bindings::io_comp_batch`.
+            Some(unsafe { &*ptr.cast() })
+        }
+    }
+
+    /// Returns a raw pointer to the underlying `struct io_comp_batch`.
+    pub fn as_ptr(&self) -> *mut bindings::io_comp_batch {
+        self as *const Self as *mut bindings::io_comp_batch
+    }
+}
+
+/// Result returned from blk-mq poll callbacks.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum PollResult {
+    /// The driver completed the given number of requests.
+    Completed(u32),
+
+    /// The driver cannot make progress and blk-mq should stop polling.
+    Stop,
+}
+
+impl PollResult {
+    /// Returns a result indicating that no requests were completed.
+    pub const fn none() -> Self {
+        Self::Completed(0)
+    }
+
+    /// Returns a result indicating that `completed` requests were completed.
+    pub const fn completed(completed: u32) -> Self {
+        Self::Completed(completed)
+    }
+
+    /// Returns a result indicating that blk-mq should stop polling for now.
+    pub const fn stop() -> Self {
+        Self::Stop
+    }
+
+    fn as_raw(self) -> crate::ffi::c_int {
+        match self {
+            Self::Completed(completed) => {
+                debug_assert!(completed <= crate::ffi::c_int::MAX as u32);
+                completed as crate::ffi::c_int
+            }
+            Self::Stop => -1,
+        }
+    }
+}
 
 /// Implement this trait to interface blk-mq as block devices.
 ///
@@ -48,7 +156,11 @@ pub trait Operations: Sized {
 
     /// Called by the kernel to poll the device for completed requests. Only
     /// used for poll queues.
-    fn poll() -> bool {
+    fn poll(
+        _queue_data: ForeignBorrowed<'_, Self::QueueData>,
+        _hctx: &HwCtx,
+        _iob: Option<&IoCompBatch>,
+    ) -> PollResult {
         build_error!(crate::error::VTABLE_DEFAULT_ERROR)
     }
 }
@@ -168,12 +280,31 @@ impl<T: Operations> OperationsVTable<T> {
     ///
     /// # Safety
     ///
-    /// This function may only be called by blk-mq C infrastructure.
+    /// This function may only be called by blk-mq C infrastructure. The caller
+    /// must ensure that `hctx` is valid. If non-null, `iob` must point to a
+    /// live completion batch for the duration of this callback.
     unsafe extern "C" fn poll_callback(
-        _hctx: *mut bindings::blk_mq_hw_ctx,
-        _iob: *mut bindings::io_comp_batch,
+        hctx: *mut bindings::blk_mq_hw_ctx,
+        iob: *mut bindings::io_comp_batch,
     ) -> crate::ffi::c_int {
-        T::poll().into()
+        // SAFETY: `hctx` is valid as required by this function.
+        let hctx = unsafe { HwCtx::from_raw(hctx) };
+
+        // SAFETY: `hctx` is live as required by this function, so the request
+        // queue and its `queuedata` are also live for the duration of this
+        // callback.
+        let queue_data = unsafe { (*(*hctx.as_ptr()).queue).queuedata };
+
+        // SAFETY: `queue.queuedata` was created by `GenDiskBuilder::build`
+        // with a call to `ForeignOwnable::into_foreign` to create
+        // `queuedata`. `ForeignOwnable::from_foreign` is only called when the
+        // tagset is dropped, which happens after we are dropped.
+        let queue_data = unsafe { T::QueueData::borrow(queue_data) };
+
+        // SAFETY: If non-null, `iob` is valid as required by this function.
+        let iob = unsafe { IoCompBatch::from_raw(iob) };
+
+        T::poll(queue_data, hctx, iob).as_raw()
     }
 
     /// This function is called by the C kernel. A pointer to this function is
