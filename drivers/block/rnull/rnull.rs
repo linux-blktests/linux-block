@@ -97,4 +97,12 @@ impl Operations for NullBlkDevice {
             // point, and so `end_ok` cannot fail.
             .expect("Fatal error - expected to be able to end request");
     }
+
+    fn poll(
+        _queue_data: &QueueData,
+        _hctx: &mq::HwCtx,
+        _iob: Option<&mq::IoCompBatch>,
+    ) -> mq::PollResult {
+        mq::PollResult::none()
+    }
 }
