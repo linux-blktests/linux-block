@@ -4049,7 +4049,6 @@ static int floppy_open(struct gendisk *disk, blk_mode_t mode)
 		fdc_state[FDC(drive)].rawcmd = 2;
 	if (!(mode & BLK_OPEN_NDELAY)) {
 		if (mode & (BLK_OPEN_READ | BLK_OPEN_WRITE)) {
-			drive_state[drive].last_checked = 0;
 			clear_bit(FD_OPEN_SHOULD_FAIL_BIT,
 				  &drive_state[drive].flags);
 			if (disk_check_media_change(disk))
@@ -4090,7 +4089,9 @@ static unsigned int floppy_check_events(struct gendisk *disk,
 	    test_bit(FD_VERIFY_BIT, &drive_state[drive].flags))
 		return DISK_EVENT_MEDIA_CHANGE;
 
-	if (time_after(jiffies, drive_state[drive].last_checked + drive_params[drive].checkfreq)) {
+	if ((clearing & DISK_EVENT_MEDIA_CHANGE) ||
+	    time_after(jiffies, drive_state[drive].last_checked +
+			       drive_params[drive].checkfreq)) {
 		if (lock_fdc(drive))
 			return 0;
 		poll_drive(false, 0);
