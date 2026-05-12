@@ -10229,6 +10229,7 @@ static void btrfs_free_swapfile_pins(struct inode *inode)
 }
 
 struct btrfs_swap_info {
+	struct btrfs_device *device;
 	u64 start;
 	u64 block_start;
 	u64 block_len;
@@ -10242,7 +10243,8 @@ static int btrfs_add_swap_extent(struct swap_info_struct *sis,
 	first_ppage = PAGE_ALIGN(bsi->block_start) >> PAGE_SHIFT;
 	next_ppage = PAGE_ALIGN_DOWN(bsi->block_start + bsi->block_len) >> PAGE_SHIFT;
 
-	return add_swap_extent(sis, next_ppage - first_ppage, first_ppage);
+	return add_swap_extent(sis, next_ppage - first_ppage, bsi->device->bdev,
+			first_ppage);
 }
 
 void btrfs_swap_deactivate(struct file *file)
@@ -10531,6 +10533,7 @@ int btrfs_swap_activate(struct file *file, struct swap_info_struct *sis)
 			bsi.start = key.offset;
 			bsi.block_start = physical_block_start;
 			bsi.block_len = len;
+			bsi.device = device;
 		}
 
 		if (fatal_signal_pending(current)) {
@@ -10561,8 +10564,6 @@ out_unlock_mmap:
 	up_write(&BTRFS_I(inode)->i_mmap_lock);
 	btrfs_free_backref_share_ctx(backref_ctx);
 	btrfs_free_path(path);
-	if (!ret && device)
-		sis->bdev = device->bdev;
 	return ret;
 }
 #endif
