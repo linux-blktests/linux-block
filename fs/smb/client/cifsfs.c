@@ -1591,6 +1591,9 @@ const struct file_operations cifs_file_ops = {
 	.remap_file_range = cifs_remap_file_range,
 	.setlease = cifs_setlease,
 	.fallocate = cifs_fallocate,
+	.swap_activate	= cifs_swap_activate,
+	.swap_deactivate = cifs_swap_deactivate,
+	.swap_rw = cifs_swap_rw,
 };
 
 const struct file_operations cifs_file_strict_ops = {
@@ -1611,6 +1614,9 @@ const struct file_operations cifs_file_strict_ops = {
 	.remap_file_range = cifs_remap_file_range,
 	.setlease = cifs_setlease,
 	.fallocate = cifs_fallocate,
+	.swap_activate	= cifs_swap_activate,
+	.swap_deactivate = cifs_swap_deactivate,
+	.swap_rw = cifs_swap_rw,
 };
 
 const struct file_operations cifs_file_direct_ops = {
@@ -1631,6 +1637,9 @@ const struct file_operations cifs_file_direct_ops = {
 	.llseek = cifs_llseek,
 	.setlease = cifs_setlease,
 	.fallocate = cifs_fallocate,
+	.swap_activate	= cifs_swap_activate,
+	.swap_deactivate = cifs_swap_deactivate,
+	.swap_rw = cifs_swap_rw,
 };
 
 const struct file_operations cifs_file_nobrl_ops = {
@@ -1649,6 +1658,9 @@ const struct file_operations cifs_file_nobrl_ops = {
 	.remap_file_range = cifs_remap_file_range,
 	.setlease = cifs_setlease,
 	.fallocate = cifs_fallocate,
+	.swap_activate	= cifs_swap_activate,
+	.swap_deactivate = cifs_swap_deactivate,
+	.swap_rw = cifs_swap_rw,
 };
 
 const struct file_operations cifs_file_strict_nobrl_ops = {
@@ -1667,6 +1679,9 @@ const struct file_operations cifs_file_strict_nobrl_ops = {
 	.remap_file_range = cifs_remap_file_range,
 	.setlease = cifs_setlease,
 	.fallocate = cifs_fallocate,
+	.swap_activate	= cifs_swap_activate,
+	.swap_deactivate = cifs_swap_deactivate,
+	.swap_rw = cifs_swap_rw,
 };
 
 const struct file_operations cifs_file_direct_nobrl_ops = {
@@ -1685,6 +1700,9 @@ const struct file_operations cifs_file_direct_nobrl_ops = {
 	.llseek = cifs_llseek,
 	.setlease = cifs_setlease,
 	.fallocate = cifs_fallocate,
+	.swap_activate	= cifs_swap_activate,
+	.swap_deactivate = cifs_swap_deactivate,
+	.swap_rw = cifs_swap_rw,
 };
 
 const struct file_operations cifs_dir_ops = {
