@@ -1123,6 +1123,7 @@ static void submit_one_async_extent(struct async_chunk *async_chunk,
 	}
 
 	file_extent.fscrypt_info = em->fscrypt_info;
+	file_extent.orig_offset = start;
 	ordered = btrfs_alloc_ordered_extent(inode, start, &file_extent,
 					     1U << BTRFS_ORDERED_COMPRESSED);
 	btrfs_free_extent_map(em);
@@ -1266,6 +1267,7 @@ static int cow_one_range(struct btrfs_inode *inode, struct folio *locked_folio,
 	}
 
 	file_extent.fscrypt_info = em->fscrypt_info;
+	file_extent.orig_offset = file_offset;
 	ordered = btrfs_alloc_ordered_extent(inode, file_offset, &file_extent,
 					     1U << BTRFS_ORDERED_REGULAR);
 	btrfs_free_extent_map(em);
@@ -2208,6 +2210,8 @@ must_cow:
 			cow_start = (u64)-1;
 		}
 
+		nocow_args.file_extent.orig_offset =
+			found_key.offset - nocow_args.file_extent.offset;
 		ret = nocow_one_range(inode, locked_folio, &cached_state,
 				      &nocow_args, cur_offset,
 				      extent_type == BTRFS_FILE_EXTENT_PREALLOC);
@@ -10330,6 +10334,7 @@ ssize_t btrfs_do_encoded_write(struct kiocb *iocb, struct iov_iter *from,
 	}
 
 	file_extent.fscrypt_info = em->fscrypt_info;
+	file_extent.orig_offset = start - encoded->unencoded_offset;
 	ordered = btrfs_alloc_ordered_extent(inode, start, &file_extent,
 				       (1U << BTRFS_ORDERED_ENCODED) |
 				       (1U << BTRFS_ORDERED_COMPRESSED));

@@ -155,6 +155,7 @@ static struct extent_map *btrfs_create_dio_extent(struct btrfs_inode *inode,
 		file_extent->fscrypt_info = em->fscrypt_info;
 	}
 
+	file_extent->orig_offset = start - file_extent->offset;
 	ordered = btrfs_alloc_ordered_extent(inode, start, file_extent,
 					     (1U << type) |
 					     (1U << BTRFS_ORDERED_DIRECT));

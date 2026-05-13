@@ -146,7 +146,8 @@ static inline struct rb_node *ordered_tree_search(struct btrfs_inode *inode,
 }
 
 static struct btrfs_ordered_extent *alloc_ordered_extent(
-			struct btrfs_inode *inode, u64 file_offset, u64 num_bytes,
+			struct btrfs_inode *inode,
+			u64 file_offset, u64 orig_offset, u64 num_bytes,
 			u64 ram_bytes, u64 disk_bytenr, u64 disk_num_bytes,
 			u64 offset, unsigned long flags, int compress_type,
 			struct fscrypt_extent_info *fscrypt_info)
@@ -193,6 +194,7 @@ static struct btrfs_ordered_extent *alloc_ordered_extent(
 	}
 
 	entry->file_offset = file_offset;
+	entry->orig_offset = orig_offset;
 	entry->num_bytes = num_bytes;
 	entry->ram_bytes = ram_bytes;
 	entry->disk_bytenr = disk_bytenr;
@@ -286,6 +288,7 @@ static void insert_ordered_extent(struct btrfs_ordered_extent *entry)
  *
  * @inode:           Inode that this extent is for.
  * @file_offset:     Logical offset in file where the extent starts.
+ * @orig_offset:     Logical offset of the original extent (PREALLOC or NOCOW)
  * @num_bytes:       Logical length of extent in file.
  * @ram_bytes:       Full length of unencoded data.
  * @disk_bytenr:     Offset of extent on disk.
@@ -323,6 +326,7 @@ struct btrfs_ordered_extent *btrfs_alloc_ordered_extent(
 	 */
 	if (flags & ((1U << BTRFS_ORDERED_NOCOW) | (1U << BTRFS_ORDERED_PREALLOC)))
 		entry = alloc_ordered_extent(inode, file_offset,
+					     file_extent->orig_offset,
 					     file_extent->num_bytes,
 					     file_extent->num_bytes,
 					     file_extent->disk_bytenr + file_extent->offset,
@@ -331,6 +335,7 @@ struct btrfs_ordered_extent *btrfs_alloc_ordered_extent(
 					     file_extent->fscrypt_info);
 	else
 		entry = alloc_ordered_extent(inode, file_offset,
+					     file_extent->orig_offset,
 					     file_extent->num_bytes,
 					     file_extent->ram_bytes,
 					     file_extent->disk_bytenr,
@@ -1276,8 +1281,8 @@ struct btrfs_ordered_extent *btrfs_split_ordered_extent(
 	if (WARN_ON_ONCE(ordered->disk_num_bytes != ordered->num_bytes))
 		return ERR_PTR(-EINVAL);
 
-	new = alloc_ordered_extent(inode, file_offset, len, len, disk_bytenr, len, 0,
-				   flags, ordered->compress_type, ordered->fscrypt_info);
+	new = alloc_ordered_extent(inode, file_offset, ordered->orig_offset, len, len, disk_bytenr,
+				   len, 0, flags, ordered->compress_type, ordered->fscrypt_info);
 	if (IS_ERR(new))
 		return new;
 
@@ -1313,6 +1318,16 @@ struct btrfs_ordered_extent *btrfs_split_ordered_extent(
 	ordered->num_bytes -= len;
 	ordered->disk_num_bytes -= len;
 	ordered->ram_bytes -= len;
+
+	/*
+	 * ->orig_offset is the original offset of the original extent, which
+	 * for PREALLOC or NOCOW stays the same, but if we're a regular extent
+	 * that means this is a new extent and thus ->orig_offset must equal
+	 * ->file_offset.  This is only important for encryption as we only use
+	 * it for setting the offset for the bio encryption context.
+	 */
+	if (test_bit(BTRFS_ORDERED_REGULAR, &ordered->flags))
+		ordered->orig_offset = ordered->file_offset;
 
 	if (test_bit(BTRFS_ORDERED_IO_DONE, &ordered->flags)) {
 		ASSERT(ordered->bytes_left == 0);

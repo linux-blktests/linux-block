@@ -107,6 +107,12 @@ struct btrfs_ordered_extent {
 	u64 file_offset;
 
 	/*
+	 * The original logical offset of the extent, this is for NOCOW and
+	 * PREALLOC extents, otherwise it'll be the same as file_offset.
+	 */
+	u64 orig_offset;
+
+	/*
 	 * These fields directly correspond to the same fields in
 	 * btrfs_file_extent_item.
 	 */
@@ -192,6 +198,7 @@ struct btrfs_file_extent {
 	u64 num_bytes;
 	u64 ram_bytes;
 	u64 offset;
+	u64 orig_offset;
 	struct fscrypt_extent_info *fscrypt_info;
 	u8 compression;
 };
