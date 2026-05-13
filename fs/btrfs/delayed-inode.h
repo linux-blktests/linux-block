@@ -19,6 +19,7 @@
 #include <linux/ref_tracker.h>
 #include "ctree.h"
 
+struct fscrypt_str;
 struct btrfs_disk_key;
 struct btrfs_fs_info;
 struct btrfs_inode;
@@ -159,7 +160,9 @@ void btrfs_readdir_put_delayed_items(struct btrfs_inode *inode,
 				     struct list_head *ins_list,
 				     struct list_head *del_list);
 bool btrfs_should_delete_dir_index(const struct list_head *del_list, u64 index);
-bool btrfs_readdir_delayed_dir_index(struct dir_context *ctx,
+bool btrfs_readdir_delayed_dir_index(const struct inode *inode,
+				     struct fscrypt_str *fstr,
+				     struct dir_context *ctx,
 				     const struct list_head *ins_list);
 
 /* Used during directory logging. */

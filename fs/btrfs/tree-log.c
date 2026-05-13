@@ -1045,9 +1045,10 @@ static int unlink_inode_for_log_replay(struct walk_control *wc,
 				       const struct fscrypt_str *name)
 {
 	struct btrfs_trans_handle *trans = wc->trans;
+	struct fscrypt_name fname = { .disk_name = *name, };
 	int ret;
 
-	ret = btrfs_unlink_inode(trans, dir, inode, name);
+	ret = btrfs_unlink_inode(trans, dir, inode, &fname);
 	if (ret) {
 		btrfs_abort_log_replay(wc, ret,
 	       "failed to unlink inode %llu parent dir %llu name %.*s root %llu",
