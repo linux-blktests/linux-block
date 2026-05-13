@@ -2929,7 +2929,9 @@ static int replay_one_buffer(struct extent_buffer *eb,
 			continue;
 
 		/* these keys are simply copied */
-		if (wc->log_key.type == BTRFS_XATTR_ITEM_KEY) {
+		if (wc->log_key.type == BTRFS_XATTR_ITEM_KEY ||
+		    wc->log_key.type == BTRFS_FSCRYPT_INODE_CTX_KEY ||
+		    wc->log_key.type == BTRFS_FSCRYPT_CTX_KEY) {
 			ret = overwrite_item(wc);
 			if (ret)
 				break;
