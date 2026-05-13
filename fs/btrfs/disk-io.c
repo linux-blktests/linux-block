@@ -1230,6 +1230,7 @@ void btrfs_free_fs_info(struct btrfs_fs_info *fs_info)
 	btrfs_extent_buffer_leak_debug_check(fs_info);
 	kfree(fs_info->super_copy);
 	kfree(fs_info->super_for_commit);
+	fscrypt_free_dummy_policy(&fs_info->dummy_enc_policy);
 	kvfree(fs_info);
 }
 

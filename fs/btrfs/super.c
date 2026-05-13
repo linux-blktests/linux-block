@@ -87,6 +87,7 @@ struct btrfs_fs_context {
 	unsigned long compress_type:4;
 	int compress_level;
 	refcount_t refs;
+	struct fscrypt_dummy_policy dummy_enc_policy;
 };
 
 static void btrfs_emit_options(struct btrfs_fs_info *info,
@@ -125,6 +126,7 @@ enum {
 	Opt_treelog,
 	Opt_user_subvol_rm_allowed,
 	Opt_norecovery,
+	Opt_test_dummy_encryption,
 
 	/* Rescue options */
 	Opt_rescue,
@@ -259,6 +261,8 @@ static const struct fs_parameter_spec btrfs_fs_parameters[] = {
 	fsparam_enum("fragment", Opt_fragment, btrfs_parameter_fragment),
 	fsparam_flag("ref_tracker", Opt_ref_tracker),
 	fsparam_flag("ref_verify", Opt_ref_verify),
+	fsparam_flag("test_dummy_encryption", Opt_test_dummy_encryption),
+	fsparam_string("test_dummy_encryption", Opt_test_dummy_encryption),
 #endif
 	{}
 };
@@ -651,6 +655,23 @@ static int btrfs_parse_param(struct fs_context *fc, struct fs_parameter *param)
 	case Opt_ref_tracker:
 		btrfs_set_opt(ctx->mount_opt, REF_TRACKER);
 		break;
+	case Opt_test_dummy_encryption:
+		int ret;
+
+		/*
+		 * We only support v2, so reject any v1 policies.
+		 */
+		if (param->type == fs_value_is_string && *param->string &&
+		    !strcmp(param->string, "v1")) {
+			btrfs_info(NULL, "v1 encryption isn't supported");
+			return -EINVAL;
+		}
+
+		btrfs_set_opt(ctx->mount_opt, TEST_DUMMY_ENCRYPTION);
+		ret = fscrypt_parse_test_dummy_encryption(param, &ctx->dummy_enc_policy);
+		if (ret)
+			return ret;
+		break;
 #endif
 	default:
 		btrfs_err(NULL, "unrecognized mount option '%s'", param->key);
@@ -986,6 +1007,9 @@ static int btrfs_fill_super(struct super_block *sb,
 		return ret;
 	}
 
+	if (fscrypt_is_dummy_policy_set(&fs_info->dummy_enc_policy))
+		btrfs_set_fs_incompat(fs_info, ENCRYPT);
+
 	btrfs_emit_options(fs_info, NULL);
 
 	inode = btrfs_iget(BTRFS_FIRST_FREE_OBJECTID, fs_info->fs_root);
@@ -1150,6 +1174,8 @@ static int btrfs_show_options(struct seq_file *seq, struct dentry *dentry)
 		seq_puts(seq, ",ref_verify");
 	if (btrfs_test_opt(info, REF_TRACKER))
 		seq_puts(seq, ",ref_tracker");
+	if (btrfs_test_opt(info, TEST_DUMMY_ENCRYPTION))
+		fscrypt_show_test_dummy_encryption(seq, ',', dentry->d_sb);
 	seq_printf(seq, ",subvolid=%llu", btrfs_root_id(BTRFS_I(d_inode(dentry))->root));
 	subvol_name = btrfs_get_subvol_name_from_objectid(info,
 			btrfs_root_id(BTRFS_I(d_inode(dentry))->root));
@@ -1415,6 +1441,18 @@ static void btrfs_ctx_to_info(struct btrfs_fs_info *fs_info, struct btrfs_fs_con
 	fs_info->mount_opt = ctx->mount_opt;
 	fs_info->compress_type = ctx->compress_type;
 	fs_info->compress_level = ctx->compress_level;
+
+	/*
+	 * If there's nothing set, or if the fs_info already has one set, don't
+	 * do anything.  If the fs_info is set we'll free the dummy one when we
+	 * free the ctx.
+	 */
+	if (!fscrypt_is_dummy_policy_set(&ctx->dummy_enc_policy) ||
+	    fscrypt_is_dummy_policy_set(&fs_info->dummy_enc_policy))
+		return;
+
+	fs_info->dummy_enc_policy = ctx->dummy_enc_policy;
+	memset(&ctx->dummy_enc_policy, 0, sizeof(ctx->dummy_enc_policy));
 }
 
 static void btrfs_info_to_ctx(struct btrfs_fs_info *fs_info, struct btrfs_fs_context *ctx)
@@ -1468,6 +1506,7 @@ static void btrfs_emit_options(struct btrfs_fs_info *info,
 	btrfs_info_if_set(info, old, IGNOREDATACSUMS, "ignoring data csums");
 	btrfs_info_if_set(info, old, IGNOREMETACSUMS, "ignoring meta csums");
 	btrfs_info_if_set(info, old, IGNORESUPERFLAGS, "ignoring unknown super block flags");
+	btrfs_info_if_set(info, old, TEST_DUMMY_ENCRYPTION, "test dummy encryption mode enabled");
 
 	btrfs_info_if_unset(info, old, NODATASUM, "setting datasum");
 	btrfs_info_if_unset(info, old, NODATACOW, "setting datacow");
@@ -1498,6 +1537,21 @@ static void btrfs_emit_options(struct btrfs_fs_info *info,
 		btrfs_info(info, "max_inline set to %llu", info->max_inline);
 }
 
+static bool btrfs_check_test_dummy_encryption(struct fs_context *fc)
+{
+	struct btrfs_fs_context *ctx = fc->fs_private;
+	struct btrfs_fs_info *fs_info = btrfs_sb(fc->root->d_sb);
+
+	if (!fscrypt_is_dummy_policy_set(&ctx->dummy_enc_policy))
+		return true;
+
+	if (fscrypt_dummy_policies_equal(&fs_info->dummy_enc_policy, &ctx->dummy_enc_policy))
+		return true;
+
+	btrfs_warn(fs_info, "Can't set or change test_dummy_encryption on remount");
+	return false;
+}
+
 static int btrfs_reconfigure(struct fs_context *fc)
 {
 	struct super_block *sb = fc->root->d_sb;
@@ -1521,6 +1575,9 @@ static int btrfs_reconfigure(struct fs_context *fc)
 	set_bit(BTRFS_FS_STATE_REMOUNTING, &fs_info->fs_state);
 
 	if (!btrfs_check_options(fs_info, &ctx->mount_opt, fc->sb_flags))
+		return -EINVAL;
+
+	if (!mount_reconfigure && !btrfs_check_test_dummy_encryption(fc))
 		return -EINVAL;
 
 	ret = btrfs_check_features(fs_info, !(fc->sb_flags & SB_RDONLY));
@@ -2139,6 +2196,7 @@ static void btrfs_free_fs_context(struct fs_context *fc)
 		btrfs_free_fs_info(fs_info);
 
 	if (ctx && refcount_dec_and_test(&ctx->refs)) {
+		fscrypt_free_dummy_policy(&ctx->dummy_enc_policy);
 		kfree(ctx->subvol_name);
 		kfree(ctx);
 	}

@@ -28,6 +28,7 @@
 #include <linux/rbtree.h>
 #include <linux/xxhash.h>
 #include <linux/fserror.h>
+#include <linux/fscrypt.h>
 #include <uapi/linux/btrfs.h>
 #include <uapi/linux/btrfs_tree.h>
 #include "extent-io-tree.h"
@@ -271,6 +272,7 @@ enum {
 	BTRFS_MOUNT_IGNOREMETACSUMS		= (1ULL << 31),
 	BTRFS_MOUNT_IGNORESUPERFLAGS		= (1ULL << 32),
 	BTRFS_MOUNT_REF_TRACKER			= (1ULL << 33),
+	BTRFS_MOUNT_TEST_DUMMY_ENCRYPTION	= (1ULL << 34),
 };
 
 /* These mount options require a full read-only fs, no new transaction is allowed. */
@@ -959,6 +961,7 @@ struct btrfs_fs_info {
 	spinlock_t eb_leak_lock;
 	struct list_head allocated_ebs;
 #endif
+	struct fscrypt_dummy_policy dummy_enc_policy;
 };
 
 #define folio_to_inode(_folio)	(BTRFS_I(_Generic((_folio),			\
