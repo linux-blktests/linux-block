@@ -6053,6 +6053,11 @@ struct btrfs_block_group *btrfs_create_chunk(struct btrfs_trans_handle *trans,
 
 	lockdep_assert_held(&info->chunk_mutex);
 
+	if (type & BTRFS_BLOCK_GROUP_RAID56_MASK && btrfs_fs_incompat(info, ENCRYPT)) {
+		btrfs_warn(info, "RAID5/6 not yet supported on encrypted filesystem");
+		return ERR_PTR(-EINVAL);
+	}
+
 	if (!alloc_profile_is_valid(type, 0)) {
 		DEBUG_WARN("invalid alloc profile for type %llu", type);
 		return ERR_PTR(-EINVAL);

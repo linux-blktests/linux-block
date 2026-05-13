@@ -734,6 +734,12 @@ bool btrfs_check_options(const struct btrfs_fs_info *info,
 	if (btrfs_check_mountopts_zoned(info, mount_opt))
 		ret = false;
 
+	if (btrfs_fs_incompat(info, RAID56) &&
+	    btrfs_raw_test_opt(*mount_opt, TEST_DUMMY_ENCRYPTION)) {
+		btrfs_err(info, "cannot use test_dummy_encryption with RAID5/6");
+		ret = false;
+	}
+
 	if (!test_bit(BTRFS_FS_STATE_REMOUNTING, &info->fs_state)) {
 		if (btrfs_raw_test_opt(*mount_opt, SPACE_CACHE)) {
 			btrfs_warn(info,
