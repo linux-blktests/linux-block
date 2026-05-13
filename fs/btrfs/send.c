@@ -5331,6 +5331,38 @@ static int put_file_data(struct send_ctx *sctx, u64 offset, u32 len)
 	return ret;
 }
 
+static int load_fscrypt_context(struct send_ctx *sctx)
+{
+	struct btrfs_root *root = sctx->send_root;
+	struct name_cache_entry *nce;
+	struct btrfs_inode *dir;
+	int ret;
+
+	if (!btrfs_fs_incompat(root->fs_info, ENCRYPT))
+		return 0;
+
+	/*
+	 * If we're encrypted we need to load the parent inode in order to make
+	 * sure the encryption context is loaded.  We have to do this even if
+	 * we're not encrypted, as we need to make sure that we don't violate
+	 * the rule about encrypted children with non-encrypted parents, which
+	 * is enforced by __fscrypt_file_open.
+	 */
+	nce = name_cache_search(sctx, sctx->cur_ino, sctx->cur_inode_gen);
+	if (!nce) {
+		ASSERT(nce);
+		return -EINVAL;
+	}
+
+	dir = btrfs_iget(nce->parent_ino, root);
+	if (IS_ERR(dir))
+		return PTR_ERR(dir);
+
+	ret = __fscrypt_file_open(&dir->vfs_inode, sctx->cur_inode);
+	iput(&dir->vfs_inode);
+	return ret;
+}
+
 /*
  * Read some bytes from the current inode/file and send a write command to
  * user space.
@@ -5345,6 +5377,10 @@ static int send_write(struct send_ctx *sctx, u64 offset, u32 len)
 		return PTR_ERR(p);
 
 	ret = begin_cmd(sctx, BTRFS_SEND_C_WRITE);
+	if (ret < 0)
+		return ret;
+
+	ret = load_fscrypt_context(sctx);
 	if (ret < 0)
 		return ret;
 
