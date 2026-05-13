@@ -592,9 +592,12 @@ struct fscrypt_master_key_secret {
  *
  * FSCRYPT_KEY_STATUS_INCOMPLETELY_REMOVED
  *	Removal of this key has been initiated, but some inodes that were
- *	unlocked with it are still in-use.  Like ABSENT, ->mk_secret is wiped,
- *	and the key can no longer be used to unlock inodes.  Unlike ABSENT, the
- *	key is still in the keyring; ->mk_decrypted_inodes is nonempty; and
+ *	unlocked with it are still in-use.
+ *	For filesystems using per-extent encryption ->mk_secret is still
+ *	being kept as the per-extent keys are derived at writeout time.
+ *	Otherwise, like ABSENT, ->mk_secret is wiped, and the key can
+ *	no longer be used to unlock inodes.  Unlike ABSENT, the key is
+ *	still in the keyring; ->mk_decrypted_inodes is nonempty; and
  *	->mk_active_refs > 0, being equal to the size of ->mk_decrypted_inodes.
  *
  *	This state transitions to ABSENT if ->mk_decrypted_inodes becomes empty,
