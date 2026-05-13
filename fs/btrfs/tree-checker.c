@@ -186,6 +186,7 @@ static bool check_prev_ino(struct extent_buffer *leaf,
 	       key->type == BTRFS_INODE_EXTREF_KEY ||
 	       key->type == BTRFS_DIR_INDEX_KEY ||
 	       key->type == BTRFS_DIR_ITEM_KEY ||
+	       key->type == BTRFS_FSCRYPT_CTX_KEY ||
 	       key->type == BTRFS_EXTENT_DATA_KEY, "key->type=%u", key->type);
 
 	/*
@@ -204,6 +205,39 @@ static bool check_prev_ino(struct extent_buffer *leaf,
 		prev_key->objectid, key->objectid);
 	return false;
 }
+
+static int check_fscrypt_context(struct extent_buffer *leaf,
+				 struct btrfs_key *key, int slot,
+				 struct btrfs_key *prev_key)
+{
+	u32 sectorsize = leaf->fs_info->sectorsize;
+	u32 item_size = btrfs_item_size(leaf, slot);
+
+	if (unlikely(!IS_ALIGNED(key->offset, sectorsize))) {
+		file_extent_err(leaf, slot,
+"unaligned file_offset for encryption context, have %llu should be aligned to %u",
+			key->offset, sectorsize);
+		return -EUCLEAN;
+	}
+
+	/*
+	 * Previous key must have the same key->objectid (ino).  It can be
+	 * XATTR_ITEM, INODE_ITEM, FSCRYPT_INODE_CTX_KEY, or another FSCRYPT_CTX_KEY.
+	 * But if objectids mismatch, it means we have a missing INODE_ITEM.
+	 */
+	if (unlikely(!check_prev_ino(leaf, key, slot, prev_key)))
+		return -EUCLEAN;
+
+	if (unlikely(item_size > BTRFS_MAX_EXTENT_CTX_SIZE)) {
+		file_extent_err(leaf, slot,
+	"invalid encryption context size, have %u expect a maximum of %u",
+				item_size, BTRFS_MAX_EXTENT_CTX_SIZE);
+		return -EUCLEAN;
+	}
+
+	return 0;
+}
+
 static int check_extent_data_item(struct extent_buffer *leaf,
 				  struct btrfs_key *key, int slot,
 				  struct btrfs_key *prev_key)
@@ -214,6 +248,7 @@ static int check_extent_data_item(struct extent_buffer *leaf,
 	u32 item_size = btrfs_item_size(leaf, slot);
 	u64 extent_end;
 	u8 policy;
+	u8 fe_type;
 
 	if (unlikely(!IS_ALIGNED(key->offset, sectorsize))) {
 		file_extent_err(leaf, slot,
@@ -244,12 +279,12 @@ static int check_extent_data_item(struct extent_buffer *leaf,
 				SZ_4K);
 		return -EUCLEAN;
 	}
-	if (unlikely(btrfs_file_extent_type(leaf, fi) >=
-		     BTRFS_NR_FILE_EXTENT_TYPES)) {
+
+	fe_type = btrfs_file_extent_type(leaf, fi);
+	if (unlikely(fe_type >= BTRFS_NR_FILE_EXTENT_TYPES)) {
 		file_extent_err(leaf, slot,
 		"invalid type for file extent, have %u expect range [0, %u]",
-			btrfs_file_extent_type(leaf, fi),
-			BTRFS_NR_FILE_EXTENT_TYPES - 1);
+			fe_type, BTRFS_NR_FILE_EXTENT_TYPES - 1);
 		return -EUCLEAN;
 	}
 
@@ -296,6 +331,16 @@ static int check_extent_data_item(struct extent_buffer *leaf,
 			return -EUCLEAN;
 		}
 		return 0;
+	}
+
+	if (policy == BTRFS_ENCRYPTION_FSCRYPT) {
+		/* Only regular and prealloc extents should have an encryption context */
+		if (unlikely(fe_type != BTRFS_FILE_EXTENT_REG &&
+			     fe_type != BTRFS_FILE_EXTENT_PREALLOC)) {
+			file_extent_err(leaf, slot,
+		"invalid type for encrypted file extent, have %u", fe_type);
+			return -EUCLEAN;
+		}
 	}
 
 	/* Regular or preallocated extent has fixed item size */
@@ -2197,6 +2242,9 @@ static enum btrfs_tree_block_status check_leaf_item(struct extent_buffer *leaf,
 		break;
 	case BTRFS_EXTENT_CSUM_KEY:
 		ret = check_csum_item(leaf, key, slot, prev_key);
+		break;
+	case BTRFS_FSCRYPT_CTX_KEY:
+		ret = check_fscrypt_context(leaf, key, slot, prev_key);
 		break;
 	case BTRFS_DIR_ITEM_KEY:
 	case BTRFS_DIR_INDEX_KEY:

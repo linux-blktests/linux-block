@@ -151,6 +151,7 @@ int btrfs_drop_extents(struct btrfs_trans_handle *trans,
 	u64 extent_offset = 0;
 	u64 extent_end = 0;
 	u64 last_end = args->start;
+	u64 first_ctx = 1, last_ctx = 0;
 	int del_nr = 0;
 	int del_slot = 0;
 	int extent_type;
@@ -408,6 +409,12 @@ delete_extent_item:
 				del_nr++;
 			}
 
+			if (btrfs_file_extent_encryption(leaf, fi) == BTRFS_ENCRYPTION_FSCRYPT) {
+				if (first_ctx > last_ctx)
+					first_ctx = key.offset;
+				last_ctx = key.offset;
+			}
+
 			if (update_refs &&
 			    extent_type == BTRFS_FILE_EXTENT_INLINE) {
 				args->bytes_found += extent_end - key.offset;
@@ -495,6 +502,64 @@ delete_extent_item:
 		btrfs_setup_item_for_insert(trans, root, path, &key,
 					    args->extent_item_size);
 		args->extent_inserted = true;
+	}
+
+	if (first_ctx <= last_ctx) {
+		int slot, nritems;
+
+		btrfs_release_path(path);
+
+		key.objectid = ino;
+		key.type = BTRFS_FSCRYPT_CTX_KEY;
+		key.offset = first_ctx;
+
+		ret = btrfs_search_slot(trans, root, &key, path, modify_tree, !!modify_tree);
+		if (ret < 0)
+			goto out_ctx;
+next_leaf:
+		leaf = path->nodes[0];
+		slot = path->slots[0];
+
+		del_slot = slot;
+		del_nr = 0;
+		nritems = btrfs_header_nritems(leaf);
+		while (slot < nritems) {
+			btrfs_item_key_to_cpu(leaf, &key, slot);
+			if (key.objectid > ino ||
+			    key.type > BTRFS_FSCRYPT_CTX_KEY ||
+			    key.offset > last_ctx)
+				break;
+			del_nr++;
+			slot++;
+		}
+		if (del_nr) {
+			ret = btrfs_del_items(trans, root, path, del_slot, del_nr);
+			if (unlikely(ret)) {
+				btrfs_abort_transaction(trans, ret);
+				goto out_ctx;
+			}
+
+			if (slot == nritems) {
+				ret = btrfs_next_leaf(root, path);
+				if (!ret)
+					goto next_leaf;
+				if (ret > 0)
+					ret = 0;
+			}
+		}
+out_ctx:
+		if (args->path && args->extent_inserted) {
+			int err;
+
+			btrfs_release_path(path);
+
+			key.objectid = ino;
+			key.type = BTRFS_EXTENT_DATA_KEY;
+			key.offset = args->start;
+			err = btrfs_search_slot(trans, root, &key, path, 0, 0);
+			if (err && ret >= 0)
+				ret = err;
+		}
 	}
 
 	if (!args->path)

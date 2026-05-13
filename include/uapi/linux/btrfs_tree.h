@@ -168,6 +168,7 @@
 #define BTRFS_VERITY_MERKLE_ITEM_KEY	37
 
 #define BTRFS_FSCRYPT_INODE_CTX_KEY	41
+#define BTRFS_FSCRYPT_CTX_KEY		42
 
 #define BTRFS_ORPHAN_ITEM_KEY		48
 /* reserve 2-15 close to the inode for later flexibility */
@@ -1078,6 +1079,13 @@ enum {
 	BTRFS_FILE_EXTENT_PREALLOC = 2,
 	BTRFS_NR_FILE_EXTENT_TYPES = 3,
 };
+
+/*
+ * Currently just the FSCRYPT_SET_CONTEXT_MAX_SIZE, which is larger than the
+ * current extent context size from fscrypt, so this should give us plenty of
+ * breathing room for expansion later.
+ */
+#define BTRFS_MAX_EXTENT_CTX_SIZE 40
 
 enum btrfs_encryption_type {
 	BTRFS_ENCRYPTION_NONE,
