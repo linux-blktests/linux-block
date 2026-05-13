@@ -5410,7 +5410,7 @@ process:
 		 */
 		if (ret) {
 			btrfs_clear_em_logging(inode, em);
-			btrfs_free_extent_map(em);
+			btrfs_free_extent_map_safe(tree, em);
 			continue;
 		}
 
@@ -5419,10 +5419,12 @@ process:
 		ret = log_one_extent(trans, inode, em, path, ctx);
 		write_lock(&tree->lock);
 		btrfs_clear_em_logging(inode, em);
-		btrfs_free_extent_map(em);
+		btrfs_free_extent_map_safe(tree, em);
 	}
 	WARN_ON(!list_empty(&extents));
 	write_unlock(&tree->lock);
+
+	btrfs_free_pending_extent_maps(tree);
 
 	if (!ret)
 		ret = btrfs_log_prealloc_extents(trans, inode, path, ctx);
