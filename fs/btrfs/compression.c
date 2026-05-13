@@ -594,6 +594,8 @@ void btrfs_submit_compressed_read(struct btrfs_bio *bbio)
 	cb->compress_type = btrfs_extent_map_compression(em);
 	cb->orig_bbio = bbio;
 	cb->bbio.csum_search_commit_root = bbio->csum_search_commit_root;
+	cb->bbio.fscrypt_info = fscrypt_get_extent_info(em->fscrypt_info);
+	cb->bbio.orig_start = 0;
 
 	fscrypt_set_bio_crypt_ctx_from_extent(&cb->bbio.bio, em->fscrypt_info, 0, GFP_NOFS);
 	btrfs_free_extent_map(em);

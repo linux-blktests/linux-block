@@ -764,6 +764,8 @@ static void btrfs_dio_submit_io(const struct iomap_iter *iter, struct bio *bio,
 	} else {
 		fscrypt_info = dio_data->fscrypt_info;
 		offset = file_offset - dio_data->orig_start;
+		bbio->fscrypt_info = fscrypt_get_extent_info(fscrypt_info);
+		bbio->orig_start = dio_data->orig_start;
 	}
 
 	fscrypt_set_bio_crypt_ctx_from_extent(&bbio->bio, fscrypt_info, offset, GFP_NOFS);
