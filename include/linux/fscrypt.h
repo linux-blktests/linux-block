@@ -471,6 +471,7 @@ int fscrypt_zeroout_range(const struct inode *inode, loff_t pos,
 
 /* hooks.c */
 int fscrypt_file_open(struct inode *inode, struct file *filp);
+int __fscrypt_file_open(struct inode *dir, struct inode *inode);
 int __fscrypt_prepare_link(struct inode *inode, struct inode *dir,
 			   struct dentry *dentry);
 int __fscrypt_prepare_rename(struct inode *old_dir, struct dentry *old_dentry,
@@ -812,6 +813,13 @@ static inline int fscrypt_zeroout_range(const struct inode *inode, loff_t pos,
 /* hooks.c */
 
 static inline int fscrypt_file_open(struct inode *inode, struct file *filp)
+{
+	if (IS_ENCRYPTED(inode))
+		return -EOPNOTSUPP;
+	return 0;
+}
+
+static inline int __fscrypt_file_open(struct inode *dir, struct inode *inode)
 {
 	if (IS_ENCRYPTED(inode))
 		return -EOPNOTSUPP;

@@ -10,6 +10,37 @@
 #include "fscrypt_private.h"
 
 /**
+ * __fscrypt_file_open() - prepare for filesystem-internal access to a
+ *			   possibly-encrypted regular file
+ * @dir: the inode for the directory via which the file is being accessed
+ * @inode: the inode being "opened"
+ *
+ * This is like fscrypt_file_open(), but instead of taking the 'struct file'
+ * being opened it takes the parent directory explicitly.  This is intended for
+ * use cases such as "send/receive" which involve the filesystem accessing file
+ * contents without setting up a 'struct file'.
+ *
+ * Return: 0 on success, -ENOKEY if the key is missing, or another -errno code
+ */
+int __fscrypt_file_open(struct inode *dir, struct inode *inode)
+{
+	int err;
+
+	err = fscrypt_require_key(inode);
+	if (err)
+		return err;
+
+	if (!fscrypt_has_permitted_context(dir, inode)) {
+		fscrypt_warn(inode,
+			     "Inconsistent encryption context (parent directory: %llu)",
+			     dir->i_ino);
+		return -EPERM;
+	}
+	return 0;
+}
+EXPORT_SYMBOL_GPL(__fscrypt_file_open);
+
+/**
  * fscrypt_file_open() - prepare to open a possibly-encrypted regular file
  * @inode: the inode being opened
  * @filp: the struct file being set up
@@ -60,12 +91,7 @@ int fscrypt_file_open(struct inode *inode, struct file *filp)
 	rcu_read_unlock();
 
 	dentry_parent = dget_parent(dentry);
-	if (!fscrypt_has_permitted_context(d_inode(dentry_parent), inode)) {
-		fscrypt_warn(inode,
-			     "Inconsistent encryption context (parent directory: %llu)",
-			     d_inode(dentry_parent)->i_ino);
-		err = -EPERM;
-	}
+	err = __fscrypt_file_open(d_inode(dentry_parent), inode);
 	dput(dentry_parent);
 	return err;
 }
