@@ -126,6 +126,14 @@ void btrfs_add_inode_defrag(struct btrfs_inode *inode, u32 extent_thresh)
 	if (!need_auto_defrag(fs_info))
 		return;
 
+	/*
+	 * Since we have to read the inode at defrag time disable auto defrag
+	 * for encrypted inodes until we have code to read the parent and load
+	 * the encryption context.
+	 */
+	if (IS_ENCRYPTED(&inode->vfs_inode))
+		return;
+
 	if (test_bit(BTRFS_INODE_IN_DEFRAG, &inode->runtime_flags))
 		return;
 
