@@ -24,6 +24,7 @@ void btrfs_fscrypt_save_extent_info(struct btrfs_path *path, u8 *ctx, unsigned l
 ssize_t btrfs_fscrypt_context_for_new_extent(struct btrfs_inode *inode,
 					     struct fscrypt_extent_info *info,
 					     u8 *ctx);
+int btrfs_fscrypt_bio_length(struct bio *bio, u64 map_length);
 
 #else
 static inline void btrfs_fscrypt_save_extent_info(struct btrfs_path *path,
@@ -61,6 +62,11 @@ static inline ssize_t btrfs_fscrypt_context_for_new_extent(struct btrfs_inode *i
 	if (!info)
 		return 0;
 	return -EINVAL;
+}
+
+static inline u64 btrfs_fscrypt_bio_length(struct bio *bio, u64 map_length)
+{
+	return map_length;
 }
 
 #endif /* CONFIG_FS_ENCRYPTION */
