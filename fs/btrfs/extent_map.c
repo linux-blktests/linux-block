@@ -59,6 +59,7 @@ struct extent_map *btrfs_alloc_extent_map(void)
 
 static void free_extent_map(struct extent_map *em)
 {
+	fscrypt_put_extent_info(em->fscrypt_info);
 	kmem_cache_free(extent_map_cache, em);
 }
 
@@ -99,12 +100,24 @@ void btrfs_free_extent_map_safe(struct extent_map_tree *tree,
 	if (!em)
 		return;
 
-	if (refcount_dec_and_test(&em->refs)) {
-		WARN_ON(btrfs_extent_map_in_tree(em));
-		WARN_ON(!list_empty(&em->list));
+	if (!refcount_dec_and_test(&em->refs))
+		return;
+
+	WARN_ON(btrfs_extent_map_in_tree(em));
+	WARN_ON(!list_empty(&em->list));
+
+	/*
+	 * We could take a lock freeing the fscrypt_info, so add this to the
+	 * list of freed_extents to be freed later.
+	 */
+	if (em->fscrypt_info) {
 		list_add_tail(&em->free_list, &tree->freed_extents);
 		set_bit(EXTENT_MAP_TREE_PENDING_FREES, &tree->flags);
+		return;
 	}
+
+	/* Nothing scary here, just free the object. */
+	free_extent_map(em);
 }
 
 /*
@@ -291,6 +304,10 @@ static bool can_merge_extent_map(const struct extent_map *em)
 	if (!list_empty(&em->list))
 		return false;
 
+	/* We can't merge encrypted extents. */
+	if (em->fscrypt_info)
+		return false;
+
 	return true;
 }
 
@@ -310,6 +327,10 @@ static bool mergeable_maps(const struct extent_map *prev, const struct extent_ma
 
 	if (next->disk_bytenr < EXTENT_MAP_LAST_BYTE - 1)
 		return btrfs_extent_map_block_start(next) == extent_map_block_end(prev);
+
+	/* Don't merge adjacent encrypted maps. */
+	if (prev->fscrypt_info || next->fscrypt_info)
+		return false;
 
 	/* HOLES and INLINE extents. */
 	return next->disk_bytenr == prev->disk_bytenr;
@@ -977,6 +998,7 @@ void btrfs_drop_extent_map_range(struct btrfs_inode *inode, u64 start, u64 end,
 
 			split->generation = gen;
 			split->flags = flags;
+			split->fscrypt_info = fscrypt_get_extent_info(em->fscrypt_info);
 			replace_extent_mapping(inode, em, split, modified);
 			btrfs_free_extent_map(split);
 			split = split2;
@@ -1005,6 +1027,7 @@ void btrfs_drop_extent_map_range(struct btrfs_inode *inode, u64 start, u64 end,
 				split->ram_bytes = split->len;
 			}
 
+			split->fscrypt_info = fscrypt_get_extent_info(em->fscrypt_info);
 			if (btrfs_extent_map_in_tree(em)) {
 				replace_extent_mapping(inode, em, split, modified);
 			} else {
@@ -1163,6 +1186,7 @@ int btrfs_split_extent_map(struct btrfs_inode *inode, u64 start, u64 len, u64 pr
 	split_pre->ram_bytes = split_pre->len;
 	split_pre->flags = flags;
 	split_pre->generation = em->generation;
+	split_pre->fscrypt_info = fscrypt_get_extent_info(em->fscrypt_info);
 
 	replace_extent_mapping(inode, em, split_pre, true);
 
@@ -1180,6 +1204,8 @@ int btrfs_split_extent_map(struct btrfs_inode *inode, u64 start, u64 len, u64 pr
 	split_mid->ram_bytes = split_mid->len;
 	split_mid->flags = flags;
 	split_mid->generation = em->generation;
+	split_mid->fscrypt_info = fscrypt_get_extent_info(em->fscrypt_info);
+
 	add_extent_mapping(inode, split_mid, true);
 
 	/* Once for us */
