@@ -535,7 +535,7 @@ static void btrfs_submit_dev_bio(struct btrfs_device *dev, struct bio *bio)
 	if (bio->bi_opf & REQ_BTRFS_CGROUP_PUNT)
 		blkcg_punt_bio_submit(bio);
 	else
-		submit_bio(bio);
+		blk_crypto_submit_bio(bio);
 }
 
 static void btrfs_submit_mirrored_bio(struct btrfs_io_context *bioc, int dev_nr)

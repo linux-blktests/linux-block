@@ -12,6 +12,7 @@
 #include "volumes.h"
 #include "bio.h"
 #include "ordered-data.h"
+#include "fscrypt.h"
 
 struct btrfs_dio_data {
 	ssize_t submitted;
@@ -727,6 +728,8 @@ static void btrfs_dio_submit_io(const struct iomap_iter *iter, struct bio *bio,
 	struct btrfs_dio_private *dip =
 		container_of(bbio, struct btrfs_dio_private, bbio);
 	struct btrfs_dio_data *dio_data = iter->private;
+	struct fscrypt_extent_info *fscrypt_info = NULL;
+	u64 offset = 0;
 
 	btrfs_bio_init(bbio, BTRFS_I(iter->inode), file_offset,
 		       btrfs_dio_end_io, bio->bi_private);
@@ -746,6 +749,9 @@ static void btrfs_dio_submit_io(const struct iomap_iter *iter, struct bio *bio,
 	if (iter->flags & IOMAP_WRITE) {
 		int ret;
 
+		fscrypt_info = dio_data->ordered->fscrypt_info;
+		offset = file_offset - dio_data->ordered->orig_offset;
+
 		ret = btrfs_extract_ordered_extent(bbio, dio_data->ordered);
 		if (ret) {
 			btrfs_finish_ordered_extent(dio_data->ordered,
@@ -755,8 +761,12 @@ static void btrfs_dio_submit_io(const struct iomap_iter *iter, struct bio *bio,
 			iomap_dio_bio_end_io(bio);
 			return;
 		}
+	} else {
+		fscrypt_info = dio_data->fscrypt_info;
+		offset = file_offset - dio_data->orig_start;
 	}
 
+	fscrypt_set_bio_crypt_ctx_from_extent(&bbio->bio, fscrypt_info, offset, GFP_NOFS);
 	btrfs_submit_bbio(bbio, 0);
 }
 

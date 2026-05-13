@@ -35,6 +35,7 @@
 #include "dev-replace.h"
 #include "super.h"
 #include "transaction.h"
+#include "fscrypt.h"
 
 static struct kmem_cache *extent_buffer_cache;
 
@@ -150,6 +151,10 @@ struct btrfs_bio_ctrl {
 	 * inside the same inode.
 	 */
 	u64 last_em_start;
+
+	/* This is set for reads and we have encryption. */
+	struct fscrypt_extent_info *fscrypt_info;
+	u64 orig_start;
 };
 
 /*
@@ -710,8 +715,27 @@ static int alloc_eb_folio_array(struct extent_buffer *eb, bool nofail)
 static bool btrfs_bio_is_contig(struct btrfs_bio_ctrl *bio_ctrl,
 				u64 disk_bytenr, loff_t file_offset)
 {
-	struct bio *bio = &bio_ctrl->bbio->bio;
+	struct btrfs_bio *bbio = bio_ctrl->bbio;
+	struct bio *bio = &bbio->bio;
+	struct inode *inode = &bbio->inode->vfs_inode;
 	const sector_t sector = disk_bytenr >> SECTOR_SHIFT;
+
+	if (IS_ENCRYPTED(inode)) {
+		u64 offset = 0;
+		struct fscrypt_extent_info *fscrypt_info = NULL;
+
+		/* bio_ctrl->fscrypt_info is only set in the READ case. */
+		if (bio_ctrl->fscrypt_info) {
+			fscrypt_info = bio_ctrl->fscrypt_info;
+			offset = file_offset - bio_ctrl->orig_start;
+		} else if (bbio->ordered) {
+			fscrypt_info = bbio->ordered->fscrypt_info;
+			offset = file_offset - bbio->ordered->orig_offset;
+		}
+
+		if (!fscrypt_mergeable_extent_bio(bio, fscrypt_info, offset))
+			return false;
+	}
 
 	if (bio_ctrl->compress_type != BTRFS_COMPRESS_NONE) {
 		/*
@@ -735,6 +759,8 @@ static void alloc_new_bio(struct btrfs_inode *inode,
 {
 	struct btrfs_fs_info *fs_info = inode->root->fs_info;
 	struct btrfs_bio *bbio;
+	struct fscrypt_extent_info *fscrypt_info = NULL;
+	u64 offset = 0;
 
 	bbio = btrfs_bio_alloc(BIO_MAX_VECS, bio_ctrl->opf, inode,
 			       file_offset, bio_ctrl->end_io_func, NULL);
@@ -754,6 +780,8 @@ static void alloc_new_bio(struct btrfs_inode *inode,
 					ordered->file_offset +
 					ordered->disk_num_bytes - file_offset);
 			bbio->ordered = ordered;
+			fscrypt_info = ordered->fscrypt_info;
+			offset = file_offset - ordered->orig_offset;
 		}
 
 		/*
@@ -764,7 +792,12 @@ static void alloc_new_bio(struct btrfs_inode *inode,
 		 */
 		bio_set_dev(&bbio->bio, fs_info->fs_devices->latest_dev->bdev);
 		wbc_init_bio(bio_ctrl->wbc, &bbio->bio);
+	} else {
+		fscrypt_info = bio_ctrl->fscrypt_info;
+		offset = file_offset - bio_ctrl->orig_start;
 	}
+
+	fscrypt_set_bio_crypt_ctx_from_extent(&bbio->bio, fscrypt_info, offset, GFP_NOFS);
 }
 
 /*
@@ -808,6 +841,19 @@ static void submit_extent_folio(struct btrfs_bio_ctrl *bio_ctrl,
 			ASSERT(bio_ctrl->compress_type == BTRFS_COMPRESS_NONE);
 			ASSERT(is_data_inode(inode));
 			len = bio_ctrl->len_to_oe_boundary;
+		}
+
+		/*
+		 * Encryption has to allocate bounce buffers to encrypt the bio,
+		 * and we need to make sure that it doesn't split the bio so we
+		 * retain all of our special info in the btrfs_bio, so submit
+		 * any bio that gets up to BIO_MAX_VECS worth of segments.
+		 */
+		if (IS_ENCRYPTED(&inode->vfs_inode) &&
+		    bio_data_dir(&bio_ctrl->bbio->bio) == WRITE &&
+		    bio_segments(&bio_ctrl->bbio->bio) == BIO_MAX_VECS) {
+			submit_one_bio(bio_ctrl);
+			continue;
 		}
 
 		if (!bio_add_folio(&bio_ctrl->bbio->bio, folio, len, pg_offset)) {
@@ -1031,6 +1077,8 @@ static int btrfs_do_readpage(struct folio *folio, struct extent_map **em_cached,
 		u64 block_start;
 		u64 em_gen;
 
+		bio_ctrl->fscrypt_info = NULL;
+
 		ASSERT(IS_ALIGNED(cur, fs_info->sectorsize));
 		if (cur >= last_byte) {
 			folio_zero_range(folio, pg_offset, end - cur + 1);
@@ -1120,6 +1168,21 @@ static int btrfs_do_readpage(struct folio *folio, struct extent_map **em_cached,
 
 		bio_ctrl->last_em_start = em->start;
 
+		/*
+		 * We use the extent offset for the IV when decrypting the page,
+		 * so we have to set the extent_offset based on the orig_start
+		 * for this extent.  Also save the fscrypt_info so the bio ctx
+		 * can be set properly.  If this inode isn't encrypted this
+		 * won't do anything.
+		 *
+		 * If we're compressed we'll handle all of this in
+		 * btrfs_submit_compressed_read.
+		 */
+		if (compress_type == BTRFS_COMPRESS_NONE) {
+			bio_ctrl->orig_start = em->start - em->offset;
+			bio_ctrl->fscrypt_info = fscrypt_get_extent_info(em->fscrypt_info);
+		}
+
 		em_gen = em->generation;
 		btrfs_free_extent_map(em);
 		em = NULL;
@@ -1128,11 +1191,17 @@ static int btrfs_do_readpage(struct folio *folio, struct extent_map **em_cached,
 		if (block_start == EXTENT_MAP_HOLE) {
 			folio_zero_range(folio, pg_offset, blocksize);
 			end_folio_read(vi, folio, true, cur, blocksize);
+
+			/* This shouldn't be set, but clear it just in case. */
+			fscrypt_put_extent_info(bio_ctrl->fscrypt_info);
 			continue;
 		}
 		/* the get_extent function already copied into the folio */
 		if (block_start == EXTENT_MAP_INLINE) {
 			end_folio_read(vi, folio, true, cur, blocksize);
+
+			/* This shouldn't be set, but clear it just in case. */
+			fscrypt_put_extent_info(bio_ctrl->fscrypt_info);
 			continue;
 		}
 
@@ -1145,6 +1214,7 @@ static int btrfs_do_readpage(struct folio *folio, struct extent_map **em_cached,
 			submit_one_bio(bio_ctrl);
 		submit_extent_folio(bio_ctrl, disk_bytenr, folio, blocksize,
 				    pg_offset, em_gen);
+		fscrypt_put_extent_info(bio_ctrl->fscrypt_info);
 	}
 	return 0;
 }

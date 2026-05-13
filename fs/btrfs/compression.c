@@ -33,6 +33,7 @@
 #include "subpage.h"
 #include "messages.h"
 #include "super.h"
+#include "fscrypt.h"
 
 static struct bio_set btrfs_compressed_bioset;
 
@@ -333,6 +334,8 @@ void btrfs_submit_compressed_write(struct btrfs_ordered_extent *ordered,
 	cb->bbio.bio.bi_iter.bi_sector = ordered->disk_bytenr >> SECTOR_SHIFT;
 	cb->bbio.ordered = ordered;
 
+	fscrypt_set_bio_crypt_ctx_from_extent(&cb->bbio.bio, ordered->fscrypt_info, 0, GFP_NOFS);
+
 	btrfs_submit_bbio(&cb->bbio, 0);
 }
 
@@ -592,6 +595,7 @@ void btrfs_submit_compressed_read(struct btrfs_bio *bbio)
 	cb->orig_bbio = bbio;
 	cb->bbio.csum_search_commit_root = bbio->csum_search_commit_root;
 
+	fscrypt_set_bio_crypt_ctx_from_extent(&cb->bbio.bio, em->fscrypt_info, 0, GFP_NOFS);
 	btrfs_free_extent_map(em);
 
 	for (int i = 0; i * min_folio_size < compressed_len; i++) {
