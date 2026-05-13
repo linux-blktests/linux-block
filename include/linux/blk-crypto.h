@@ -7,7 +7,7 @@
 #define __LINUX_BLK_CRYPTO_H
 
 #include <linux/minmax.h>
-#include <linux/types.h>
+#include <linux/blk_types.h>
 #include <uapi/linux/blk-crypto.h>
 
 enum blk_crypto_mode_num {
@@ -18,6 +18,14 @@ enum blk_crypto_mode_num {
 	BLK_ENCRYPTION_MODE_SM4_XTS,
 	BLK_ENCRYPTION_MODE_MAX,
 };
+
+/*
+ * orig_bio must be the bio that was submitted from the upper layer as the upper
+ * layer could have used a specific bioset and expect the orig_bio to be from
+ * its bioset.
+ */
+typedef blk_status_t (*blk_crypto_process_bio_t)(struct bio *orig_bio,
+						 struct bio *enc_bio);
 
 /*
  * Supported types of keys.  Must be bitflags due to their use in
@@ -77,12 +85,14 @@ enum blk_crypto_key_type {
  *	filesystem block size or the disk sector size.
  * @dun_bytes: the maximum number of bytes of DUN used when using this key
  * @key_type: the type of this key -- either raw or hardware-wrapped
+ * @proces_bio: optional callback to process encrypted bios.
  */
 struct blk_crypto_config {
 	enum blk_crypto_mode_num crypto_mode;
 	unsigned int data_unit_size;
 	unsigned int dun_bytes;
 	enum blk_crypto_key_type key_type;
+	blk_crypto_process_bio_t process_bio;
 };
 
 /**
@@ -150,7 +160,8 @@ int blk_crypto_init_key(struct blk_crypto_key *blk_key,
 			enum blk_crypto_key_type key_type,
 			enum blk_crypto_mode_num crypto_mode,
 			unsigned int dun_bytes,
-			unsigned int data_unit_size);
+			unsigned int data_unit_size,
+			blk_crypto_process_bio_t process_bio);
 
 int blk_crypto_start_using_key(struct block_device *bdev,
 			       const struct blk_crypto_key *key);

@@ -352,6 +352,8 @@ bool __blk_crypto_cfg_supported(struct blk_crypto_profile *profile,
 		return false;
 	if (!(profile->key_types_supported & cfg->key_type))
 		return false;
+	if (cfg->process_bio && !blk_crypto_profile_is_fallback(profile))
+		return false;
 	return true;
 }
 

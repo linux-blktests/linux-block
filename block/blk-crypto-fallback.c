@@ -330,6 +330,17 @@ new_bio:
 		}
 	}
 
+	/* Process the encrypted bio before we submit it. */
+	if (bc->bc_key->crypto_cfg.process_bio) {
+		blk_status_t status;
+
+		status = bc->bc_key->crypto_cfg.process_bio(src_bio, enc_bio);
+		if (status != BLK_STS_OK) {
+			enc_bio->bi_status = status;
+			goto out_free_enc_bio;
+		}
+	}
+
 	submit_bio(enc_bio);
 	return;
 
@@ -357,6 +368,16 @@ static void blk_crypto_fallback_encrypt_bio(struct bio *src_bio)
 	struct bio_crypt_ctx *bc = src_bio->bi_crypt_context;
 	struct blk_crypto_keyslot *slot;
 	blk_status_t status;
+
+	/*
+	 * We cannot split bio's that have process_bio, as they require the original bio.
+	 * The upper layer must make sure to limit the submitted bio's appropriately.
+	 */
+	if (bio_segments(src_bio) > BIO_MAX_VECS && bc->bc_key->crypto_cfg.process_bio) {
+		src_bio->bi_status = BLK_STS_RESOURCE;
+		bio_endio(src_bio);
+		return;
+	}
 
 	status = blk_crypto_get_keyslot(blk_crypto_fallback_profile,
 					bc->bc_key, &slot);
@@ -427,6 +448,13 @@ static void blk_crypto_fallback_decrypt_bio(struct work_struct *work)
 	struct blk_crypto_keyslot *slot;
 	blk_status_t status;
 
+	/* Process the bio first before trying to decrypt. */
+	if (bc->bc_key->crypto_cfg.process_bio) {
+		status = bc->bc_key->crypto_cfg.process_bio(bio, bio);
+		if (status != BLK_STS_OK)
+			goto out;
+	}
+
 	status = blk_crypto_get_keyslot(blk_crypto_fallback_profile,
 					bc->bc_key, &slot);
 	if (status == BLK_STS_OK) {
@@ -435,10 +463,23 @@ static void blk_crypto_fallback_decrypt_bio(struct work_struct *work)
 				blk_crypto_fallback_tfm(slot));
 		blk_crypto_put_keyslot(slot);
 	}
+out:
 	mempool_free(f_ctx, bio_fallback_crypt_ctx_pool);
 
 	bio->bi_status = status;
 	bio_endio(bio);
+}
+
+/**
+ * blk_crypto_profile_is_fallback - check if this profile is the fallback
+ *				    profile
+ * @profile: the profile we're checking
+ *
+ * This is just a quick check to make sure @profile is the fallback profile.
+ */
+bool blk_crypto_profile_is_fallback(struct blk_crypto_profile *profile)
+{
+	return profile == blk_crypto_fallback_profile;
 }
 
 /**

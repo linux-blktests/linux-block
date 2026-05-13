@@ -226,6 +226,8 @@ int blk_crypto_fallback_start_using_mode(enum blk_crypto_mode_num mode_num);
 
 int blk_crypto_fallback_evict_key(const struct blk_crypto_key *key);
 
+bool blk_crypto_profile_is_fallback(struct blk_crypto_profile *profile);
+
 #else /* CONFIG_BLK_INLINE_ENCRYPTION_FALLBACK */
 
 static inline int
@@ -239,6 +241,12 @@ static inline int
 blk_crypto_fallback_evict_key(const struct blk_crypto_key *key)
 {
 	return 0;
+}
+
+static inline bool
+blk_crypto_profile_is_fallback(struct blk_crypto_profile *profile)
+{
+	return false;
 }
 
 #endif /* CONFIG_BLK_INLINE_ENCRYPTION_FALLBACK */
