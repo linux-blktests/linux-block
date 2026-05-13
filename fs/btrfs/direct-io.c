@@ -17,6 +17,8 @@ struct btrfs_dio_data {
 	ssize_t submitted;
 	struct extent_changeset *data_reserved;
 	struct btrfs_ordered_extent *ordered;
+	struct fscrypt_extent_info *fscrypt_info;
+	u64 orig_start;
 	bool data_space_reserved;
 	bool nocow_done;
 };
@@ -550,6 +552,9 @@ static int btrfs_dio_iomap_begin(struct inode *inode, loff_t start,
 							       release_offset,
 							       release_len);
 		}
+	} else {
+		dio_data->fscrypt_info = fscrypt_get_extent_info(em->fscrypt_info);
+		dio_data->orig_start = em->start - em->offset;
 	}
 
 	/*
@@ -638,6 +643,11 @@ static int btrfs_dio_iomap_end(struct inode *inode, loff_t pos, loff_t length,
 	if (write) {
 		btrfs_put_ordered_extent(dio_data->ordered);
 		dio_data->ordered = NULL;
+	}
+
+	if (dio_data->fscrypt_info) {
+		fscrypt_put_extent_info(dio_data->fscrypt_info);
+		dio_data->fscrypt_info = NULL;
 	}
 
 	if (write)
