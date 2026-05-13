@@ -2564,6 +2564,11 @@ static int __init btrfs_print_mod_info(void)
 #else
 			", fsverity=no"
 #endif
+#ifdef CONFIG_FS_ENCRYPTION
+			", fscrypt=yes"
+#else
+			", fscrypt=no"
+#endif
 			;
 
 #ifdef CONFIG_BTRFS_EXPERIMENTAL
