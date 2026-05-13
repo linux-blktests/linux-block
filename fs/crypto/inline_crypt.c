@@ -313,6 +313,40 @@ void fscrypt_set_bio_crypt_ctx(struct bio *bio, const struct inode *inode,
 EXPORT_SYMBOL_GPL(fscrypt_set_bio_crypt_ctx);
 
 /**
+ * fscrypt_set_bio_crypt_ctx_from_extent() - prepare a file contents bio for
+ *					     inline crypto with extent
+ *					     encryption
+ * @bio: a bio which will eventually be submitted to the file
+ * @ei: the extent's crypto info
+ * @pos: the first extent logical offset (in bytes) in the I/O
+ * @gfp_mask: memory allocation flags - these must be a waiting mask so that
+ *					bio_crypt_set_ctx can't fail.
+ *
+ * If the contents of the file should be encrypted (or decrypted) with inline
+ * encryption, then assign the appropriate encryption context to the bio.
+ *
+ * Normally the bio should be newly allocated (i.e. no pages added yet), as
+ * otherwise fscrypt_mergeable_extent_bio() won't work as intended.
+ *
+ * The encryption context will be freed automatically when the bio is freed.
+ */
+void fscrypt_set_bio_crypt_ctx_from_extent(struct bio *bio,
+					   const struct fscrypt_extent_info *ei,
+					   loff_t pos, gfp_t gfp_mask)
+{
+	const struct blk_crypto_key *key;
+	u64 dun[BLK_CRYPTO_DUN_ARRAY_SIZE] = {};
+
+	if (!ei)
+		return;
+	key = ei->prep_key.blk_key;
+
+	dun[0] = pos >> key->data_unit_size_bits;
+	bio_crypt_set_ctx(bio, key, dun, gfp_mask);
+}
+EXPORT_SYMBOL_GPL(fscrypt_set_bio_crypt_ctx_from_extent);
+
+/**
  * fscrypt_mergeable_bio() - test whether data can be added to a bio
  * @bio: the bio being built up
  * @inode: the inode for the next part of the I/O
@@ -358,6 +392,53 @@ bool fscrypt_mergeable_bio(struct bio *bio, const struct inode *inode,
 	return bio_crypt_dun_is_contiguous(bc, bio->bi_iter.bi_size, next_dun);
 }
 EXPORT_SYMBOL_GPL(fscrypt_mergeable_bio);
+
+/**
+ * fscrypt_mergeable_extent_bio() - test whether data can be added to a bio
+ * @bio: the bio being built up
+ * @ei: the fscrypt_extent_info for this extent
+ * @pos: the next extent logical offset (in bytes) in the I/O
+ *
+ * When building a bio which may contain data which should undergo inline
+ * encryption (or decryption) via fscrypt, filesystems should call this function
+ * to ensure that the resulting bio contains only contiguous data unit numbers.
+ * This will return false if the next part of the I/O cannot be merged with the
+ * bio because either the encryption key would be different or the encryption
+ * data unit numbers would be discontiguous.
+ *
+ * fscrypt_set_bio_crypt_ctx_from_extent() must have already been called on the
+ * bio.
+ *
+ * This function isn't required in cases where crypto-mergeability is ensured in
+ * another way, such as I/O targeting only a single extent (thus a single key)
+ * combined with fscrypt_limit_io_blocks() to ensure DUN contiguity.
+ *
+ * Return: true iff the I/O is mergeable
+ */
+bool fscrypt_mergeable_extent_bio(struct bio *bio,
+				  const struct fscrypt_extent_info *ei,
+				  loff_t pos)
+{
+	const struct bio_crypt_ctx *bc = bio_crypt_ctx(bio);
+	u64 next_dun[BLK_CRYPTO_DUN_ARRAY_SIZE] = {};
+
+	if (!ei != !bc)
+		return false;
+	if (!bc)
+		return true;
+
+	/*
+	 * Comparing the key pointers is good enough, as all I/O for each key
+	 * uses the same pointer.  I.e., there's currently no need to support
+	 * merging requests where the keys are the same but the pointers differ.
+	 */
+	if (bc->bc_key != ei->prep_key.blk_key)
+		return false;
+
+	next_dun[0] = pos >> bc->bc_key->data_unit_size_bits;
+	return bio_crypt_dun_is_contiguous(bc, bio->bi_iter.bi_size, next_dun);
+}
+EXPORT_SYMBOL_GPL(fscrypt_mergeable_extent_bio);
 
 /**
  * fscrypt_dio_supported() - check whether DIO (direct I/O) is supported on an
