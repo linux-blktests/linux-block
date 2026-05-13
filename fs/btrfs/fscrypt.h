@@ -25,6 +25,9 @@ ssize_t btrfs_fscrypt_context_for_new_extent(struct btrfs_inode *inode,
 					     struct fscrypt_extent_info *info,
 					     u8 *ctx);
 int btrfs_fscrypt_bio_length(struct bio *bio, u64 map_length);
+int btrfs_decrypt_name(struct btrfs_root *root, struct extent_buffer *eb,
+		       unsigned long name_off, u32 name_len,
+		       u64 parent_ino, struct fscrypt_str *name);
 
 #else
 static inline void btrfs_fscrypt_save_extent_info(struct btrfs_path *path,
@@ -67,6 +70,13 @@ static inline ssize_t btrfs_fscrypt_context_for_new_extent(struct btrfs_inode *i
 static inline u64 btrfs_fscrypt_bio_length(struct bio *bio, u64 map_length)
 {
 	return map_length;
+}
+
+static inline int btrfs_decrypt_name(struct btrfs_root *root, struct extent_buffer *eb,
+				     unsigned long name_off, u32 name_len,
+				     u64 parent_ino, struct fscrypt_str *name)
+{
+	return -EINVAL;
 }
 
 #endif /* CONFIG_FS_ENCRYPTION */
