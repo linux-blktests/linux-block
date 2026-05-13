@@ -1121,10 +1121,11 @@ static void submit_one_async_extent(struct async_chunk *async_chunk,
 		ret = PTR_ERR(em);
 		goto out_free_reserve;
 	}
-	btrfs_free_extent_map(em);
 
+	file_extent.fscrypt_info = em->fscrypt_info;
 	ordered = btrfs_alloc_ordered_extent(inode, start, &file_extent,
 					     1U << BTRFS_ORDERED_COMPRESSED);
+	btrfs_free_extent_map(em);
 	if (IS_ERR(ordered)) {
 		btrfs_drop_extent_map_range(inode, start, end, false);
 		ret = PTR_ERR(ordered);
@@ -1263,10 +1264,11 @@ static int cow_one_range(struct btrfs_inode *inode, struct folio *locked_folio,
 		ret = PTR_ERR(em);
 		goto free_reserved;
 	}
-	btrfs_free_extent_map(em);
 
+	file_extent.fscrypt_info = em->fscrypt_info;
 	ordered = btrfs_alloc_ordered_extent(inode, file_offset, &file_extent,
 					     1U << BTRFS_ORDERED_REGULAR);
+	btrfs_free_extent_map(em);
 	if (IS_ERR(ordered)) {
 		btrfs_drop_extent_map_range(inode, file_offset, cur_end, false);
 		ret = PTR_ERR(ordered);
@@ -1933,18 +1935,32 @@ static int nocow_one_range(struct btrfs_inode *inode, struct folio *locked_folio
 			   u64 file_pos, bool is_prealloc)
 {
 	struct btrfs_ordered_extent *ordered;
+	struct extent_map *em;
 	const u64 len = nocow_args->file_extent.num_bytes;
 	const u64 end = file_pos + len - 1;
 	int ret = 0;
 
 	btrfs_lock_extent(&inode->io_tree, file_pos, end, cached);
 
-	if (is_prealloc) {
-		struct extent_map *em;
+	/*
+	 * We only want to do this lookup if we're encrypted, otherwise
+	 * fsrypt_info will be null and we can avoid this lookup.
+	 */
+	if (IS_ENCRYPTED(&inode->vfs_inode)) {
+		em = btrfs_get_extent(inode, NULL, file_pos, len);
+		if (IS_ERR(em)) {
+			btrfs_unlock_extent(&inode->io_tree, file_pos, end, cached);
+			return PTR_ERR(em);
+		}
+		nocow_args->file_extent.fscrypt_info = fscrypt_get_extent_info(em->fscrypt_info);
+		btrfs_free_extent_map(em);
+	}
 
+	if (is_prealloc) {
 		em = btrfs_create_io_em(inode, file_pos, &nocow_args->file_extent,
 					BTRFS_ORDERED_PREALLOC);
 		if (IS_ERR(em)) {
+			fscrypt_put_extent_info(nocow_args->file_extent.fscrypt_info);
 			ret = PTR_ERR(em);
 			goto error;
 		}
@@ -1955,6 +1971,7 @@ static int nocow_one_range(struct btrfs_inode *inode, struct folio *locked_folio
 					     is_prealloc
 					     ? (1U << BTRFS_ORDERED_PREALLOC)
 					     : (1U << BTRFS_ORDERED_NOCOW));
+	fscrypt_put_extent_info(nocow_args->file_extent.fscrypt_info);
 	if (IS_ERR(ordered)) {
 		if (is_prealloc)
 			btrfs_drop_extent_map_range(inode, file_pos, end, false);
@@ -7657,7 +7674,13 @@ struct extent_map *btrfs_create_io_em(struct btrfs_inode *inode, u64 start,
 	em->flags |= EXTENT_FLAG_PINNED;
 	if (type == BTRFS_ORDERED_COMPRESSED)
 		btrfs_extent_map_set_compression(em, file_extent->compression);
-	btrfs_extent_map_set_encryption(em, BTRFS_ENCRYPTION_NONE);
+
+	if (file_extent->fscrypt_info) {
+		btrfs_extent_map_set_encryption(em, BTRFS_ENCRYPTION_FSCRYPT);
+		em->fscrypt_info = fscrypt_get_extent_info(file_extent->fscrypt_info);
+	} else {
+		btrfs_extent_map_set_encryption(em, BTRFS_ENCRYPTION_NONE);
+	}
 
 	ret = btrfs_replace_extent_map_range(inode, em, true);
 	if (ret) {
@@ -10237,11 +10260,12 @@ ssize_t btrfs_do_encoded_write(struct kiocb *iocb, struct iov_iter *from,
 		ret = PTR_ERR(em);
 		goto out_free_reserved;
 	}
-	btrfs_free_extent_map(em);
 
+	file_extent.fscrypt_info = em->fscrypt_info;
 	ordered = btrfs_alloc_ordered_extent(inode, start, &file_extent,
 				       (1U << BTRFS_ORDERED_ENCODED) |
 				       (1U << BTRFS_ORDERED_COMPRESSED));
+	btrfs_free_extent_map(em);
 	if (IS_ERR(ordered)) {
 		btrfs_drop_extent_map_range(inode, start, end, false);
 		ret = PTR_ERR(ordered);

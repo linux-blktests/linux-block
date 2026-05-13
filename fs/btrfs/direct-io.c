@@ -140,7 +140,7 @@ static int lock_extent_direct(struct inode *inode, u64 lockstart, u64 lockend,
 static struct extent_map *btrfs_create_dio_extent(struct btrfs_inode *inode,
 						  struct btrfs_dio_data *dio_data,
 						  const u64 start,
-						  const struct btrfs_file_extent *file_extent,
+						  struct btrfs_file_extent *file_extent,
 						  const int type)
 {
 	struct extent_map *em = NULL;
@@ -150,6 +150,7 @@ static struct extent_map *btrfs_create_dio_extent(struct btrfs_inode *inode,
 		em = btrfs_create_io_em(inode, start, file_extent, type);
 		if (IS_ERR(em))
 			goto out;
+		file_extent->fscrypt_info = em->fscrypt_info;
 	}
 
 	ordered = btrfs_alloc_ordered_extent(inode, start, file_extent,
@@ -276,6 +277,7 @@ static int btrfs_get_blocks_direct_write(struct extent_map **map,
 		}
 		space_reserved = true;
 
+		file_extent.fscrypt_info = em->fscrypt_info;
 		em2 = btrfs_create_dio_extent(BTRFS_I(inode), dio_data, start,
 					      &file_extent, type);
 		btrfs_dec_nocow_writers(bg);
