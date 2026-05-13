@@ -202,6 +202,7 @@ again:
 	file_extent.ram_bytes = ins.offset;
 	file_extent.offset = 0;
 	file_extent.compression = BTRFS_COMPRESS_NONE;
+	file_extent.fscrypt_info = NULL;
 	em = btrfs_create_dio_extent(inode, dio_data, start, &file_extent,
 				     BTRFS_ORDERED_REGULAR);
 	btrfs_dec_block_group_reservations(fs_info, ins.objectid);

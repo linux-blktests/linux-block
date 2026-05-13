@@ -1112,6 +1112,7 @@ static void submit_one_async_extent(struct async_chunk *async_chunk,
 	file_extent.num_bytes = async_extent->ram_size;
 	file_extent.offset = 0;
 	file_extent.compression = async_extent->cb->compress_type;
+	file_extent.fscrypt_info = NULL;
 
 	async_extent->cb->bbio.bio.bi_iter.bi_sector = ins.objectid >> SECTOR_SHIFT;
 
@@ -1249,6 +1250,7 @@ static int cow_one_range(struct btrfs_inode *inode, struct folio *locked_folio,
 	file_extent.ram_bytes = ins->offset;
 	file_extent.offset = 0;
 	file_extent.compression = BTRFS_COMPRESS_NONE;
+	file_extent.fscrypt_info = NULL;
 
 	/*
 	 * Locked range will be released either during error clean up (inside
@@ -10229,6 +10231,7 @@ ssize_t btrfs_do_encoded_write(struct kiocb *iocb, struct iov_iter *from,
 	file_extent.ram_bytes = ram_bytes;
 	file_extent.offset = encoded->unencoded_offset;
 	file_extent.compression = compression;
+	file_extent.fscrypt_info = NULL;
 	em = btrfs_create_io_em(inode, start, &file_extent, BTRFS_ORDERED_COMPRESSED);
 	if (IS_ERR(em)) {
 		ret = PTR_ERR(em);

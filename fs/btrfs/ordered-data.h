@@ -192,6 +192,7 @@ struct btrfs_file_extent {
 	u64 num_bytes;
 	u64 ram_bytes;
 	u64 offset;
+	struct fscrypt_extent_info *fscrypt_info;
 	u8 compression;
 };
 

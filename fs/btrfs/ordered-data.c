@@ -148,7 +148,8 @@ static inline struct rb_node *ordered_tree_search(struct btrfs_inode *inode,
 static struct btrfs_ordered_extent *alloc_ordered_extent(
 			struct btrfs_inode *inode, u64 file_offset, u64 num_bytes,
 			u64 ram_bytes, u64 disk_bytenr, u64 disk_num_bytes,
-			u64 offset, unsigned long flags, int compress_type)
+			u64 offset, unsigned long flags, int compress_type,
+			struct fscrypt_extent_info *fscrypt_info)
 {
 	struct btrfs_ordered_extent *entry;
 	int ret;
@@ -205,10 +206,12 @@ static struct btrfs_ordered_extent *alloc_ordered_extent(
 	}
 	entry->inode = inode;
 	entry->compress_type = compress_type;
-	entry->encryption_type = BTRFS_ENCRYPTION_NONE;
 	entry->truncated_len = (u64)-1;
 	entry->qgroup_rsv = qgroup_rsv;
 	entry->flags = flags;
+	entry->fscrypt_info = fscrypt_get_extent_info(fscrypt_info);
+	entry->encryption_type = entry->fscrypt_info ?
+		BTRFS_ENCRYPTION_FSCRYPT : BTRFS_ENCRYPTION_NONE;
 	refcount_set(&entry->refs, 1);
 	init_waitqueue_head(&entry->wait);
 	INIT_LIST_HEAD(&entry->csum_list);
@@ -290,6 +293,7 @@ static void insert_ordered_extent(struct btrfs_ordered_extent *entry)
  * @offset:          Offset into unencoded data where file data starts.
  * @flags:           Flags specifying type of extent (1U << BTRFS_ORDERED_*).
  * @compress_type:   Compression algorithm used for data.
+ * @fscrypt_info:    The fscrypt_extent_info for this extent, if necessary.
  *
  * Most of these parameters correspond to &struct btrfs_file_extent_item. The
  * tree is given a single reference on the ordered extent that was inserted, and
@@ -323,7 +327,8 @@ struct btrfs_ordered_extent *btrfs_alloc_ordered_extent(
 					     file_extent->num_bytes,
 					     file_extent->disk_bytenr + file_extent->offset,
 					     file_extent->num_bytes, 0, flags,
-					     file_extent->compression);
+					     file_extent->compression,
+					     file_extent->fscrypt_info);
 	else
 		entry = alloc_ordered_extent(inode, file_offset,
 					     file_extent->num_bytes,
@@ -331,7 +336,8 @@ struct btrfs_ordered_extent *btrfs_alloc_ordered_extent(
 					     file_extent->disk_bytenr,
 					     file_extent->disk_num_bytes,
 					     file_extent->offset, flags,
-					     file_extent->compression);
+					     file_extent->compression,
+					     file_extent->fscrypt_info);
 	if (!IS_ERR(entry))
 		insert_ordered_extent(entry);
 	return entry;
@@ -1270,8 +1276,8 @@ struct btrfs_ordered_extent *btrfs_split_ordered_extent(
 	if (WARN_ON_ONCE(ordered->disk_num_bytes != ordered->num_bytes))
 		return ERR_PTR(-EINVAL);
 
-	new = alloc_ordered_extent(inode, file_offset, len, len, disk_bytenr,
-				   len, 0, flags, ordered->compress_type);
+	new = alloc_ordered_extent(inode, file_offset, len, len, disk_bytenr, len, 0,
+				   flags, ordered->compress_type, ordered->fscrypt_info);
 	if (IS_ERR(new))
 		return new;
 
