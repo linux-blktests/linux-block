@@ -400,6 +400,9 @@ struct btrfs_replace_extent_info {
 	u64 file_offset;
 	/* Pointer to a file extent item of type regular or prealloc. */
 	char *extent_buf;
+	/* The fscrypt_extent_info for a new extent. */
+	u8 *fscrypt_ctx;
+	u32 fscrypt_context_size;
 	/*
 	 * Set to true when attempting to replace a file range with a new extent
 	 * described by this structure, set to false when attempting to clone an

@@ -38,6 +38,7 @@
 #include "file.h"
 #include "super.h"
 #include "print-tree.h"
+#include "fscrypt.h"
 
 /*
  * Unlock folio after btrfs_file_write() is done with it.
@@ -2411,6 +2412,16 @@ static int btrfs_insert_replace_extent(struct btrfs_trans_handle *trans,
 	if (extent_info->is_new_extent)
 		btrfs_set_file_extent_generation(leaf, extent, trans->transid);
 	btrfs_release_path(path);
+	if (extent_info->fscrypt_context_size) {
+		key.type = BTRFS_FSCRYPT_CTX_KEY;
+		ret = btrfs_insert_empty_item(trans, root, path, &key,
+					      extent_info->fscrypt_context_size);
+		if (ret)
+			return ret;
+		btrfs_fscrypt_save_extent_info(path,
+					       extent_info->fscrypt_ctx,
+					       extent_info->fscrypt_context_size);
+	}
 
 	ret = btrfs_inode_set_file_extent_range(inode, extent_info->file_offset,
 						replace_len);

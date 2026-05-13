@@ -16,6 +16,7 @@
 #include "file-item.h"
 #include "super.h"
 #include "compression.h"
+#include "fscrypt.h"
 
 static struct kmem_cache *btrfs_inode_defrag_cachep;
 
@@ -720,6 +721,11 @@ next:
 		if (ret > 0)
 			goto not_found;
 	}
+	btrfs_release_path(&path);
+
+	ret = btrfs_fscrypt_load_extent_info(inode, &path, &key, em);
+	if (ret)
+		goto err;
 	return em;
 
 not_found:

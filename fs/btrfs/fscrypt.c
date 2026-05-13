@@ -212,9 +212,93 @@ static struct block_device **btrfs_fscrypt_get_devices(struct super_block *sb,
 	return devs;
 }
 
+int btrfs_fscrypt_load_extent_info(struct btrfs_inode *inode,
+				   struct btrfs_path *path,
+				   struct btrfs_key *key,
+				   struct extent_map *em)
+{
+	struct extent_buffer *leaf;
+	int slot;
+	unsigned long offset;
+	u8 ctx[BTRFS_MAX_EXTENT_CTX_SIZE];
+	unsigned long size;
+	struct fscrypt_extent_info *info;
+	unsigned long nofs_flag;
+	int ret;
+
+	if (em->disk_bytenr == EXTENT_MAP_HOLE)
+		return 0;
+	if (btrfs_extent_map_encryption(em) != BTRFS_ENCRYPTION_FSCRYPT)
+		return 0;
+
+	key->type = BTRFS_FSCRYPT_CTX_KEY;
+	ret = btrfs_search_slot(NULL, inode->root, key, path, 0, 0);
+	leaf = path->nodes[0];
+	slot = path->slots[0];
+	if (ret) {
+		btrfs_err(leaf->fs_info,
+	"missing or error searching encryption context item in leaf: root=%llu block=%llu slot=%d ino=%llu file_offset=%llu, err %i",
+			  btrfs_header_owner(leaf), btrfs_header_bytenr(leaf), slot,
+			  key->objectid, key->offset, ret);
+		btrfs_release_path(path);
+		return ret;
+	}
+
+	size = btrfs_item_size(leaf, slot);
+	if (size > FSCRYPT_SET_CONTEXT_MAX_SIZE) {
+		btrfs_err(leaf->fs_info,
+	"unexpected or corrupted encryption context size in leaf: root=%llu block=%llu slot=%d ino=%llu file_offset=%llu, size %lu (too big)",
+			  btrfs_header_owner(leaf), btrfs_header_bytenr(leaf), slot,
+			  key->objectid, key->offset, size);
+		btrfs_release_path(path);
+		return -EIO;
+	}
+
+	offset = btrfs_item_ptr_offset(leaf, slot),
+	read_extent_buffer(leaf, ctx, offset, size);
+	btrfs_release_path(path);
+
+	nofs_flag = memalloc_nofs_save();
+	info = fscrypt_load_extent_info(&inode->vfs_inode, ctx, size);
+	memalloc_nofs_restore(nofs_flag);
+	if (IS_ERR(info))
+		return PTR_ERR(info);
+	em->fscrypt_info = info;
+	return 0;
+}
+
+void btrfs_fscrypt_save_extent_info(struct btrfs_path *path, u8 *ctx, unsigned long size)
+{
+	struct extent_buffer *leaf = path->nodes[0];
+	unsigned long offset = btrfs_item_ptr_offset(leaf, path->slots[0]);
+
+	ASSERT(size <= FSCRYPT_SET_CONTEXT_MAX_SIZE);
+
+	write_extent_buffer(leaf, ctx, offset, size);
+	btrfs_release_path(path);
+}
+
+ssize_t btrfs_fscrypt_context_for_new_extent(struct btrfs_inode *inode,
+					     struct fscrypt_extent_info *info,
+					     u8 *ctx)
+{
+	ssize_t ret;
+
+	if (!info)
+		return 0;
+
+	ret = fscrypt_context_for_new_extent(&inode->vfs_inode, info, ctx);
+	if (ret < 0) {
+		btrfs_err_rl(inode->root->fs_info, "invalid encrypt context");
+		return ret;
+	}
+	return ret;
+}
+
 const struct fscrypt_operations btrfs_fscrypt_ops = {
 	.inode_info_offs = (int)offsetof(struct btrfs_inode, i_crypt_info) -
 			   (int)offsetof(struct btrfs_inode, vfs_inode),
+	.has_per_extent_encryption = 1,
 	.get_context = btrfs_fscrypt_get_context,
 	.set_context = btrfs_fscrypt_set_context,
 	.empty_dir = btrfs_fscrypt_empty_dir,

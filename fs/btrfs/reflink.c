@@ -421,7 +421,7 @@ static int btrfs_clone(struct inode *src, struct inode *inode,
 		struct btrfs_key new_key;
 		u64 disko = 0, diskl = 0;
 		u64 datao = 0, datal = 0;
-		u8 comp;
+		u8 comp, encryption;
 		u64 drop_start;
 
 		/* Note the key will change type as we walk through the tree */
@@ -464,6 +464,7 @@ process_slot:
 		extent = btrfs_item_ptr(leaf, slot,
 					struct btrfs_file_extent_item);
 		extent_gen = btrfs_file_extent_generation(leaf, extent);
+		encryption = btrfs_file_extent_encryption(leaf, extent);
 		comp = btrfs_file_extent_compression(leaf, extent);
 		type = btrfs_file_extent_type(leaf, extent);
 		if (type == BTRFS_FILE_EXTENT_REG ||
@@ -523,6 +524,7 @@ process_slot:
 		if (type == BTRFS_FILE_EXTENT_REG ||
 		    type == BTRFS_FILE_EXTENT_PREALLOC) {
 			struct btrfs_replace_extent_info clone_info;
+			u8 fscrypt_ctx[FSCRYPT_SET_CONTEXT_MAX_SIZE];
 
 			/*
 			 *    a  | --- range to clone ---|  b
@@ -539,6 +541,43 @@ process_slot:
 				datal -= off - key.offset;
 			}
 
+			if (encryption == BTRFS_ENCRYPTION_FSCRYPT) {
+				unsigned long offset;
+
+				key.type = BTRFS_FSCRYPT_CTX_KEY;
+				ret = btrfs_search_slot(NULL, BTRFS_I(src)->root, &key, path, 0, 0);
+				if (ret < 0)
+					goto out;
+				leaf = path->nodes[0];
+				slot = path->slots[0];
+				if (ret) {
+					btrfs_err(leaf->fs_info,
+	"missing or error searching encryption context item in leaf: root=%llu block=%llu slot=%d ino=%llu file_offset=%llu, err %i",
+						btrfs_header_owner(leaf),
+						btrfs_header_bytenr(leaf), slot,
+						key.objectid, key.offset, ret);
+					goto out;
+				}
+
+				size = btrfs_item_size(leaf, slot);
+				if (size > FSCRYPT_SET_CONTEXT_MAX_SIZE) {
+					btrfs_err(leaf->fs_info,
+	"unexpected or corrupted encryption context size in leaf: root=%llu block=%llu slot=%d ino=%llu file_offset=%llu, size %u (too big)",
+						btrfs_header_owner(leaf),
+						btrfs_header_bytenr(leaf), slot,
+						key.objectid, key.offset, size);
+					ret = -EIO;
+					goto out;
+				}
+
+				offset = btrfs_item_ptr_offset(leaf, slot),
+				read_extent_buffer(leaf, fscrypt_ctx, offset, size);
+				btrfs_release_path(path);
+				key.type = BTRFS_EXTENT_DATA_KEY;
+			} else {
+				size = 0;
+			}
+
 			clone_info.disk_offset = disko;
 			clone_info.disk_len = diskl;
 			clone_info.data_offset = datao;
@@ -547,6 +586,8 @@ process_slot:
 			clone_info.extent_buf = buf;
 			clone_info.is_new_extent = false;
 			clone_info.update_times = !no_time_update;
+			clone_info.fscrypt_ctx = fscrypt_ctx;
+			clone_info.fscrypt_context_size = size;
 			ret = btrfs_replace_file_extents(BTRFS_I(inode), path,
 					drop_start, new_key.offset + datal - 1,
 					&clone_info, &trans);
