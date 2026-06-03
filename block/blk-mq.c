@@ -4459,7 +4459,7 @@ EXPORT_SYMBOL(blk_mq_destroy_queue);
 
 struct gendisk *__blk_mq_alloc_disk(struct blk_mq_tag_set *set,
 		struct queue_limits *lim, void *queuedata,
-		struct lock_class_key *lkclass)
+		struct gendisk_lkclass *lkclass)
 {
 	struct request_queue *q;
 	struct gendisk *disk;
@@ -4480,7 +4480,7 @@ struct gendisk *__blk_mq_alloc_disk(struct blk_mq_tag_set *set,
 EXPORT_SYMBOL(__blk_mq_alloc_disk);
 
 struct gendisk *blk_mq_alloc_disk_for_queue(struct request_queue *q,
-		struct lock_class_key *lkclass)
+		struct gendisk_lkclass *lkclass)
 {
 	struct gendisk *disk;
 
