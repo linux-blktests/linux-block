@@ -308,7 +308,9 @@ static void seq_print_resource_transfer_log_summary(struct seq_file *m,
 
 	seq_puts(m, "n\tdevice\tvnr\t" RQ_HDR);
 	spin_lock_irq(&resource->req_lock);
-	list_for_each_entry(req, &connection->transfer_log, tl_requests) {
+	for (req = list_first_entry(&connection->transfer_log, typeof(*req), tl_requests);
+	     !list_entry_is_head(req, &connection->transfer_log, tl_requests);
+	     req = list_next_entry(req, tl_requests)) {
 		unsigned int tmp = 0;
 		unsigned int s;
 		++count;
