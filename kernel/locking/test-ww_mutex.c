@@ -519,7 +519,9 @@ static void stress_reorder_work(struct work_struct *work)
 	do {
 		ww_acquire_init(&ctx, stress->class);
 
-		list_for_each_entry(ll, &locks, link) {
+		for (ll = list_first_entry(&locks, typeof(*ll), link);
+		     !list_entry_is_head(ll, &locks, link);
+		     ll = list_next_entry(ll, link)) {
 			err = ww_mutex_lock(ll->lock, &ctx);
 			if (!err)
 				continue;
