@@ -86,7 +86,9 @@ int ttm_eu_reserve_buffers(struct ww_acquire_ctx *ticket,
 	if (ticket)
 		ww_acquire_init(ticket, &reservation_ww_class);
 
-	list_for_each_entry(entry, list, head) {
+	for (entry = list_first_entry(list, typeof(*entry), head);
+	     !list_entry_is_head(entry, list, head);
+	     entry = list_next_entry(entry, head)) {
 		struct ttm_buffer_object *bo = entry->bo;
 		unsigned int num_fences;
 
