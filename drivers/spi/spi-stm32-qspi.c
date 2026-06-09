@@ -577,7 +577,10 @@ static int stm32_qspi_transfer_one_message(struct spi_controller *ctrl,
 
 	gpiod_set_value_cansleep(spi_get_csgpiod(spi, 0), true);
 
-	list_for_each_entry(transfer, &msg->transfers, transfer_list) {
+	for (transfer = list_first_entry(&msg->transfers,
+					 typeof(*transfer), transfer_list);
+	     !list_entry_is_head(transfer, &msg->transfers, transfer_list);
+	     transfer = list_next_entry(transfer, transfer_list)) {
 		u8 dummy_bytes = 0;
 
 		memset(&op, 0, sizeof(op));
