@@ -434,7 +434,10 @@ static int fsi_spi_transfer_one_message(struct spi_controller *ctlr,
 	if (rc)
 		goto error;
 
-	list_for_each_entry(transfer, &mesg->transfers, transfer_list) {
+	for (transfer = list_first_entry(&mesg->transfers,
+					 typeof(*transfer), transfer_list);
+	     !list_entry_is_head(transfer, &mesg->transfers, transfer_list);
+	     transfer = list_next_entry(transfer, transfer_list)) {
 		struct fsi_spi_sequence seq;
 		struct spi_transfer *next = NULL;
 
