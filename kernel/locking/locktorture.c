@@ -644,7 +644,9 @@ __acquires(torture_ww_mutex_2)
 
 	ww_acquire_init(ctx, &torture_ww_class);
 
-	list_for_each_entry(ll, &list, link) {
+	for (ll = list_first_entry(&list, typeof(*ll), link);
+	     !list_entry_is_head(ll, &list, link);
+	     ll = list_next_entry(ll, link)) {
 		int err;
 
 		err = ww_mutex_lock(ll->lock, ctx);
