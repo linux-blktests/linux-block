@@ -190,7 +190,9 @@ static void __i915_schedule(struct i915_sched_node *node,
 	 * end result is a topological list of requests in reverse order, the
 	 * last element in the list is the request we must execute first.
 	 */
-	list_for_each_entry(dep, &dfs, dfs_link) {
+	for (dep = list_first_entry(&dfs, typeof(*dep), dfs_link);
+	     !list_entry_is_head(dep, &dfs, dfs_link);
+	     dep = list_next_entry(dep, dfs_link)) {
 		struct i915_sched_node *node = dep->signaler;
 
 		/* If we are already flying, we know we have no signalers */
