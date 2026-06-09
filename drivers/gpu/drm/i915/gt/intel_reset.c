@@ -1077,7 +1077,9 @@ static bool __intel_gt_unset_wedged(struct intel_gt *gt)
 	 * No more can be submitted until we reset the wedged bit.
 	 */
 	spin_lock(&timelines->lock);
-	list_for_each_entry(tl, &timelines->active_list, link) {
+	for (tl = list_first_entry(&timelines->active_list, typeof(*tl), link);
+	     !list_entry_is_head(tl, &timelines->active_list, link);
+	     tl = list_next_entry(tl, link)) {
 		struct dma_fence *fence;
 
 		fence = i915_active_fence_get(&tl->last_request);
