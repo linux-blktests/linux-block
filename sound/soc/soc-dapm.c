@@ -255,7 +255,9 @@ static __always_inline void dapm_widget_invalidate_paths(
 	list_add_tail(&w->work_list, &list);
 	w->endpoints[dir] = -1;
 
-	list_for_each_entry(w, &list, work_list) {
+	for (w = list_first_entry(&list, typeof(*w), work_list);
+	     !list_entry_is_head(w, &list, work_list);
+	     w = list_next_entry(w, work_list)) {
 		snd_soc_dapm_widget_for_each_path(w, dir, p) {
 			if (p->is_supply || !p->connect)
 				continue;
