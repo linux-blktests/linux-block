@@ -868,7 +868,8 @@ void drm_atomic_bridge_chain_post_disable(struct drm_bridge *bridge,
 
 	encoder = bridge->encoder;
 
-	list_for_each_entry_from(bridge, &encoder->bridge_chain, chain_node) {
+	for (; !list_entry_is_head(bridge, &encoder->bridge_chain, chain_node);
+	     bridge = list_next_entry(bridge, chain_node)) {
 		limit = NULL;
 
 		if (!list_is_last(&bridge->chain_node, &encoder->bridge_chain)) {
@@ -962,7 +963,9 @@ void drm_atomic_bridge_chain_pre_enable(struct drm_bridge *bridge,
 
 	encoder = bridge->encoder;
 
-	list_for_each_entry_reverse(iter, &encoder->bridge_chain, chain_node) {
+	for (iter = list_last_entry(&encoder->bridge_chain, typeof(*iter), chain_node);
+	     !list_entry_is_head(iter, &encoder->bridge_chain, chain_node);
+	     iter = list_prev_entry(iter, chain_node)) {
 		if (iter->pre_enable_prev_first) {
 			next = iter;
 			limit = bridge;
