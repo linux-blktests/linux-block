@@ -809,6 +809,29 @@ static inline size_t list_count_nodes(struct list_head *head)
 #define list_entry_is_head(pos, head, member)				\
 	list_is_head(&pos->member, (head))
 
+#define __list_for_each_entry(pos, next, head, member)			\
+	for (typeof(pos) next = list_next_entry(pos =			\
+		list_first_entry(head, typeof(*pos), member), member);	\
+	     !list_entry_is_head(pos, head, member);			\
+	     pos = next, next = list_next_entry(next, member))
+
+#define __list_for_each_entry_reverse(pos, prev, head, member)		\
+	for (typeof(pos) prev = list_prev_entry(pos =			\
+		list_last_entry(head, typeof(*pos), member), member);	\
+	     !list_entry_is_head(pos, head, member);			\
+	     pos = prev, prev = list_prev_entry(prev, member))
+
+#define __list_for_each_entry_continue(pos, next, head, member)		\
+	for (typeof(pos) next = list_next_entry(pos =			\
+		list_next_entry(pos, member), member);			\
+	     !list_entry_is_head(pos, head, member);			\
+	     pos = next, next = list_next_entry(next, member))
+
+#define __list_for_each_entry_from(pos, next, head, member)		\
+	for (typeof(pos) next = list_next_entry(pos, member);		\
+	     !list_entry_is_head(pos, head, member);			\
+	     pos = next, next = list_next_entry(next, member))
+
 /**
  * list_for_each_entry	-	iterate over list of given type
  * @pos:	the type * to use as a loop cursor.
@@ -816,9 +839,7 @@ static inline size_t list_count_nodes(struct list_head *head)
  * @member:	the name of the list_head within the struct.
  */
 #define list_for_each_entry(pos, head, member)				\
-	for (pos = list_first_entry(head, typeof(*pos), member);	\
-	     !list_entry_is_head(pos, head, member);			\
-	     pos = list_next_entry(pos, member))
+	__list_for_each_entry(pos, __UNIQUE_ID(next), head, member)
 
 /**
  * list_for_each_entry_reverse - iterate backwards over list of given type.
@@ -827,9 +848,7 @@ static inline size_t list_count_nodes(struct list_head *head)
  * @member:	the name of the list_head within the struct.
  */
 #define list_for_each_entry_reverse(pos, head, member)			\
-	for (pos = list_last_entry(head, typeof(*pos), member);		\
-	     !list_entry_is_head(pos, head, member); 			\
-	     pos = list_prev_entry(pos, member))
+	__list_for_each_entry_reverse(pos, __UNIQUE_ID(prev), head, member)
 
 /**
  * list_prepare_entry - prepare a pos entry for use in list_for_each_entry_continue()
@@ -852,9 +871,7 @@ static inline size_t list_count_nodes(struct list_head *head)
  * the current position.
  */
 #define list_for_each_entry_continue(pos, head, member) 		\
-	for (pos = list_next_entry(pos, member);			\
-	     !list_entry_is_head(pos, head, member);			\
-	     pos = list_next_entry(pos, member))
+	__list_for_each_entry_continue(pos, __UNIQUE_ID(next), head, member)
 
 /**
  * list_for_each_entry_continue_reverse - iterate backwards from the given point
@@ -879,8 +896,7 @@ static inline size_t list_count_nodes(struct list_head *head)
  * Iterate over list of given type, continuing from current position.
  */
 #define list_for_each_entry_from(pos, head, member) 			\
-	for (; !list_entry_is_head(pos, head, member);			\
-	     pos = list_next_entry(pos, member))
+	__list_for_each_entry_from(pos, __UNIQUE_ID(next), head, member)
 
 /**
  * list_for_each_entry_from_reverse - iterate backwards over list of given type
@@ -901,6 +917,8 @@ static inline size_t list_count_nodes(struct list_head *head)
  * @n:		another type * to use as temporary storage
  * @head:	the head for your list.
  * @member:	the name of the list_head within the struct.
+ *
+ * Prefer list_for_each_entry() unless the temporary cursor is needed.
  */
 #define list_for_each_entry_safe(pos, n, head, member)			\
 	for (pos = list_first_entry(head, typeof(*pos), member),	\
@@ -917,6 +935,8 @@ static inline size_t list_count_nodes(struct list_head *head)
  *
  * Iterate over list of given type, continuing after current point,
  * safe against removal of list entry.
+ *
+ * Prefer list_for_each_entry_continue() unless the temporary cursor is needed.
  */
 #define list_for_each_entry_safe_continue(pos, n, head, member) 		\
 	for (pos = list_next_entry(pos, member), 				\
@@ -933,6 +953,8 @@ static inline size_t list_count_nodes(struct list_head *head)
  *
  * Iterate over list of given type from current point, safe against
  * removal of list entry.
+ *
+ * Prefer list_for_each_entry_from() unless the temporary cursor is needed.
  */
 #define list_for_each_entry_safe_from(pos, n, head, member) 			\
 	for (n = list_next_entry(pos, member);					\
@@ -948,6 +970,8 @@ static inline size_t list_count_nodes(struct list_head *head)
  *
  * Iterate backwards over list of given type, safe against removal
  * of list entry.
+ *
+ * Prefer list_for_each_entry_reverse() unless the temporary cursor is needed.
  */
 #define list_for_each_entry_safe_reverse(pos, n, head, member)		\
 	for (pos = list_last_entry(head, typeof(*pos), member),		\
