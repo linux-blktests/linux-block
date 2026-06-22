@@ -54,6 +54,7 @@ struct loop_device {
 
 	struct file	*lo_backing_file;
 	unsigned int	lo_min_dio_size;
+	unsigned int	lo_dio_mem_align;
 	struct block_device *lo_device;
 
 	gfp_t		old_gfp_mask;
@@ -447,26 +448,37 @@ static void loop_reread_partitions(struct loop_device *lo)
 			__func__, lo->lo_number, lo->lo_file_name, rc);
 }
 
-static unsigned int loop_query_min_dio_size(struct loop_device *lo)
+static void loop_update_dio_alignment(struct loop_device *lo)
 {
 	struct file *file = lo->lo_backing_file;
 	struct block_device *sb_bdev = file->f_mapping->host->i_sb->s_bdev;
 	struct kstat st;
 
 	/*
-	 * Use the minimal dio alignment of the file system if provided.
+	 * Use the dio alignment of the file system if provided.  dio_offset_align
+	 * is the minimum dio size and offset; dio_mem_align is the buffer memory
+	 * alignment, kept as a mask to become the loop device's dma_alignment in
+	 * direct I/O mode where the buffer is handed to the backing file unchanged.
 	 */
 	if (!vfs_getattr(&file->f_path, &st, STATX_DIOALIGN, 0) &&
-	    (st.result_mask & STATX_DIOALIGN))
-		return st.dio_offset_align;
+	    (st.result_mask & STATX_DIOALIGN)) {
+		lo->lo_min_dio_size = st.dio_offset_align;
+		lo->lo_dio_mem_align = st.dio_mem_align - 1;
+		return;
+	}
 
 	/*
 	 * In a perfect world this wouldn't be needed, but as of Linux 6.13 only
 	 * a handful of file systems support the STATX_DIOALIGN flag.
 	 */
-	if (sb_bdev)
-		return bdev_logical_block_size(sb_bdev);
-	return SECTOR_SIZE;
+	if (sb_bdev) {
+		lo->lo_min_dio_size = bdev_logical_block_size(sb_bdev);
+		lo->lo_dio_mem_align = bdev_dma_alignment(sb_bdev);
+		return;
+	}
+
+	lo->lo_min_dio_size = SECTOR_SIZE;
+	lo->lo_dio_mem_align = SECTOR_SIZE - 1;
 }
 
 static inline int is_loop_device(struct file *file)
@@ -509,7 +521,7 @@ static void loop_assign_backing_file(struct loop_device *lo, struct file *file)
 			lo->old_gfp_mask & ~(__GFP_IO | __GFP_FS));
 	if (lo->lo_backing_file->f_flags & O_DIRECT)
 		lo->lo_flags |= LO_FLAGS_DIRECT_IO;
-	lo->lo_min_dio_size = loop_query_min_dio_size(lo);
+	loop_update_dio_alignment(lo);
 }
 
 static int loop_check_backing_file(struct file *file)
@@ -961,6 +973,17 @@ static void loop_update_limits(struct loop_device *lo, struct queue_limits *lim,
 	lim->logical_block_size = bsize;
 	lim->physical_block_size = bsize;
 	lim->io_min = bsize;
+	/*
+	 * In direct I/O the user pages are handed to the backing file as-is, so
+	 * the backing's DMA alignment requirement applies to them.  Advertise it
+	 * so misaligned I/O is rejected at this device's entry instead of being
+	 * dispatched to the backend.  Buffered I/O copies through the page cache
+	 * and imposes no such requirement.
+	 */
+	if (lo->lo_flags & LO_FLAGS_DIRECT_IO)
+		lim->dma_alignment = lo->lo_dio_mem_align;
+	else
+		lim->dma_alignment = SECTOR_SIZE - 1;
 	lim->features &= ~(BLK_FEAT_WRITE_CACHE | BLK_FEAT_ROTATIONAL);
 	if (file->f_op->fsync && !(lo->lo_flags & LO_FLAGS_READ_ONLY))
 		lim->features |= BLK_FEAT_WRITE_CACHE;
@@ -1416,6 +1439,7 @@ static int loop_set_dio(struct loop_device *lo, unsigned long arg)
 {
 	bool use_dio = !!arg;
 	unsigned int memflags;
+	struct queue_limits lim;
 
 	if (lo->lo_state != Lo_bound)
 		return -ENXIO;
@@ -1434,6 +1458,16 @@ static int loop_set_dio(struct loop_device *lo, unsigned long arg)
 		lo->lo_flags |= LO_FLAGS_DIRECT_IO;
 	else
 		lo->lo_flags &= ~LO_FLAGS_DIRECT_IO;
+	/*
+	 * Direct I/O forwards the user pages to the backing file unchanged, so
+	 * track the backing's DMA alignment requirement as the mode is toggled.
+	 */
+	lim = queue_limits_start_update(lo->lo_queue);
+	if (lo->lo_flags & LO_FLAGS_DIRECT_IO)
+		lim.dma_alignment = lo->lo_dio_mem_align;
+	else
+		lim.dma_alignment = SECTOR_SIZE - 1;
+	queue_limits_commit_update(lo->lo_queue, &lim);
 	blk_mq_unfreeze_queue(lo->lo_queue, memflags);
 	return 0;
 }
