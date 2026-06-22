@@ -144,6 +144,7 @@ struct zloop_device {
 	unsigned int		nr_conv_zones;
 	unsigned int		max_open_zones;
 	unsigned int		block_size;
+	unsigned int		dio_mem_align;
 
 	spinlock_t		open_zones_lock;
 	struct list_head	open_zones_lru_list;
@@ -1035,6 +1036,9 @@ static int zloop_get_block_size(struct zloop_device *zlo,
 {
 	struct block_device *sb_bdev = zone->file->f_mapping->host->i_sb->s_bdev;
 	struct kstat st;
+	bool have_dioalign = !vfs_getattr(&zone->file->f_path, &st,
+					  STATX_DIOALIGN, 0) &&
+			     (st.result_mask & STATX_DIOALIGN);
 
 	/*
 	 * If the FS block size is lower than or equal to 4K, use that as the
@@ -1044,13 +1048,24 @@ static int zloop_get_block_size(struct zloop_device *zlo,
 	 */
 	if (file_inode(zone->file)->i_sb->s_blocksize <= SZ_4K)
 		zlo->block_size = file_inode(zone->file)->i_sb->s_blocksize;
-	else if (!vfs_getattr(&zone->file->f_path, &st, STATX_DIOALIGN, 0) &&
-		 (st.result_mask & STATX_DIOALIGN))
+	else if (have_dioalign)
 		zlo->block_size = st.dio_offset_align;
 	else if (sb_bdev)
 		zlo->block_size = bdev_physical_block_size(sb_bdev);
 	else
 		zlo->block_size = SECTOR_SIZE;
+
+	/*
+	 * In direct I/O the request's pages are handed to the backing files
+	 * unchanged, so track their required memory alignment as a mask for
+	 * dma_alignment.
+	 */
+	if (have_dioalign)
+		zlo->dio_mem_align = st.dio_mem_align - 1;
+	else if (sb_bdev)
+		zlo->dio_mem_align = bdev_dma_alignment(sb_bdev);
+	else
+		zlo->dio_mem_align = SECTOR_SIZE - 1;
 
 	if (zlo->zone_capacity & ((zlo->block_size >> SECTOR_SHIFT) - 1)) {
 		pr_err("Zone capacity is not aligned to block size %u\n",
@@ -1279,6 +1294,9 @@ static int zloop_ctl_add(struct zloop_options *opts)
 
 	lim.physical_block_size = zlo->block_size;
 	lim.logical_block_size = zlo->block_size;
+	/* Direct I/O hands the request's pages to the backing files unchanged. */
+	if (!opts->buffered_io)
+		lim.dma_alignment = zlo->dio_mem_align;
 	if (zlo->zone_append)
 		lim.max_hw_zone_append_sectors = lim.max_hw_sectors;
 	lim.max_open_zones = zlo->max_open_zones;
