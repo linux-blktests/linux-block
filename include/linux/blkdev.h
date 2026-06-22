@@ -1047,6 +1047,11 @@ extern const char *blk_op_str(enum req_op op);
 int blk_status_to_errno(blk_status_t status);
 blk_status_t errno_to_blk_status(int errno);
 
+static inline void bio_endio_errno(struct bio *bio, int errno)
+{
+	bio_endio_status(bio, errno_to_blk_status(errno));
+}
+
 /* only poll the hardware once, don't continue until a completion was found */
 #define BLK_POLL_ONESHOT		(1 << 0)
 int bio_poll(struct bio *bio, struct io_comp_batch *iob, unsigned int flags);
