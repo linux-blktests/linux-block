@@ -111,12 +111,23 @@ static struct cgroup_subsys_state *blkcg_css(void)
 	return task_css(current, io_cgrp_id);
 }
 
+static void blkg_free_pd(struct blkcg_gq *blkg)
+{
+	int i;
+
+	for (i = 0; i < BLKCG_MAX_POLS; i++) {
+		if (blkg->pd[i]) {
+			blkcg_policy[i]->pd_free_fn(blkg->pd[i]);
+			blkg->pd[i] = NULL;
+		}
+	}
+}
+
 static void blkg_free_workfn(struct work_struct *work)
 {
 	struct blkcg_gq *blkg = container_of(work, struct blkcg_gq,
 					     free_work);
 	struct request_queue *q = blkg->q;
-	int i;
 
 	/*
 	 * pd_free_fn() can also be called from blkcg_deactivate_policy(),
@@ -126,9 +137,7 @@ static void blkg_free_workfn(struct work_struct *work)
 	 * blkcg_deactivate_policy().
 	 */
 	mutex_lock(&q->blkcg_mutex);
-	for (i = 0; i < BLKCG_MAX_POLS; i++)
-		if (blkg->pd[i])
-			blkcg_policy[i]->pd_free_fn(blkg->pd[i]);
+	blkg_free_pd(blkg);
 	if (blkg->parent)
 		blkg_put(blkg->parent);
 	spin_lock_irq(&q->queue_lock);
@@ -441,13 +450,22 @@ static struct blkcg_gq *blkg_create(struct blkcg *blkcg, struct gendisk *disk,
 	if (!ret)
 		return blkg;
 
-	/* @blkg failed fully initialized, use the usual release path */
+	/*
+	 * @blkg failed fully initialized and never linked, so its pd[] is
+	 * invisible to blkcg_deactivate_policy(). Free pd[] synchronously
+	 * while blkcg_policy[] is still valid, otherwise the async free path
+	 * may call pd_free_fn() after the policy is unregistered (e.g. rmmod bfq).
+	 * The err_free_blkg path below frees pd[] for the same reason.
+	 */
+	blkg_free_pd(blkg);
 	percpu_ref_kill(&blkg->refcnt);
 	return ERR_PTR(ret);
 
 err_free_blkg:
-	if (new_blkg)
+	if (new_blkg) {
+		blkg_free_pd(new_blkg);
 		blkg_free(new_blkg);
+	}
 	return ERR_PTR(ret);
 }
 
