@@ -1000,6 +1000,7 @@ void __bio_add_page(struct bio *bio, struct page *page,
 {
 	WARN_ON_ONCE(bio_flagged(bio, BIO_CLONED));
 	WARN_ON_ONCE(bio_full(bio, len));
+	WARN_ON_ONCE(off + len < off);	/* does the sum overflow? */
 
 	if (is_pci_p2pdma_page(page))
 		bio->bi_opf |= REQ_NOMERGE;
@@ -1044,6 +1045,9 @@ int bio_add_page(struct bio *bio, struct page *page,
 	if (WARN_ON_ONCE(len == 0))
 		return 0;
 	if (bio->bi_iter.bi_size > BIO_MAX_SIZE - len)
+		return 0;
+	/* Are offset and len sane, i.e. their sum doesn't overflow? */
+	if (offset + len < offset)
 		return 0;
 
 	if (bio->bi_vcnt > 0) {
