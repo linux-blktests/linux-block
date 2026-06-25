@@ -1281,6 +1281,11 @@ _drbd_set_state(struct drbd_device *device, union drbd_state ns,
 	if (rv < SS_SUCCESS)
 		return rv;
 
+	if (!connection) {
+		drbd_err(device, "No connection to peer, aborting!\n");
+		return SS_ALREADY_STANDALONE;
+	}
+
 	if (!(flags & CS_HARD)) {
 		/*  pre-state-change checks ; only look at ns  */
 		/* See drbd_state_sw_errors in drbd_strings.c */
