@@ -238,8 +238,11 @@ static ssize_t __blkdev_direct_IO(struct kiocb *iocb, struct iov_iter *iter,
 		}
 		if (iocb->ki_flags & IOCB_HAS_METADATA) {
 			ret = bio_integrity_map_iter(bio, iocb->private);
-			if (unlikely(ret))
-				goto fail;
+			if (unlikely(ret)) {
+				bio->bi_status = errno_to_blk_status(ret);
+				bio_endio(bio);
+				break;
+			}
 		}
 
 		if (is_read) {
