@@ -916,8 +916,7 @@ static void nvme_set_app_tag(struct request *req, struct nvme_command *cmnd)
 static void nvme_set_ref_tag(struct nvme_ns *ns, struct nvme_command *cmnd,
 			      struct request *req)
 {
-	u32 upper, lower;
-	u64 ref48;
+	u64 ref_tag;
 
 	/* only type1 and type 2 PI formats have a reftag */
 	switch (ns->head->pi_type) {
@@ -928,18 +927,19 @@ static void nvme_set_ref_tag(struct nvme_ns *ns, struct nvme_command *cmnd,
 		return;
 	}
 
+	ref_tag = full_pi_ref_tag(req);
+	if (blk_integrity_rq(req))
+		ref_tag = bio_integrity(req->bio)->bip_iter.bi_sector;
+
 	/* both rw and write zeroes share the same reftag format */
 	switch (ns->head->guard_type) {
 	case NVME_NVM_NS_16B_GUARD:
-		cmnd->rw.reftag = cpu_to_le32(t10_pi_ref_tag(req));
+		cmnd->rw.reftag = cpu_to_le32(lower_32_bits(ref_tag));
 		break;
 	case NVME_NVM_NS_64B_GUARD:
-		ref48 = ext_pi_ref_tag(req);
-		lower = lower_32_bits(ref48);
-		upper = upper_32_bits(ref48);
-
-		cmnd->rw.reftag = cpu_to_le32(lower);
-		cmnd->rw.cdw3 = cpu_to_le32(upper);
+		ref_tag = lower_48_bits(ref_tag);
+		cmnd->rw.reftag = cpu_to_le32(lower_32_bits(ref_tag));
+		cmnd->rw.cdw3 = cpu_to_le32(upper_32_bits(ref_tag));
 		break;
 	default:
 		break;
@@ -1891,7 +1891,7 @@ static bool nvme_init_integrity(struct nvme_ns_head *head,
 		break;
 	}
 
-	bi->flags |= BLK_SPLIT_INTERVAL_CAPABLE;
+	bi->flags |= BLK_SPLIT_INTERVAL_CAPABLE | BLK_EXPECTED_REF_TAG_CAPABLE;
 	bi->metadata_size = head->ms;
 	if (bi->csum_type) {
 		bi->pi_tuple_size = head->pi_size;

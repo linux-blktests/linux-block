@@ -68,9 +68,4 @@ static inline u64 lower_48_bits(u64 n)
 	return n & ((1ull << 48) - 1);
 }
 
-static inline u64 ext_pi_ref_tag(struct request *rq)
-{
-	return lower_48_bits(full_pi_ref_tag(rq));
-}
-
 #endif
