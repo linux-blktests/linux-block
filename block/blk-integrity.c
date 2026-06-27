@@ -141,6 +141,8 @@ bool blk_integrity_merge_rq(struct request_queue *q, struct request *req,
 			    struct request *next)
 {
 	struct bio_integrity_payload *bip, *bip_next;
+	struct blk_integrity *bi;
+	u64 intervals;
 
 	if (blk_integrity_rq(req) == 0 && blk_integrity_rq(next) == 0)
 		return true;
@@ -157,6 +159,13 @@ bool blk_integrity_merge_rq(struct request_queue *q, struct request *req,
 	    bip->app_tag != bip_next->app_tag)
 		return false;
 
+	bi = blk_get_integrity(req->bio->bi_bdev->bd_disk);
+	intervals = blk_rq_bytes(req) >> bi->interval_exp;
+	if (bip->bip_flags & BIP_CHECK_REFTAG &&
+	    bi->flags & BLK_EXPECTED_REF_TAG_CAPABLE &&
+	    bip->bip_iter.bi_sector + intervals != bip_next->bip_iter.bi_sector)
+		return false;
+
 	if (req->nr_integrity_segments + next->nr_integrity_segments >
 	    q->limits.max_integrity_segments)
 		return false;
@@ -171,7 +180,9 @@ bool blk_integrity_merge_bio(struct request_queue *q, struct request *req,
 			     struct bio *bio)
 {
 	struct bio_integrity_payload *bip, *bip_bio = bio_integrity(bio);
+	struct blk_integrity *bi;
 	int nr_integrity_segs;
+	u64 intervals;
 
 	if (blk_integrity_rq(req) == 0 && bip_bio == NULL)
 		return true;
@@ -185,6 +196,13 @@ bool blk_integrity_merge_bio(struct request_queue *q, struct request *req,
 
 	if (bip->bip_flags & BIP_CHECK_APPTAG &&
 	    bip->app_tag != bip_bio->app_tag)
+		return false;
+
+	bi = blk_get_integrity(req->bio->bi_bdev->bd_disk);
+	intervals = blk_rq_bytes(req) >> bi->interval_exp;
+	if (bip->bip_flags & BIP_CHECK_REFTAG &&
+	    bi->flags & BLK_EXPECTED_REF_TAG_CAPABLE &&
+	    bip->bip_iter.bi_sector + intervals != bip_bio->bip_iter.bi_sector)
 		return false;
 
 	nr_integrity_segs = blk_rq_count_integrity_sg(q, bio);

@@ -546,7 +546,8 @@ static void blk_integrity_remap(struct request *rq, unsigned int nr_bytes,
 	unsigned intervals = nr_bytes >> bi->interval_exp;
 	struct bio *bio;
 
-	if (!(bi->flags & BLK_INTEGRITY_REF_TAG))
+	if (!(bi->flags & BLK_INTEGRITY_REF_TAG) ||
+	    bi->flags & BLK_EXPECTED_REF_TAG_CAPABLE)
 		return;
 
 	__rq_for_each_bio(bio, rq) {

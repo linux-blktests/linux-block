@@ -15,6 +15,8 @@ enum blk_integrity_flags {
 	BLK_INTEGRITY_REF_TAG		= 1 << 3,
 	BLK_INTEGRITY_STACKED		= 1 << 4,
 	BLK_SPLIT_INTERVAL_CAPABLE	= 1 << 5,
+	/* Device I/O specifies expected initial ref tag independent of LBA */
+	BLK_EXPECTED_REF_TAG_CAPABLE	= 1 << 6,
 };
 
 const char *blk_integrity_profile_name(struct blk_integrity *bi);
