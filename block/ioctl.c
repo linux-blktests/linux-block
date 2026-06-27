@@ -856,12 +856,17 @@ long compat_blkdev_ioctl(struct file *file, unsigned cmd, unsigned long arg)
 }
 #endif
 
+/*
+ * Per-command block io_uring PDU stored in io_uring_cmd.pdu[32].
+ * Holds discard state between submission, completion and task work.
+ */
 struct blk_iou_cmd {
 	u64 start;
 	u64 len;
 	int res;
 	bool nowait;
 };
+static_assert(sizeof(struct blk_iou_cmd) <= sizeof_field(struct io_uring_cmd, pdu));
 
 static void blk_cmd_complete(struct io_tw_req tw_req, io_tw_token_t tw)
 {
