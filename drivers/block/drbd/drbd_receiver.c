@@ -24,6 +24,7 @@
 #include <linux/memcontrol.h>
 #include <linux/mm_inline.h>
 #include <linux/slab.h>
+#include <linux/limits.h>
 #include <uapi/linux/sched/types.h>
 #include <linux/sched/signal.h>
 #include <linux/pkt_sched.h>
@@ -1946,6 +1947,9 @@ static int receive_DataReply(struct drbd_connection *connection, struct packet_i
 	spin_unlock_irq(&device->resource->req_lock);
 	if (unlikely(!req))
 		return -EIO;
+
+	if (pi->size > INT_MAX)
+		return -EINVAL;
 
 	err = recv_dless_read(peer_device, req, sector, pi->size);
 	if (!err)
