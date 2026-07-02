@@ -326,6 +326,10 @@ void io_uring_cmd_issue_blocking(struct io_uring_cmd *ioucmd)
 {
 	struct io_kiocb *req = cmd_to_io_kiocb(ioucmd);
 
+	if (!(req->flags & REQ_F_SQE_COPIED)) {
+		io_uring_cmd_sqe_copy(req);
+		req->flags |= REQ_F_SQE_COPIED;
+	}
 	io_req_queue_iowq(req);
 }
 
