@@ -2161,12 +2161,11 @@ static int __init null_init(void)
 
 	config_group_init(&nullb_subsys.su_group);
 	mutex_init(&nullb_subsys.su_mutex);
+	mutex_init(&lock);
 
 	ret = configfs_register_subsystem(&nullb_subsys);
 	if (ret)
 		return ret;
-
-	mutex_init(&lock);
 
 	null_major = register_blkdev(0, "nullb");
 	if (null_major < 0) {
