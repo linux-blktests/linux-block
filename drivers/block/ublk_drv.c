@@ -1494,8 +1494,6 @@ static unsigned int ublk_unmap_io(bool need_map,
 		struct iov_iter iter;
 		const int dir = ITER_SOURCE;
 
-		WARN_ON_ONCE(io->res > rq_bytes);
-
 		import_ubuf(dir, u64_to_user_ptr(io->buf.addr), io->res, &iter);
 		return ublk_copy_user_pages(req, 0, &iter, dir);
 	}
