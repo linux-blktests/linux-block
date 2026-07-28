@@ -1787,6 +1787,25 @@ static ssize_t algorithm_params_store(struct device *dev,
 			return -EINVAL;
 	}
 
+	if (zram->comp_algs[prio]) {
+		unsigned int caps = zcomp_get_caps(zram->comp_algs[prio]);
+
+		if (dict_path && !(caps & ZCOMP_CAP_DICT)) {
+			pr_err("zram: %s does not support dictionary\n",
+			       zram->comp_algs[prio]);
+			return -EOPNOTSUPP;
+		}
+
+		if (level != ZCOMP_PARAM_NOT_SET) {
+			ret = zcomp_validate_level(zram->comp_algs[prio], level);
+			if (ret) {
+				pr_err("zram: invalid level for %s\n",
+				       zram->comp_algs[prio]);
+				return ret;
+			}
+		}
+	}
+
 	ret = comp_params_store(zram, prio, level, dict_path, &deflate_params);
 	return ret ? ret : len;
 }
