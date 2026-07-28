@@ -331,6 +331,27 @@ static void nbd_mark_nsock_dead(struct nbd_device *nbd, struct nbd_sock *nsock,
 	nsock->sent = 0;
 }
 
+static void nbd_size_update(struct nbd_device *nbd)
+{
+	struct nbd_config *config = nbd->config;
+
+	if (max_part)
+		set_bit(GD_NEED_PART_SCAN, &nbd->disk->state);
+	if (!set_capacity_and_notify(nbd->disk, config->bytesize >> 9))
+		kobject_uevent(&nbd_to_dev(nbd)->kobj, KOBJ_CHANGE);
+}
+
+static int nbd_size_set(struct nbd_device *nbd, loff_t bytesize)
+{
+	if (bytesize < 0)
+		return -EINVAL;
+
+	nbd->config->bytesize = bytesize;
+	if (nbd->pid)
+		nbd_size_update(nbd);
+	return 0;
+}
+
 static int nbd_set_size(struct nbd_device *nbd, loff_t bytesize, loff_t blksize)
 {
 	struct queue_limits lim;
@@ -375,10 +396,7 @@ static int nbd_set_size(struct nbd_device *nbd, loff_t bytesize, loff_t blksize)
 	if (error)
 		return error;
 
-	if (max_part)
-		set_bit(GD_NEED_PART_SCAN, &nbd->disk->state);
-	if (!set_capacity_and_notify(nbd->disk, bytesize >> 9))
-		kobject_uevent(&nbd_to_dev(nbd)->kobj, KOBJ_CHANGE);
+	nbd_size_update(nbd);
 	return 0;
 }
 
@@ -2099,11 +2117,19 @@ static int nbd_genl_size_set(struct genl_info *info, struct nbd_device *nbd)
 	if (info->attrs[NBD_ATTR_SIZE_BYTES])
 		bytes = nla_get_u64(info->attrs[NBD_ATTR_SIZE_BYTES]);
 
-	if (info->attrs[NBD_ATTR_BLOCK_SIZE_BYTES])
+	if (info->attrs[NBD_ATTR_BLOCK_SIZE_BYTES]) {
 		bsize = nla_get_u64(info->attrs[NBD_ATTR_BLOCK_SIZE_BYTES]);
+		if (!bsize)
+			bsize = 1u << NBD_DEF_BLKSIZE_BITS;
+		if (blk_validate_block_size(bsize))
+			return -EINVAL;
+	}
 
-	if (bytes != config->bytesize || bsize != nbd_blksize(config))
-		return nbd_set_size(nbd, bytes, bsize);
+	if (bytes != config->bytesize || bsize != nbd_blksize(config)) {
+		if (bsize != nbd_blksize(config))
+			return nbd_set_size(nbd, bytes, bsize);
+		return nbd_size_set(nbd, bytes);
+	}
 	return 0;
 }
 
