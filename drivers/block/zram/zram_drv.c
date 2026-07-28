@@ -1690,21 +1690,23 @@ static int comp_params_store(struct zram *zram, u32 prio, s32 level,
 			     const char *dict_path,
 			     struct deflate_params *deflate_params)
 {
+	void *new_dict = NULL;
 	ssize_t sz = 0;
 
-	comp_params_reset(zram, prio);
-
 	if (dict_path) {
-		sz = kernel_read_file_from_path(dict_path, 0,
-						&zram->params[prio].dict,
-						INT_MAX,
-						NULL,
-						READING_POLICY);
-		if (sz < 0)
-			return -EINVAL;
+		sz = kernel_read_file_from_path(dict_path, 0, &new_dict,
+						INT_MAX, NULL, READING_POLICY);
+		if (sz <= 0) {
+			vfree(new_dict);
+			if (sz == 0)
+				return -EINVAL;
+			return sz;
+		}
 	}
 
+	comp_params_reset(zram, prio);
 	zram->params[prio].dict_sz = sz;
+	zram->params[prio].dict = new_dict;
 	zram->params[prio].level = level;
 	zram->params[prio].deflate.winbits = deflate_params->winbits;
 	return 0;
