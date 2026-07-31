@@ -92,7 +92,8 @@ static inline int bio_queue_enter(struct bio *bio)
 	struct request_queue *q = bdev_get_queue(bio->bi_bdev);
 
 	if (blk_try_enter_queue(q, false)) {
-		rwsem_acquire_read(&q->io_lockdep_map, 0, 0, _RET_IP_);
+		rwsem_acquire_read(&q->io_lockdep_map, 0,
+				   !!(bio->bi_opf & REQ_NOWAIT), _RET_IP_);
 		rwsem_release(&q->io_lockdep_map, _RET_IP_);
 		return 0;
 	}
