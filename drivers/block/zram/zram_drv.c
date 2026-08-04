@@ -2893,6 +2893,9 @@ static ssize_t disksize_store(struct device *dev, struct device_attribute *attr,
 		return -EBUSY;
 	}
 
+	if (disksize > (u64)U32_MAX << PAGE_SHIFT)
+		return -EINVAL;
+
 	disksize = PAGE_ALIGN(disksize);
 	num_pages = disksize >> PAGE_SHIFT;
 	/* Slots are addressed by an unsigned long index */
