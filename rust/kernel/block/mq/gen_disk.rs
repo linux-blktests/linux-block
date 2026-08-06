@@ -15,7 +15,33 @@ use crate::{
     str::NullTerminatedFormatter,
     sync::Arc,
     types::{ForeignOwnable, ScopeGuard},
+    ModuleMetadata,
 };
+
+struct BlockFops<M: ModuleMetadata>(core::marker::PhantomData<M>);
+
+impl<M: ModuleMetadata> BlockFops<M> {
+    const TABLE: bindings::block_device_operations = bindings::block_device_operations {
+        submit_bio: None,
+        open: None,
+        release: None,
+        ioctl: None,
+        compat_ioctl: None,
+        check_events: None,
+        unlock_native_capacity: None,
+        getgeo: None,
+        set_read_only: None,
+        swap_slot_free_notify: None,
+        report_zones: None,
+        devnode: None,
+        alternative_gpt_sector: None,
+        get_unique_id: None,
+        owner: crate::this_module::<M>().as_ptr(),
+        pr_ops: core::ptr::null_mut(),
+        free_disk: None,
+        poll_bio: None,
+    };
+}
 
 /// A builder for [`GenDisk`].
 ///
@@ -95,7 +121,7 @@ impl GenDiskBuilder {
     }
 
     /// Build a new `GenDisk` and add it to the VFS.
-    pub fn build<T: Operations>(
+    pub fn build<M: ModuleMetadata, T: Operations>(
         self,
         name: fmt::Arguments<'_>,
         tagset: Arc<TagSet<T>>,
@@ -125,30 +151,8 @@ impl GenDiskBuilder {
             )
         })?;
 
-        const TABLE: bindings::block_device_operations = bindings::block_device_operations {
-            submit_bio: None,
-            open: None,
-            release: None,
-            ioctl: None,
-            compat_ioctl: None,
-            check_events: None,
-            unlock_native_capacity: None,
-            getgeo: None,
-            set_read_only: None,
-            swap_slot_free_notify: None,
-            report_zones: None,
-            devnode: None,
-            alternative_gpt_sector: None,
-            get_unique_id: None,
-            // TODO: Set to `THIS_MODULE`.
-            owner: core::ptr::null_mut(),
-            pr_ops: core::ptr::null_mut(),
-            free_disk: None,
-            poll_bio: None,
-        };
-
-        // SAFETY: `gendisk` is a valid pointer as we initialized it above
-        unsafe { (*gendisk).fops = &TABLE };
+        // SAFETY: `gendisk` is a valid pointer as we initialized it above.
+        unsafe { (*gendisk).fops = &BlockFops::<M>::TABLE };
 
         let cleanup_failure = ScopeGuard::new_with_data((gendisk, data), |(gendisk, data)| {
             // SAFETY: `gendisk` came from `__blk_mq_alloc_disk()` above and
@@ -159,8 +163,6 @@ impl GenDiskBuilder {
             drop(unsafe { T::QueueData::from_foreign(data) });
         });
 
-        // The failure guard now owns both pieces of cleanup; the early guard
-        // must not run on this path anymore.
         recover_data.dismiss();
 
         let mut writer = NullTerminatedFormatter::new(

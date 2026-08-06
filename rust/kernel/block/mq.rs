@@ -8,8 +8,8 @@
 //! - Implement [`Operations`] for a type `T`.
 //! - Create a [`TagSet<T>`].
 //! - Create a [`GenDisk<T>`], via the [`GenDiskBuilder`].
-//! - Add the disk to the system by calling [`GenDiskBuilder::build`] passing in
-//!   the `TagSet` reference.
+//! - Add the disk to the system by calling [`GenDiskBuilder::build`], passing in
+//!   the module type, the disk name, the `TagSet`, and queue data.
 //!
 //! The types available in this module that have direct C counterparts are:
 //!
@@ -86,9 +86,16 @@
 //!
 //! let tagset: Arc<TagSet<MyBlkDevice>> =
 //!     Arc::pin_init(TagSet::new(1, 256, 1), flags::GFP_KERNEL)?;
+//! # struct MyModule;
+//! # impl kernel::ModuleMetadata for MyModule {
+//! #     const NAME: &'static kernel::str::CStr = c"myblk";
+//! #     // SAFETY: Doctest stub; no module is loaded.
+//! #     const THIS_MODULE: ThisModule =
+//! #         unsafe { ThisModule::from_ptr(core::ptr::null_mut()) };
+//! # }
 //! let mut disk = gen_disk::GenDiskBuilder::new()
 //!     .capacity_sectors(4096)
-//!     .build(fmt!("myblk"), tagset, ())?;
+//!     .build::<MyModule, MyBlkDevice>(fmt!("myblk"), tagset, ())?;
 //!
 //! # Ok::<(), kernel::error::Error>(())
 //! ```
