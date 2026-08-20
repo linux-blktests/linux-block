@@ -515,11 +515,6 @@ static struct file *loop_get_backing_file(struct loop_device *lo)
 {
 	if (lo->lo_state != Lo_bound)
 		return NULL;
-	/*
-	 * Order wrt setting lo->lo_backing_file in
-	 * loop_configure().
-	 */
-	rmb();
 	return get_file(lo->lo_backing_file);
 }
 
@@ -1148,9 +1143,6 @@ static int loop_configure(struct loop_device *lo, blk_mode_t mode,
 
 	size = lo_calculate_size(lo, file);
 	loop_set_size(lo, size);
-
-	/* Order wrt reading lo_state in loop_validate_file(). */
-	wmb();
 
 	WRITE_ONCE(lo->lo_state, Lo_bound);
 	if (part_shift)
