@@ -520,7 +520,7 @@ static struct file *loop_get_backing_file(struct loop_device *lo)
 	 * loop_configure().
 	 */
 	rmb();
-	return lo->lo_backing_file;
+	return get_file(lo->lo_backing_file);
 }
 
 /* Returns 0 if and only if @file is not backed by loop device @bdev. */
@@ -534,21 +534,27 @@ static int loop_validate_file(struct loop_device *lo, struct file *file,
 	if (!S_ISREG(inode->i_mode) && !S_ISBLK(inode->i_mode))
 		return -EINVAL;
 
+	get_file(f);
 	/* Avoid recursion */
 	while (is_loop_device(f)) {
 		struct loop_device *l;
+		struct file *prev_f = f;
 		struct block_device *f_bdev = loop_get_bdev(f);
 
 		lockdep_assert_held(&loop_validate_mutex);
-		if (f_bdev->bd_disk == bdev->bd_disk)
+		if (f_bdev->bd_disk == bdev->bd_disk) {
+			fput(f);
 			return -EBADF;
+		}
 
 		l = f_bdev->bd_disk->private_data;
 		scoped_guard(mutex, &l->lo_mutex)
 			f = loop_get_backing_file(l);
+		fput(prev_f);
 		if (!f)
 			return -EINVAL;
 	}
+	fput(f);
 	return 0;
 }
 
