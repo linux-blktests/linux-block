@@ -506,6 +506,9 @@ static int loop_validate_file(struct file *file, struct block_device *bdev)
 	struct inode	*inode = file->f_mapping->host;
 	struct file	*f = file;
 
+	if (!S_ISREG(inode->i_mode) && !S_ISBLK(inode->i_mode))
+		return -EINVAL;
+
 	/* Avoid recursion */
 	while (is_loop_device(f)) {
 		struct loop_device *l;
@@ -522,8 +525,6 @@ static int loop_validate_file(struct file *file, struct block_device *bdev)
 		rmb();
 		f = l->lo_backing_file;
 	}
-	if (!S_ISREG(inode->i_mode) && !S_ISBLK(inode->i_mode))
-		return -EINVAL;
 	return 0;
 }
 
