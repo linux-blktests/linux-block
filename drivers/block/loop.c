@@ -20,6 +20,7 @@
 #include <linux/suspend.h>
 #include <linux/freezer.h>
 #include <linux/mutex.h>
+#include <linux/lockdep.h>
 #include <linux/writeback.h>
 #include <linux/completion.h>
 #include <linux/highmem.h>
@@ -74,6 +75,7 @@ struct loop_device {
 	struct blk_mq_tag_set	tag_set;
 	struct gendisk		*lo_disk;
 	struct mutex		lo_mutex;
+	struct lock_class_key	lo_mutex_key;
 	bool			idr_visible;
 };
 
@@ -1801,6 +1803,7 @@ static void lo_free_disk(struct gendisk *disk)
 	loop_free_idle_workers(lo, true);
 	timer_shutdown_sync(&lo->timer);
 	mutex_destroy(&lo->lo_mutex);
+	lockdep_unregister_key(&lo->lo_mutex_key);
 	kfree(lo);
 }
 
@@ -2114,7 +2117,8 @@ static int loop_add(int i)
 	 */
 	if (!part_shift)
 		set_bit(GD_SUPPRESS_PART_SCAN, &disk->state);
-	mutex_init(&lo->lo_mutex);
+	lockdep_register_key(&lo->lo_mutex_key);
+	mutex_init_with_key(&lo->lo_mutex, &lo->lo_mutex_key);
 	lo->lo_number		= i;
 	spin_lock_init(&lo->lo_lock);
 	spin_lock_init(&lo->lo_work_lock);
