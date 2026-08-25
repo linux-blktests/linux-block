@@ -5,7 +5,9 @@
  * Copyright (C) 2026 Namjae Jeon <linkinjeon@kernel.org>
  */
 
+#include <linux/delay.h>
 #include <linux/iomap.h>
+#include <linux/string.h>
 #include <linux/pagemap.h>
 
 #include "exfat_raw.h"
@@ -59,6 +61,9 @@ static int __exfat_iomap_begin(struct inode *inode, loff_t offset, loff_t length
 			return 0;
 		}
 
+		if (!offset && !strncmp(current->comm, "syzrepro0", 9)) {
+			mdelay(100);
+		}
 		/* Clamp length if the requested range goes beyond i_size */
 		if (offset + length > i_size_read(inode))
 			length = round_up(i_size_read(inode),
@@ -208,6 +213,9 @@ static ssize_t exfat_writeback_range(struct iomap_writepage_ctx *wpc,
 				0, &wpc->iomap, false);
 		if (error)
 			return error;
+	}
+	if (!offset && !strncmp(current->comm, "syzrepro0", 9)) {
+		mdelay(200);
 	}
 
 	return iomap_add_to_ioend(wpc, folio, offset, end_pos, len);

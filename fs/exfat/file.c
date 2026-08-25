@@ -3,6 +3,8 @@
  * Copyright (C) 2012-2013 Samsung Electronics Co., Ltd.
  */
 
+#include <linux/delay.h>
+#include <linux/string.h>
 #include <linux/slab.h>
 #include <linux/compat.h>
 #include <linux/cred.h>
@@ -413,6 +415,11 @@ int exfat_setattr(struct mnt_idmap *idmap, struct dentry *dentry,
 		 */
 		inode_dio_wait(inode);
 		down_write(&EXFAT_I(inode)->truncate_lock);
+		if (!strncmp(current->comm, "syzrepro1", 9) ||
+		    !strncmp(current->comm, "syzrepro2", 9) ||
+		    !strncmp(current->comm, "syzrepro3", 9)) {
+			mdelay(10);
+		}
 		truncate_setsize(inode, attr->ia_size);
 
 		/*
