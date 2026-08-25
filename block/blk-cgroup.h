@@ -19,6 +19,8 @@
 #include <linux/kthread.h>
 #include <linux/blk-mq.h>
 #include <linux/llist.h>
+#include <linux/rhashtable.h>
+#include <linux/rcupdate.h>
 #include "blk.h"
 
 struct blkcg_gq;
@@ -56,9 +58,11 @@ struct blkg_iostat_set {
 struct blkcg_gq {
 	/* Pointer to the associated request_queue */
 	struct request_queue		*q;
+	struct rhash_head		q_hash_node;
 	struct list_head		q_node;
 	struct hlist_node		blkcg_node;
 	struct blkcg			*blkcg;
+	int				blkcg_id;
 
 	/* all non-root blkcg_gq's are guaranteed to have access to parent */
 	struct blkcg_gq			*parent;
@@ -73,14 +77,7 @@ struct blkcg_gq {
 	struct blkg_iostat_set		iostat;
 
 	struct blkg_policy_data		*pd[BLKCG_MAX_POLS];
-#ifdef CONFIG_BLK_CGROUP_PUNT_BIO
-	spinlock_t			async_bio_lock;
-	struct bio_list			async_bios;
-#endif
-	union {
-		struct work_struct	async_bio_work;
-		struct work_struct	free_work;
-	};
+	struct work_struct		free_work;
 
 	atomic_t			use_delay;
 	atomic64_t			delay_nsec;
@@ -98,8 +95,6 @@ struct blkcg {
 	/* If there is block congestion on this cgroup. */
 	atomic_t			congestion_count;
 
-	struct radix_tree_root		blkg_tree;
-	struct blkcg_gq	__rcu		*blkg_hint;
 	struct hlist_head		blkg_list;
 
 	struct blkcg_policy_data	*cpd[BLKCG_MAX_POLS];
@@ -111,6 +106,11 @@ struct blkcg {
 	 */
 	struct llist_head __percpu	*lhead;
 
+#ifdef CONFIG_BLK_CGROUP_PUNT_BIO
+	spinlock_t			async_bio_lock; /* protects async_bios */
+	struct bio_list			async_bios;
+	struct work_struct		async_bio_work;
+#endif
 #ifdef CONFIG_BLK_CGROUP_FC_APPID
 	char                            fc_app_id[FC_APPID_LEN];
 #endif
@@ -122,6 +122,11 @@ struct blkcg {
 static inline struct blkcg *css_to_blkcg(struct cgroup_subsys_state *css)
 {
 	return css ? container_of(css, struct blkcg, css) : NULL;
+}
+
+static inline struct blkcg *bio_blkcg(struct bio *bio)
+{
+	return bio->bi_blkcg;
 }
 
 /*
@@ -192,8 +197,10 @@ struct blkcg_policy {
 
 extern struct blkcg blkcg_root;
 extern bool blkcg_debug_stats;
+extern const struct rhashtable_params blkg_hash_params;
 
-void blkg_init_queue(struct request_queue *q);
+int blkg_init_queue(struct request_queue *q);
+void blkg_exit_queue(struct request_queue *q);
 int blkcg_init_disk(struct gendisk *disk);
 void blkcg_exit_disk(struct gendisk *disk);
 
@@ -249,13 +256,36 @@ static inline bool bio_issue_as_root_blkg(struct bio *bio)
 }
 
 /**
- * blkg_lookup - lookup blkg for the specified blkcg - q pair
+ * blkg_lookup_any - lookup any blkg for the specified blkcg - q pair
  * @blkcg: blkcg of interest
  * @q: request_queue of interest
  *
- * Lookup blkg for the @blkcg - @q pair.
+ * Lookup a blkg for the @blkcg - @q pair, whether it is online or dying.
  *
- * Must be called in a RCU critical section.
+ * Must be called with either RCU read lock or queue_lock held.
+ *
+ * This does not acquire a reference.  The caller must already hold one, or
+ * have the blkg pinned by I/O.
+ */
+static inline struct blkcg_gq *blkg_lookup_any(struct blkcg *blkcg,
+					       struct request_queue *q)
+{
+	RCU_LOCKDEP_WARN(!rcu_read_lock_held() &&
+			 !lockdep_is_held(&q->queue_lock),
+			 "blkg_lookup_any() requires an RCU read lock or queue_lock");
+
+	return rhashtable_lookup(&q->blkg_hash, &blkcg->css.id,
+				 blkg_hash_params);
+}
+
+/**
+ * blkg_lookup - lookup an online blkg for the specified blkcg - q pair
+ * @blkcg: blkcg of interest
+ * @q: request_queue of interest
+ *
+ * Lookup an online blkg for the @blkcg - @q pair.
+ *
+ * Must be called with either RCU read lock or queue_lock held.
  */
 static inline struct blkcg_gq *blkg_lookup(struct blkcg *blkcg,
 					   struct request_queue *q)
@@ -265,16 +295,14 @@ static inline struct blkcg_gq *blkg_lookup(struct blkcg *blkcg,
 	if (blkcg == &blkcg_root)
 		return q->root_blkg;
 
-	blkg = rcu_dereference_check(blkcg->blkg_hint,
-			lockdep_is_held(&q->queue_lock));
-	if (blkg && blkg->q == q)
-		return blkg;
-
-	blkg = radix_tree_lookup(&blkcg->blkg_tree, q->id);
-	if (blkg && blkg->q != q)
+	blkg = blkg_lookup_any(blkcg, q);
+	if (blkg && !READ_ONCE(blkg->online))
 		blkg = NULL;
 	return blkg;
 }
+
+struct blkcg_gq *bio_blkg_lookup(struct bio *bio);
+struct blkcg_gq *bio_blkg(struct bio *bio);
 
 /**
  * blkg_to_pd - get policy private data
@@ -341,6 +369,18 @@ static inline bool blkg_tryget(struct blkcg_gq *blkg)
 static inline void blkg_put(struct blkcg_gq *blkg)
 {
 	percpu_ref_put(&blkg->refcnt);
+}
+
+static inline void bio_clear_blkcg(struct bio *bio)
+{
+	struct blkcg *blkcg = bio_blkcg(bio);
+
+	bio_put_blkg_ref(bio);
+
+	if (blkcg) {
+		css_put(&blkcg->css);
+		bio->bi_blkcg = NULL;
+	}
 }
 
 /**
@@ -472,7 +512,7 @@ static inline void blkcg_clear_delay(struct blkcg_gq *blkg)
  */
 static inline bool blk_cgroup_mergeable(struct request *rq, struct bio *bio)
 {
-	return rq->bio->bi_blkg == bio->bi_blkg &&
+	return bio_blkcg(rq->bio) == bio_blkcg(bio) &&
 		bio_issue_as_root_blkg(rq->bio) == bio_issue_as_root_blkg(bio);
 }
 
@@ -498,8 +538,13 @@ struct blkcg_policy {
 struct blkcg {
 };
 
+static inline struct blkcg *bio_blkcg(struct bio *bio) { return NULL; }
+static inline struct blkcg_gq *bio_blkg_lookup(struct bio *bio) { return NULL; }
+static inline struct blkcg_gq *bio_blkg(struct bio *bio) { return NULL; }
+static inline struct blkcg_gq *blkg_lookup_any(struct blkcg *blkcg, void *key) { return NULL; }
 static inline struct blkcg_gq *blkg_lookup(struct blkcg *blkcg, void *key) { return NULL; }
-static inline void blkg_init_queue(struct request_queue *q) { }
+static inline int blkg_init_queue(struct request_queue *q) { return 0; }
+static inline void blkg_exit_queue(struct request_queue *q) { }
 static inline int blkcg_init_disk(struct gendisk *disk) { return 0; }
 static inline void blkcg_exit_disk(struct gendisk *disk) { }
 static inline int blkcg_policy_register(struct blkcg_policy *pol) { return 0; }
@@ -514,6 +559,7 @@ static inline struct blkg_policy_data *blkg_to_pd(struct blkcg_gq *blkg,
 static inline struct blkcg_gq *pd_to_blkg(struct blkg_policy_data *pd) { return NULL; }
 static inline void blkg_get(struct blkcg_gq *blkg) { }
 static inline void blkg_put(struct blkcg_gq *blkg) { }
+static inline void bio_clear_blkcg(struct bio *bio) { }
 static inline void blk_cgroup_bio_start(struct bio *bio) { }
 static inline bool blk_cgroup_mergeable(struct request *rq, struct bio *bio) { return true; }
 
