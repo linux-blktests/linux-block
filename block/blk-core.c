@@ -225,21 +225,19 @@ const char *blk_status_to_tag(blk_status_t status)
 	return blk_errors[idx].tag;
 }
 
-blk_status_t tag_to_blk_status(const char *tag)
+int tag_to_blk_status(const char *tag, blk_status_t *status)
 {
 	int i;
 
 	for (i = 0; i < ARRAY_SIZE(blk_errors); i++) {
 		if (blk_errors[i].tag &&
-		    !strcmp(blk_errors[i].tag, tag))
-			return (__force blk_status_t)i;
+		    !strcmp(blk_errors[i].tag, tag)) {
+			*status = (__force blk_status_t)i;
+			return 0;
+		}
 	}
 
-	/*
-	 * Return BLK_STS_OK for mismatches as this function is intended to
-	 * parse error status values.
-	 */
-	return BLK_STS_OK;
+	return -EINVAL;
 }
 
 /**
@@ -759,11 +757,8 @@ static void __submit_bio_noacct_mq(struct bio *bio)
 	current->bio_list = NULL;
 }
 
-void submit_bio_noacct_nocheck(struct bio *bio, bool split)
+void __submit_bio_noacct_nocheck(struct bio *bio, bool split)
 {
-	if (unlikely(blk_error_inject(bio)))
-		return;
-
 	blk_cgroup_bio_start(bio);
 
 	if (!bio_flagged(bio, BIO_TRACE_COMPLETION)) {
@@ -791,6 +786,14 @@ void submit_bio_noacct_nocheck(struct bio *bio, bool split)
 	} else {
 		__submit_bio_noacct(bio);
 	}
+}
+
+void submit_bio_noacct_nocheck(struct bio *bio, bool split)
+{
+	if (unlikely(blk_error_inject(bio)))
+		return;
+
+	__submit_bio_noacct_nocheck(bio, split);
 }
 
 static blk_status_t blk_validate_atomic_write_op_size(struct request_queue *q,
