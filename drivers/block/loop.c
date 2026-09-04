@@ -212,9 +212,6 @@ static inline void loop_update_dio(struct loop_device *lo)
  * loop_set_size() - sets device size and notifies userspace
  * @lo: struct loop_device to set the size for
  * @size: new size of the loop device
- *
- * Callers must validate that the size passed into this function fits into
- * a sector_t, eg using loop_validate_size()
  */
 static void loop_set_size(struct loop_device *lo, loff_t size)
 {
@@ -273,7 +270,7 @@ static int lo_fallocate(struct loop_device *lo, struct request *rq, loff_t pos,
 	return ret;
 }
 
-static int lo_req_flush(struct loop_device *lo, struct request *rq)
+static int lo_req_flush(struct loop_device *lo)
 {
 	int ret = vfs_fsync(lo->lo_backing_file, 0);
 	if (unlikely(ret && ret != -EINVAL))
@@ -414,7 +411,7 @@ static int do_req_filebacked(struct loop_device *lo, struct request *rq)
 
 	switch (req_op(rq)) {
 	case REQ_OP_FLUSH:
-		return lo_req_flush(lo, rq);
+		return lo_req_flush(lo);
 	case REQ_OP_WRITE_ZEROES:
 		/*
 		 * If the caller doesn't want deallocation, call zeroout to
@@ -2344,7 +2341,10 @@ module_exit(loop_exit);
 #ifndef MODULE
 static int __init max_loop_setup(char *str)
 {
-	max_loop = simple_strtol(str, NULL, 0);
+	if (kstrtoint(str, 0, &max_loop)) {
+		pr_warn("loop: invalid max_loop, keeping default\n");
+		return 1;
+	}
 #ifdef CONFIG_BLOCK_LEGACY_AUTOLOAD
 	max_loop_specified = true;
 #endif
