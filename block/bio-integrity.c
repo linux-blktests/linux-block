@@ -302,15 +302,9 @@ static int bio_integrity_copy_user(struct bio *bio, struct bio_vec *bvec,
 
 	ret = bio_integrity_add_page(bio, virt_to_page(buf), len,
 				     offset_in_page(buf));
-	if (ret != len) {
-		ret = -ENOMEM;
-		goto free_bip;
-	}
-
+	WARN_ON_ONCE(ret != len);
 	bip->bip_flags |= BIP_COPY_USER;
 	return 0;
-free_bip:
-	bio_integrity_free(bio);
 free_buf:
 	kfree(buf);
 	return ret;
