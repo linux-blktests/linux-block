@@ -177,7 +177,11 @@ static int nvme_map_user_request(struct request *req, u64 ubuffer,
 		return ret;
 
 	if (has_metadata) {
-		ret = blk_rq_integrity_map_user(req, meta_buffer, meta_len);
+		struct iov_iter meta_iter;
+
+		iov_iter_ubuf(&meta_iter, rq_data_dir(req), meta_buffer,
+			      meta_len);
+		ret = blk_rq_integrity_map_user(req, &meta_iter);
 		if (ret)
 			goto out_unmap;
 	}
