@@ -14,6 +14,7 @@ enum bip_flags {
 	BIP_CHECK_REFTAG	= 1 << 6, /* reftag check */
 	BIP_CHECK_APPTAG	= 1 << 7, /* apptag check */
 
+	BIP_PAGE_PINNED		= 1 << 14, /* pages need to be unpinned */
 	BIP_MEMPOOL		= 1 << 15, /* buffer backed by mempool */
 };
 

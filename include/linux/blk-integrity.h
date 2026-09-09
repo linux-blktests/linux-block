@@ -30,8 +30,7 @@ static inline bool queue_limits_stack_integrity_bdev(struct queue_limits *t,
 int blk_rq_map_integrity_sg(struct request *, struct scatterlist *);
 
 int blk_rq_count_integrity_sg(struct request_queue *, struct bio *);
-int blk_rq_integrity_map_user(struct request *rq, void __user *ubuf,
-			      ssize_t bytes);
+int blk_rq_integrity_map_user(struct request *rq, struct iov_iter *iter);
 int blk_get_meta_cap(struct block_device *bdev, unsigned int cmd,
 		     struct logical_block_metadata_cap __user *argp);
 bool blk_rq_integrity_dma_map_iter_start(struct request *req,
@@ -118,8 +117,7 @@ static inline int blk_rq_map_integrity_sg(struct request *q,
 	return 0;
 }
 static inline int blk_rq_integrity_map_user(struct request *rq,
-					    void __user *ubuf,
-					    ssize_t bytes)
+					    struct iov_iter *iter)
 {
 	return -EINVAL;
 }
