@@ -190,7 +190,8 @@ static void bio_integrity_uncopy_user(struct bio_integrity_payload *bip)
 	ret = copy_to_iter(bvec_virt(bounce_bvec), bytes, &orig_iter);
 	WARN_ON_ONCE(ret != bytes);
 
-	bio_integrity_unpin_bvec(orig_bvecs, orig_nr_vecs);
+	if (bip->bip_flags & BIP_PAGE_PINNED)
+		bio_integrity_unpin_bvec(orig_bvecs, orig_nr_vecs);
 }
 
 /**
@@ -210,7 +211,8 @@ void bio_integrity_unmap_user(struct bio *bio)
 		return;
 	}
 
-	bio_integrity_unpin_bvec(bip->bip_vec, bip->bip_max_vcnt);
+	if (bip->bip_flags & BIP_PAGE_PINNED)
+		bio_integrity_unpin_bvec(bip->bip_vec, bip->bip_max_vcnt);
 }
 
 /**
@@ -260,7 +262,7 @@ int bio_integrity_add_page(struct bio *bio, struct page *page,
 EXPORT_SYMBOL(bio_integrity_add_page);
 
 static int bio_integrity_copy_user(struct bio *bio, struct bio_vec *bvec,
-				   int nr_vecs, unsigned int len)
+				   int nr_vecs, unsigned int len, bool pinned)
 {
 	bool write = op_is_write(bio_op(bio));
 	struct bio_integrity_payload *bip;
@@ -295,10 +297,14 @@ static int bio_integrity_copy_user(struct bio *bio, struct bio_vec *bvec,
 		goto free_buf;
 	}
 
-	if (write)
-		bio_integrity_unpin_bvec(bvec, nr_vecs);
-	else
+	if (write) {
+		if (pinned)
+			bio_integrity_unpin_bvec(bvec, nr_vecs);
+	} else {
 		memcpy(&bip->bip_vec[1], bvec, nr_vecs * sizeof(*bvec));
+		if (pinned)
+			bip->bip_flags |= BIP_PAGE_PINNED;
+	}
 
 	ret = bio_integrity_add_page(bio, virt_to_page(buf), len,
 				     offset_in_page(buf));
@@ -311,7 +317,7 @@ free_buf:
 }
 
 static int bio_integrity_init_user(struct bio *bio, struct bio_vec *bvec,
-				   int nr_vecs, unsigned int len)
+				   int nr_vecs, unsigned int len, bool pinned)
 {
 	struct bio_integrity_payload *bip;
 
@@ -322,12 +328,14 @@ static int bio_integrity_init_user(struct bio *bio, struct bio_vec *bvec,
 	memcpy(bip->bip_vec, bvec, nr_vecs * sizeof(*bvec));
 	bip->bip_iter.bi_size = len;
 	bip->bip_vcnt = nr_vecs;
+	if (pinned)
+		bip->bip_flags |= BIP_PAGE_PINNED;
 	return 0;
 }
 
 static unsigned int bvec_from_pages(struct bio_vec *bvec, struct page **pages,
 				    int nr_vecs, ssize_t bytes, ssize_t offset,
-				    bool *is_p2p)
+				    bool *is_p2p, bool pinned)
 {
 	unsigned int nr_bvecs = 0;
 	int i, j;
@@ -343,7 +351,8 @@ static unsigned int bvec_from_pages(struct bio_vec *bvec, struct page **pages,
 			if (page_folio(pages[j]) != folio ||
 			    pages[j] != pages[j - 1] + 1)
 				break;
-			unpin_user_page(pages[j]);
+			if (pinned)
+				unpin_user_page(pages[j]);
 			size += next;
 			bytes -= next;
 		}
@@ -364,6 +373,7 @@ int bio_integrity_map_user(struct bio *bio, struct iov_iter *iter)
 	struct request_queue *q = bdev_get_queue(bio->bi_bdev);
 	struct page *stack_pages[UIO_FASTIOV], **pages = stack_pages;
 	struct bio_vec stack_vec[UIO_FASTIOV], *bvec = stack_vec;
+	bool pinned = iov_iter_extract_will_pin(iter);
 	iov_iter_extraction_t extraction_flags = 0;
 	size_t offset, bytes = iter->count;
 	bool copy, is_p2p = false;
@@ -400,8 +410,8 @@ int bio_integrity_map_user(struct bio *bio, struct iov_iter *iter)
 	 * Handle partial pinning. This can happen when pin_user_pages_fast()
 	 * returns fewer pages than requested.
 	 */
-	if (user_backed_iter(iter) && unlikely(ret != bytes)) {
-		if (ret > 0) {
+	if (unlikely(ret != bytes)) {
+		if (pinned && ret > 0) {
 			int npinned = DIV_ROUND_UP(offset + ret, PAGE_SIZE);
 			int i;
 
@@ -415,7 +425,7 @@ int bio_integrity_map_user(struct bio *bio, struct iov_iter *iter)
 	}
 
 	nr_bvecs = bvec_from_pages(bvec, pages, nr_vecs, bytes, offset,
-				   &is_p2p);
+				   &is_p2p, pinned);
 	if (pages != stack_pages)
 		kvfree(pages);
 	if (nr_bvecs > queue_max_integrity_segments(q))
@@ -424,9 +434,11 @@ int bio_integrity_map_user(struct bio *bio, struct iov_iter *iter)
 		bio->bi_opf |= REQ_NOMERGE;
 
 	if (copy)
-		ret = bio_integrity_copy_user(bio, bvec, nr_bvecs, bytes);
+		ret = bio_integrity_copy_user(bio, bvec, nr_bvecs, bytes,
+					      pinned);
 	else
-		ret = bio_integrity_init_user(bio, bvec, nr_bvecs, bytes);
+		ret = bio_integrity_init_user(bio, bvec, nr_bvecs, bytes,
+					      pinned);
 	if (ret)
 		goto release_pages;
 	if (bvec != stack_vec)
@@ -435,7 +447,8 @@ int bio_integrity_map_user(struct bio *bio, struct iov_iter *iter)
 	return 0;
 
 release_pages:
-	bio_integrity_unpin_bvec(bvec, nr_bvecs);
+	if (pinned)
+		bio_integrity_unpin_bvec(bvec, nr_bvecs);
 free_bvec:
 	if (bvec != stack_vec)
 		kfree(bvec);
