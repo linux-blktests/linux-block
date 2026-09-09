@@ -490,17 +490,18 @@ static int nvme_uring_cmd_io(struct nvme_ctrl *ctrl, struct nvme_ns *ns,
 	struct request *req;
 	blk_opf_t rq_flags = 0;
 	blk_mq_req_flags_t blk_flags = 0;
+	u8 flags = READ_ONCE(cmd->flags);
 	u32 metadata_len, data_len;
 	u64 metadata, addr;
 	u32 timeout_ms;
 	int ddir;
 	int ret;
 
-	c.common.opcode = READ_ONCE(cmd->opcode);
-	c.common.flags = READ_ONCE(cmd->flags);
-	if (c.common.flags)
+	if (flags & ~NVME_URING_CMD_FIXED_METADATA)
 		return -EINVAL;
 
+	c.common.opcode = READ_ONCE(cmd->opcode);
+	c.common.flags = 0;
 	c.common.command_id = 0;
 	c.common.nsid = cpu_to_le32(cmd->nsid);
 	if (!nvme_validate_passthru_nsid(ctrl, ns, le32_to_cpu(c.common.nsid)))
@@ -541,8 +542,18 @@ static int nvme_uring_cmd_io(struct nvme_ctrl *ctrl, struct nvme_ns *ns,
 		map_iter = &iter;
 	}
 	if (data_len && metadata && metadata_len) {
-		iov_iter_ubuf(&meta_iter, ddir, nvme_to_user_ptr(metadata),
-			      metadata_len);
+		if (flags & NVME_URING_CMD_FIXED_METADATA) {
+			u16 buf_index = READ_ONCE(cmd->metadata_buf_index);
+
+			ret = io_uring_cmd_import_fixed_metadata(
+				ioucmd, buf_index, metadata, metadata_len, ddir,
+				&meta_iter, issue_flags);
+			if (ret < 0)
+				return ret;
+		} else {
+			iov_iter_ubuf(&meta_iter, ddir, nvme_to_user_ptr(metadata),
+				      metadata_len);
+		}
 		map_meta_iter = &meta_iter;
 	}
 
