@@ -408,14 +408,6 @@ static int nvme_user_cmd64(struct nvme_ctrl *ctrl, struct nvme_ns *ns,
 	return status;
 }
 
-struct nvme_uring_data {
-	__u64	metadata;
-	__u64	addr;
-	__u32	data_len;
-	__u32	metadata_len;
-	__u32	timeout_ms;
-};
-
 /*
  * This overlays struct io_uring_cmd pdu.
  * Expect build errors if this grows larger than that.
@@ -485,13 +477,15 @@ static int nvme_uring_cmd_io(struct nvme_ctrl *ctrl, struct nvme_ns *ns,
 							       struct nvme_uring_cmd);
 	struct request_queue *q = ns ? ns->queue : ctrl->admin_q;
 	bool open_for_write = ioucmd->file->f_mode & FMODE_WRITE;
-	struct nvme_uring_data d;
 	struct nvme_command c;
 	struct iov_iter iter;
 	struct iov_iter *map_iter = NULL;
 	struct request *req;
 	blk_opf_t rq_flags = 0;
 	blk_mq_req_flags_t blk_flags = 0;
+	u32 metadata_len, data_len;
+	u64 metadata, addr;
+	u32 timeout_ms;
 	int ret;
 
 	c.common.opcode = READ_ONCE(cmd->opcode);
@@ -518,21 +512,21 @@ static int nvme_uring_cmd_io(struct nvme_ctrl *ctrl, struct nvme_ns *ns,
 	if (!nvme_cmd_allowed(ctrl, ns, &c, 0, open_for_write))
 		return -EACCES;
 
-	d.metadata = READ_ONCE(cmd->metadata);
-	d.addr = READ_ONCE(cmd->addr);
-	d.data_len = READ_ONCE(cmd->data_len);
-	d.metadata_len = READ_ONCE(cmd->metadata_len);
-	d.timeout_ms = READ_ONCE(cmd->timeout_ms);
+	metadata = READ_ONCE(cmd->metadata);
+	addr = READ_ONCE(cmd->addr);
+	data_len = READ_ONCE(cmd->data_len);
+	metadata_len = READ_ONCE(cmd->metadata_len);
+	timeout_ms = READ_ONCE(cmd->timeout_ms);
 
-	if (d.data_len && (ioucmd->flags & IORING_URING_CMD_FIXED)) {
+	if (data_len && (ioucmd->flags & IORING_URING_CMD_FIXED)) {
 		int ddir = nvme_is_write(&c) ? WRITE : READ;
 
 		if (vec)
 			ret = io_uring_cmd_import_fixed_vec(ioucmd,
-					u64_to_user_ptr(d.addr), d.data_len,
+					u64_to_user_ptr(addr), data_len,
 					ddir, &iter, issue_flags);
 		else
-			ret = io_uring_cmd_import_fixed(d.addr, d.data_len,
+			ret = io_uring_cmd_import_fixed(addr, data_len,
 					ddir, &iter, ioucmd, issue_flags);
 		if (ret < 0)
 			return ret;
@@ -550,11 +544,11 @@ static int nvme_uring_cmd_io(struct nvme_ctrl *ctrl, struct nvme_ns *ns,
 	req = nvme_alloc_user_request(q, &c, rq_flags, blk_flags);
 	if (IS_ERR(req))
 		return PTR_ERR(req);
-	req->timeout = d.timeout_ms ? msecs_to_jiffies(d.timeout_ms) : 0;
+	req->timeout = timeout_ms ? msecs_to_jiffies(timeout_ms) : 0;
 
-	if (d.data_len) {
-		ret = nvme_map_user_request(req, d.addr, d.data_len,
-			nvme_to_user_ptr(d.metadata), d.metadata_len,
+	if (data_len) {
+		ret = nvme_map_user_request(req, addr, data_len,
+			nvme_to_user_ptr(metadata), metadata_len,
 			map_iter, vec ? NVME_IOCTL_VEC : 0);
 		if (ret)
 			goto out_free_req;
