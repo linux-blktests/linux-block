@@ -70,11 +70,14 @@ struct nvme_passthru_cmd64 {
 	__u64	result;
 };
 
+/* struct nvme_uring_cmd flags field bits */
+#define NVME_URING_CMD_FIXED_METADATA (1U << 0)
+
 /* same as struct nvme_passthru_cmd64, minus the 8b result field */
 struct nvme_uring_cmd {
 	__u8	opcode;
 	__u8	flags;
-	__u16	rsvd1;
+	__u16	metadata_buf_index;
 	__u32	nsid;
 	__u32	cdw2;
 	__u32	cdw3;
