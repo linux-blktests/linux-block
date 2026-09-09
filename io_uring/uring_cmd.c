@@ -27,15 +27,21 @@ static void io_req_uring_cleanup(struct io_kiocb *req, unsigned int issue_flags)
 {
 	struct io_uring_cmd *ioucmd = io_kiocb_to_cmd(req, struct io_uring_cmd);
 	struct io_async_cmd *ac = req->async_data;
+	struct io_ring_ctx *ctx = req->ctx;
 
 	if (issue_flags & IO_URING_F_UNLOCKED)
 		return;
+
+	if (ioucmd->metadata_node) {
+		io_put_rsrc_node(ctx, ioucmd->metadata_node);
+		ioucmd->metadata_node = NULL;
+	}
 
 	io_alloc_cache_vec_kasan(&ac->vec);
 	if (ac->vec.nr > IO_VEC_CACHE_SOFT_CAP)
 		io_vec_free(&ac->vec);
 
-	if (io_alloc_cache_put(&req->ctx->cmd_cache, ac)) {
+	if (io_alloc_cache_put(&ctx->cmd_cache, ac)) {
 		ioucmd->sqe = NULL;
 		io_req_async_data_clear(req, REQ_F_NEED_CLEANUP);
 	} else {
@@ -196,6 +202,7 @@ int io_uring_cmd_prep(struct io_kiocb *req, const struct io_uring_sqe *sqe)
 	if (ac->vec.iovec)
 		req->flags |= REQ_F_NEED_CLEANUP;
 	ioucmd->sqe = sqe;
+	ioucmd->metadata_node = NULL;
 	return 0;
 }
 
@@ -304,6 +311,27 @@ int io_uring_cmd_import_fixed_vec(struct io_uring_cmd *ioucmd,
 				 issue_flags);
 }
 EXPORT_SYMBOL_GPL(io_uring_cmd_import_fixed_vec);
+
+int io_uring_cmd_import_fixed_metadata(struct io_uring_cmd *ioucmd,
+				       u16 buf_index, u64 ubuf, size_t len,
+				       int ddir, struct iov_iter *iter,
+				       unsigned int issue_flags)
+{
+	struct io_rsrc_node *buf_node = ioucmd->metadata_node;
+
+	if (!buf_node) {
+		struct io_kiocb *req = cmd_to_io_kiocb(ioucmd);
+
+		buf_node = io_get_buf_node(req, buf_index, issue_flags);
+		if (!buf_node)
+			return -EFAULT;
+
+		req->flags |= REQ_F_NEED_CLEANUP;
+		ioucmd->metadata_node = buf_node;
+	}
+	return io_import_fixed(ddir, iter, buf_node, ubuf, len);
+}
+EXPORT_SYMBOL_GPL(io_uring_cmd_import_fixed_metadata);
 
 void io_uring_cmd_issue_blocking(struct io_uring_cmd *ioucmd)
 {
