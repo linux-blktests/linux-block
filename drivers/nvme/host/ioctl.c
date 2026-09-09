@@ -154,17 +154,16 @@ static struct request *nvme_alloc_user_request(struct request_queue *q,
 }
 
 static int nvme_map_user_request(struct request *req, u64 ubuffer,
-		unsigned bufflen, void __user *meta_buffer, unsigned meta_len,
-		struct iov_iter *iter, unsigned int flags)
+		unsigned bufflen, struct iov_iter *iter,
+		struct iov_iter *meta_iter, unsigned int flags)
 {
 	struct request_queue *q = req->q;
 	struct nvme_ns *ns = q->queuedata;
 	struct block_device *bdev = ns ? ns->disk->part0 : NULL;
 	bool supports_metadata = bdev && blk_get_integrity(bdev->bd_disk);
-	bool has_metadata = meta_buffer && meta_len;
 	int ret;
 
-	if (has_metadata && !supports_metadata)
+	if (meta_iter && !supports_metadata)
 		return -EINVAL;
 
 	if (iter)
@@ -176,12 +175,8 @@ static int nvme_map_user_request(struct request *req, u64 ubuffer,
 	if (ret)
 		return ret;
 
-	if (has_metadata) {
-		struct iov_iter meta_iter;
-
-		iov_iter_ubuf(&meta_iter, rq_data_dir(req), meta_buffer,
-			      meta_len);
-		ret = blk_rq_integrity_map_user(req, &meta_iter);
+	if (meta_iter) {
+		ret = blk_rq_integrity_map_user(req, meta_iter);
 		if (ret)
 			goto out_unmap;
 	}
@@ -212,8 +207,16 @@ static int nvme_submit_user_cmd(struct request_queue *q,
 
 	req->timeout = timeout;
 	if (ubuffer && bufflen) {
-		ret = nvme_map_user_request(req, ubuffer, bufflen, meta_buffer,
-				meta_len, NULL, flags);
+		struct iov_iter meta_iter;
+		struct iov_iter *map_meta_iter = NULL;
+
+		if (meta_buffer && meta_len) {
+			iov_iter_ubuf(&meta_iter, rq_data_dir(req), meta_buffer,
+				      meta_len);
+			map_meta_iter = &meta_iter;
+		}
+		ret = nvme_map_user_request(req, ubuffer, bufflen, NULL,
+					    map_meta_iter, flags);
 		if (ret)
 			goto out_free_req;
 	}
@@ -482,14 +485,15 @@ static int nvme_uring_cmd_io(struct nvme_ctrl *ctrl, struct nvme_ns *ns,
 	struct request_queue *q = ns ? ns->queue : ctrl->admin_q;
 	bool open_for_write = ioucmd->file->f_mode & FMODE_WRITE;
 	struct nvme_command c;
-	struct iov_iter iter;
-	struct iov_iter *map_iter = NULL;
+	struct iov_iter iter, meta_iter;
+	struct iov_iter *map_iter = NULL, *map_meta_iter = NULL;
 	struct request *req;
 	blk_opf_t rq_flags = 0;
 	blk_mq_req_flags_t blk_flags = 0;
 	u32 metadata_len, data_len;
 	u64 metadata, addr;
 	u32 timeout_ms;
+	int ddir;
 	int ret;
 
 	c.common.opcode = READ_ONCE(cmd->opcode);
@@ -522,9 +526,8 @@ static int nvme_uring_cmd_io(struct nvme_ctrl *ctrl, struct nvme_ns *ns,
 	metadata_len = READ_ONCE(cmd->metadata_len);
 	timeout_ms = READ_ONCE(cmd->timeout_ms);
 
+	ddir = nvme_is_write(&c) ? WRITE : READ;
 	if (data_len && (ioucmd->flags & IORING_URING_CMD_FIXED)) {
-		int ddir = nvme_is_write(&c) ? WRITE : READ;
-
 		if (vec)
 			ret = io_uring_cmd_import_fixed_vec(ioucmd,
 					u64_to_user_ptr(addr), data_len,
@@ -536,6 +539,11 @@ static int nvme_uring_cmd_io(struct nvme_ctrl *ctrl, struct nvme_ns *ns,
 			return ret;
 
 		map_iter = &iter;
+	}
+	if (data_len && metadata && metadata_len) {
+		iov_iter_ubuf(&meta_iter, ddir, nvme_to_user_ptr(metadata),
+			      metadata_len);
+		map_meta_iter = &meta_iter;
 	}
 
 	if (issue_flags & IO_URING_F_NONBLOCK) {
@@ -551,9 +559,9 @@ static int nvme_uring_cmd_io(struct nvme_ctrl *ctrl, struct nvme_ns *ns,
 	req->timeout = timeout_ms ? msecs_to_jiffies(timeout_ms) : 0;
 
 	if (data_len) {
-		ret = nvme_map_user_request(req, addr, data_len,
-			nvme_to_user_ptr(metadata), metadata_len,
-			map_iter, vec ? NVME_IOCTL_VEC : 0);
+		ret = nvme_map_user_request(req, addr, data_len, map_iter,
+					    map_meta_iter,
+					    vec ? NVME_IOCTL_VEC : 0);
 		if (ret)
 			goto out_free_req;
 	}
