@@ -2533,8 +2533,8 @@ static void calc_vtime_cost_builtin(struct bio *bio, struct ioc_gq *iocg,
 	u64 seek_pages = 0;
 	u64 cost = 0;
 
-	/* Can't calculate cost for empty bio */
-	if (!bio->bi_iter.bi_size)
+	/* Dataless WRITE|REQ_PREFLUSH (standalone flush) is priced below */
+	if (!bio->bi_iter.bi_size && !(bio->bi_opf & REQ_PREFLUSH))
 		goto out;
 
 	switch (bio_op(bio)) {
@@ -2544,10 +2544,30 @@ static void calc_vtime_cost_builtin(struct bio *bio, struct ioc_gq *iocg,
 		coef_page	= ioc->params.lcoefs[LCOEF_RPAGE];
 		break;
 	case REQ_OP_WRITE:
+		if (!bio->bi_iter.bi_size) {
+			/*
+			 * dataless WRITE|REQ_PREFLUSH: standalone flush;
+			 * at least one page so fast profiles still charge
+			 */
+			cost = max(ioc->params.lcoefs[LCOEF_WRANDIO],
+				   ioc->params.lcoefs[LCOEF_WPAGE]);
+			goto out;
+		}
 		coef_seqio	= ioc->params.lcoefs[LCOEF_WSEQIO];
 		coef_randio	= ioc->params.lcoefs[LCOEF_WRANDIO];
 		coef_page	= ioc->params.lcoefs[LCOEF_WPAGE];
 		break;
+	case REQ_OP_ZONE_APPEND:
+		/*
+		 * A zone append advances the zone write pointer and is
+		 * therefore sequential from the device's perspective, so
+		 * the cursor-based classification below doesn't apply.
+		 * Compute the full cost here.
+		 */
+		if (!is_merge)
+			cost += ioc->params.lcoefs[LCOEF_WSEQIO];
+		cost += pages * ioc->params.lcoefs[LCOEF_WPAGE];
+		goto out;
 	default:
 		goto out;
 	}
@@ -2586,6 +2606,7 @@ static void calc_size_vtime_cost_builtin(struct request *rq, struct ioc *ioc,
 	case REQ_OP_READ:
 		*costp = pages * ioc->params.lcoefs[LCOEF_RPAGE];
 		break;
+	case REQ_OP_ZONE_APPEND:
 	case REQ_OP_WRITE:
 		*costp = pages * ioc->params.lcoefs[LCOEF_WPAGE];
 		break;
@@ -2708,7 +2729,9 @@ static void ioc_rqos_throttle(struct rq_qos *rqos, struct bio *bio)
 	if (!iocg_activate(iocg, &now))
 		return;
 
-	iocg->cursor = bio_end_sector(bio);
+	/* ZA bi_sector is zone start, not the write position */
+	if (bio_op(bio) != REQ_OP_ZONE_APPEND)
+		iocg->cursor = bio_end_sector(bio);
 	vtime = atomic64_read(&iocg->vtime);
 	cost = adjust_inuse_and_calc_cost(iocg, vtime, abs_cost, &now);
 
@@ -2725,10 +2748,11 @@ static void ioc_rqos_throttle(struct rq_qos *rqos, struct bio *bio)
 
 	/*
 	 * We're over budget. This can be handled in two ways. IOs which may
-	 * cause priority inversions are punted to @ioc->aux_iocg and charged as
-	 * debt. Otherwise, the issuer is blocked on @iocg->waitq. Debt handling
-	 * requires @ioc->lock, waitq handling @iocg->waitq.lock. Determine
-	 * whether debt handling is needed and acquire locks accordingly.
+	 * cause priority inversions are issued regardless and charged against
+	 * @iocg->abs_vdebt as debt. Otherwise, the issuer is blocked on
+	 * @iocg->waitq. Debt handling requires @ioc->lock, waitq handling
+	 * @iocg->waitq.lock. Determine whether debt handling is needed and
+	 * acquire locks accordingly.
 	 */
 	use_debt = bio_issue_as_root_blkg(bio) || fatal_signal_pending(current);
 	ioc_locked = use_debt || READ_ONCE(iocg->abs_vdebt);
@@ -2854,6 +2878,7 @@ static void ioc_rqos_done(struct rq_qos *rqos, struct request *rq)
 		pidx = QOS_RLAT;
 		rw = READ;
 		break;
+	case REQ_OP_ZONE_APPEND:
 	case REQ_OP_WRITE:
 		pidx = QOS_WLAT;
 		rw = WRITE;
