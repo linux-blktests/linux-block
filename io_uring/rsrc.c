@@ -1189,10 +1189,10 @@ static int io_import_kbuf(int ddir, struct iov_iter *iter,
 	return 0;
 }
 
-static int io_import_fixed(int ddir, struct iov_iter *iter,
-			   struct io_mapped_ubuf *imu,
-			   u64 buf_addr, size_t len)
+int io_import_fixed(int ddir, struct iov_iter *iter, struct io_rsrc_node *node,
+		    u64 buf_addr, size_t len)
 {
+	struct io_mapped_ubuf *imu = node->buf;
 	const struct bio_vec *bvec;
 	size_t folio_mask;
 	unsigned nr_segs;
@@ -1244,24 +1244,18 @@ static int io_import_fixed(int ddir, struct iov_iter *iter,
 inline struct io_rsrc_node *io_find_buf_node(struct io_kiocb *req,
 					     unsigned issue_flags)
 {
-	struct io_ring_ctx *ctx = req->ctx;
 	struct io_rsrc_node *node;
 
 	if (req->flags & REQ_F_BUF_NODE)
 		return req->buf_node;
-	req->flags |= REQ_F_BUF_NODE;
 
-	io_ring_submit_lock(ctx, issue_flags);
-	node = io_rsrc_node_lookup(&ctx->buf_table, req->buf_index);
-	if (node) {
-		node->refs++;
-		req->buf_node = node;
-		io_ring_submit_unlock(ctx, issue_flags);
-		return node;
-	}
-	req->flags &= ~REQ_F_BUF_NODE;
-	io_ring_submit_unlock(ctx, issue_flags);
-	return NULL;
+	node = io_get_buf_node(req, req->buf_index, issue_flags);
+	if (!node)
+		return NULL;
+
+	req->flags |= REQ_F_BUF_NODE;
+	req->buf_node = node;
+	return node;
 }
 
 int io_import_reg_buf(struct io_kiocb *req, struct iov_iter *iter,
@@ -1273,7 +1267,7 @@ int io_import_reg_buf(struct io_kiocb *req, struct iov_iter *iter,
 	node = io_find_buf_node(req, issue_flags);
 	if (!node)
 		return -EFAULT;
-	return io_import_fixed(ddir, iter, node->buf, buf_addr, len);
+	return io_import_fixed(ddir, iter, node, buf_addr, len);
 }
 
 static int io_buffer_acct_cloned_hpages(struct io_ring_ctx *ctx,
