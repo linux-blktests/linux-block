@@ -18,7 +18,7 @@ struct io_uring_cmd {
 	u32		cmd_op;
 	u32		flags;
 	u8		pdu[32]; /* available inline for free use */
-	u8		unused[8];
+	struct io_rsrc_node *metadata_node;
 };
 
 #define io_uring_sqe128_cmd(sqe, type)	({					\
@@ -70,6 +70,10 @@ int io_uring_cmd_import_fixed_vec(struct io_uring_cmd *ioucmd,
 				  size_t uvec_segs,
 				  int ddir, struct iov_iter *iter,
 				  unsigned issue_flags);
+int io_uring_cmd_import_fixed_metadata(struct io_uring_cmd *ioucmd,
+				       u16 buf_index, u64 ubuf, size_t len,
+				       int ddir, struct iov_iter *iter,
+				       unsigned int issue_flags);
 
 /*
  * Completes the request, i.e. posts an io_uring CQE and deallocates @ioucmd
@@ -133,6 +137,12 @@ static inline int io_uring_cmd_import_fixed_vec(struct io_uring_cmd *ioucmd,
 						size_t uvec_segs,
 						int ddir, struct iov_iter *iter,
 						unsigned issue_flags)
+{
+	return -EOPNOTSUPP;
+}
+static inline int io_uring_cmd_import_fixed_metadata(
+	struct io_uring_cmd *ioucmd, u16 buf_index, u64 ubuf, size_t len,
+	int ddir, struct iov_iter *iter, unsigned int issue_flags)
 {
 	return -EOPNOTSUPP;
 }
