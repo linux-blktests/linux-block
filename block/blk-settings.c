@@ -653,6 +653,14 @@ static unsigned int blk_round_down_sectors(unsigned int sectors, unsigned int lb
 	return sectors;
 }
 
+static void blk_clear_atomic_write_limits(struct queue_limits *lim)
+{
+	lim->atomic_write_hw_max = 0;
+	lim->atomic_write_hw_unit_max = 0;
+	lim->atomic_write_hw_unit_min = 0;
+	lim->atomic_write_hw_boundary = 0;
+}
+
 /* Check if second and later bottom devices are compliant */
 static bool blk_stack_atomic_writes_tail(struct queue_limits *t,
 				struct queue_limits *b)
@@ -726,16 +734,13 @@ static bool blk_stack_atomic_writes_head(struct queue_limits *t,
 	return true;
 }
 
-static void blk_stack_atomic_writes_limits(struct queue_limits *t,
-				struct queue_limits *b, sector_t start)
+static bool blk_stack_atomic_writes_hw_limits(struct queue_limits *t,
+				struct queue_limits *b)
 {
 	if (!(b->features & BLK_FEAT_ATOMIC_WRITES))
 		goto unsupported;
 
 	if (!b->atomic_write_hw_unit_min)
-		goto unsupported;
-
-	if (!blk_atomic_write_start_sect_aligned(start, b))
 		goto unsupported;
 
 	/* UINT_MAX indicates no stacking of bottom devices yet */
@@ -747,49 +752,32 @@ static void blk_stack_atomic_writes_limits(struct queue_limits *t,
 			goto unsupported;
 	}
 	blk_stack_atomic_writes_chunk_sectors(t);
-	return;
+	return true;
 
 unsupported:
-	t->atomic_write_hw_max = 0;
-	t->atomic_write_hw_unit_max = 0;
-	t->atomic_write_hw_unit_min = 0;
-	t->atomic_write_hw_boundary = 0;
+	blk_clear_atomic_write_limits(t);
+	return false;
 }
 
-/**
- * blk_stack_limits - adjust queue_limits for stacked devices
- * @t:	the stacking driver limits (top device)
- * @b:  the underlying queue limits (bottom, component device)
- * @start:  first data sector within component device
- *
- * Description:
- *    This function is used by stacking drivers like MD and DM to ensure
- *    that all component devices have compatible block sizes and
- *    alignments.  The stacking driver must provide a queue_limits
- *    struct (top) and then iteratively call the stacking function for
- *    all component (bottom) devices.  The stacking function will
- *    attempt to combine the values and ensure proper alignment.
- *
- *    Returns 0 if the top and bottom queue_limits are compatible.  The
- *    top device's block sizes and alignment offsets may be adjusted to
- *    ensure alignment with the bottom device. If no compatible sizes
- *    and alignments exist, -1 is returned and the resulting top
- *    queue_limits will have the misaligned flag set to indicate that
- *    the alignment_offset is undefined.
- */
-int blk_stack_limits(struct queue_limits *t, struct queue_limits *b,
-		     sector_t start)
+static void blk_stack_atomic_writes_limits(struct queue_limits *t,
+				struct queue_limits *b, sector_t start)
 {
-	unsigned int top, bottom, alignment;
-	int ret = 0;
+	if (blk_stack_atomic_writes_hw_limits(t, b) &&
+	    !blk_atomic_write_start_sect_aligned(start, b))
+		blk_clear_atomic_write_limits(t);
+}
 
-	t->features |= (b->features & BLK_FEAT_INHERIT_MASK);
+#define STACK_MIN_NOT_ZERO(t, b, field) \
+	((t)->field = min_not_zero((t)->field, (b)->field))
+#define STACK_MIN(t, b, field) \
+	((t)->field = min((t)->field, (b)->field))
 
+static void blk_stack_path_limits(struct queue_limits *t,
+		const struct queue_limits *b)
+{
 	/*
-	 * Some feaures need to be supported both by the stacking driver and all
-	 * underlying devices.  The stacking driver sets these flags before
-	 * stacking the limits, and this will clear the flags if any of the
-	 * underlying devices does not support it.
+	 * These features must be supported by the top queue and every path that
+	 * can execute I/O. Clear them when a path does not support them.
 	 */
 	if (!(b->features & BLK_FEAT_NOWAIT))
 		t->features &= ~BLK_FEAT_NOWAIT;
@@ -798,51 +786,102 @@ int blk_stack_limits(struct queue_limits *t, struct queue_limits *b,
 	if (!(b->features & BLK_FEAT_PCI_P2PDMA))
 		t->features &= ~BLK_FEAT_PCI_P2PDMA;
 
-	t->flags |= (b->flags & BLK_FLAG_MISALIGNED);
+	STACK_MIN_NOT_ZERO(t, b, max_hw_sectors);
+	STACK_MIN_NOT_ZERO(t, b, max_dev_sectors);
+	STACK_MIN_NOT_ZERO(t, b, seg_boundary_mask);
+	STACK_MIN_NOT_ZERO(t, b, virt_boundary_mask);
+	STACK_MIN_NOT_ZERO(t, b, max_segments);
+	STACK_MIN_NOT_ZERO(t, b, max_integrity_segments);
+	STACK_MIN_NOT_ZERO(t, b, max_segment_size);
+	STACK_MIN(t, b, max_write_zeroes_sectors);
+	STACK_MIN(t, b, max_hw_wzeroes_unmap_sectors);
+	STACK_MIN_NOT_ZERO(t, b, max_discard_segments);
+	STACK_MIN(t, b, max_hw_zone_append_sectors);
+	t->dma_alignment = max(t->dma_alignment, b->dma_alignment);
+}
 
-	t->max_sectors = min_not_zero(t->max_sectors, b->max_sectors);
-	t->max_user_sectors = min_not_zero(t->max_user_sectors,
-			b->max_user_sectors);
-	t->max_hw_sectors = min_not_zero(t->max_hw_sectors, b->max_hw_sectors);
-	t->max_dev_sectors = min_not_zero(t->max_dev_sectors, b->max_dev_sectors);
-	t->max_write_zeroes_sectors = min(t->max_write_zeroes_sectors,
-					b->max_write_zeroes_sectors);
-	t->max_user_wzeroes_unmap_sectors =
-			min(t->max_user_wzeroes_unmap_sectors,
-			    b->max_user_wzeroes_unmap_sectors);
-	t->max_hw_wzeroes_unmap_sectors =
-			min(t->max_hw_wzeroes_unmap_sectors,
-			    b->max_hw_wzeroes_unmap_sectors);
+/**
+ * blk_set_mpath_head_limits - set head limits common to all paths
+ * @t: limits for the multipath head
+ * @b: limits for one path
+ *
+ * Set head limits that are expected to be identical across paths. Stack
+ * limits that may differ between paths with blk_stack_mpath_limits().
+ */
+void blk_set_mpath_head_limits(struct queue_limits *t,
+			       struct queue_limits *b)
+{
+	t->logical_block_size = b->logical_block_size;
+	t->physical_block_size = b->physical_block_size;
+	t->alignment_offset = b->alignment_offset;
+	t->io_min = b->io_min;
+	t->io_opt = b->io_opt;
+	t->discard_granularity = b->discard_granularity;
+	t->discard_alignment = b->discard_alignment;
+	t->zone_write_granularity = b->zone_write_granularity;
+	t->max_write_streams = b->max_write_streams;
+	t->write_stream_granularity = b->write_stream_granularity;
+}
+EXPORT_SYMBOL_GPL(blk_set_mpath_head_limits);
 
-	t->max_hw_zone_append_sectors = min(t->max_hw_zone_append_sectors,
-					b->max_hw_zone_append_sectors);
+/**
+ * blk_stack_mpath_limits - stack limits across same-LBA multipath paths
+ * @t: limits for the multipath head
+ * @b: limits for one path
+ *
+ * Stack limits in @b that may differ between paths. Unlike
+ * blk_stack_limits(), this does not apply mapped-range topology or a mapping
+ * offset. Set limits that are expected to be identical across paths with
+ * blk_set_mpath_head_limits().
+ *
+ * Initialize @t with blk_set_stacking_limits() and set features that require
+ * support from every path before the first call. Set
+ * @t->max_hw_discard_sectors to UINT_MAX and call once for each path. A zero
+ * discard limit disables discard for the head.
+ */
+void blk_stack_mpath_limits(struct queue_limits *t, struct queue_limits *b)
+{
+	if (b->chunk_sectors)
+		t->chunk_sectors = gcd(t->chunk_sectors, b->chunk_sectors);
 
-	t->seg_boundary_mask = min_not_zero(t->seg_boundary_mask,
-					    b->seg_boundary_mask);
-	t->virt_boundary_mask = min_not_zero(t->virt_boundary_mask,
-					    b->virt_boundary_mask);
+	t->features |= b->features &
+		(BLK_FEAT_WRITE_CACHE | BLK_FEAT_FUA |
+		 BLK_FEAT_ROTATIONAL | BLK_FEAT_STABLE_WRITES);
+	blk_stack_path_limits(t, b);
+	STACK_MIN(t, b, max_hw_discard_sectors);
+	blk_stack_atomic_writes_hw_limits(t, b);
 
-	t->max_segments = min_not_zero(t->max_segments, b->max_segments);
-	t->max_discard_segments = min_not_zero(t->max_discard_segments,
-					       b->max_discard_segments);
-	t->max_integrity_segments = min_not_zero(t->max_integrity_segments,
-						 b->max_integrity_segments);
+	if (t->features & BLK_FEAT_ZONED) {
+		STACK_MIN_NOT_ZERO(t, b, max_open_zones);
+		STACK_MIN_NOT_ZERO(t, b, max_active_zones);
+	}
+}
+EXPORT_SYMBOL_GPL(blk_stack_mpath_limits);
 
-	t->max_segment_size = min_not_zero(t->max_segment_size,
-					   b->max_segment_size);
+/*
+ * Stack block sizes, I/O granularities, chunk boundaries and alignment for a
+ * bottom-device range mapped at @start. Round maximum sector limits after the
+ * resulting logical block size is known.
+ */
+static int blk_stack_topology_limits(struct queue_limits *t,
+		const struct queue_limits *b, sector_t start)
+{
+	unsigned int top, bottom, alignment;
+	int ret = 0;
+
+	t->flags |= b->flags & BLK_FLAG_MISALIGNED;
 
 	alignment = queue_limit_alignment_offset(b, start);
 
-	/* Bottom device has different alignment.  Check that it is
+	/*
+	 * The bottom device has a different alignment. Check that it is
 	 * compatible with the current top alignment.
 	 */
 	if (t->alignment_offset != alignment) {
-
-		top = max(t->physical_block_size, t->io_min)
-			+ t->alignment_offset;
+		top = max(t->physical_block_size, t->io_min) + t->alignment_offset;
 		bottom = max(b->physical_block_size, b->io_min) + alignment;
 
-		/* Verify that top and bottom intervals line up */
+		/* Verify that top and bottom intervals line up. */
 		if (max(top, bottom) % min(top, bottom)) {
 			t->flags |= BLK_FLAG_MISALIGNED;
 			ret = -1;
@@ -851,15 +890,12 @@ int blk_stack_limits(struct queue_limits *t, struct queue_limits *b,
 
 	t->logical_block_size = max(t->logical_block_size,
 				    b->logical_block_size);
-
 	t->physical_block_size = max(t->physical_block_size,
 				     b->physical_block_size);
-
 	t->io_min = max(t->io_min, b->io_min);
 	t->io_opt = lcm_not_zero(t->io_opt, b->io_opt);
-	t->dma_alignment = max(t->dma_alignment, b->dma_alignment);
 
-	/* Set non-power-of-2 compatible chunk_sectors boundary */
+	/* Set non-power-of-2 compatible chunk_sectors boundary. */
 	if (b->chunk_sectors)
 		t->chunk_sectors = gcd(t->chunk_sectors, b->chunk_sectors);
 
@@ -891,19 +927,64 @@ int blk_stack_limits(struct queue_limits *t, struct queue_limits *b,
 		ret = -1;
 	}
 
-	/* Find lowest common alignment_offset */
-	t->alignment_offset = lcm_not_zero(t->alignment_offset, alignment)
-		% max(t->physical_block_size, t->io_min);
+	/* Find lowest common alignment_offset. */
+	t->alignment_offset = lcm_not_zero(t->alignment_offset, alignment) %
+		max(t->physical_block_size, t->io_min);
 
-	/* Verify that new alignment_offset is on a logical block boundary */
+	/* Verify that new alignment_offset is on a logical block boundary. */
 	if (t->alignment_offset & (t->logical_block_size - 1)) {
 		t->flags |= BLK_FLAG_MISALIGNED;
 		ret = -1;
 	}
 
-	t->max_sectors = blk_round_down_sectors(t->max_sectors, t->logical_block_size);
-	t->max_hw_sectors = blk_round_down_sectors(t->max_hw_sectors, t->logical_block_size);
-	t->max_dev_sectors = blk_round_down_sectors(t->max_dev_sectors, t->logical_block_size);
+	t->max_sectors = blk_round_down_sectors(t->max_sectors,
+						t->logical_block_size);
+	t->max_hw_sectors = blk_round_down_sectors(t->max_hw_sectors,
+						   t->logical_block_size);
+	t->max_dev_sectors = blk_round_down_sectors(t->max_dev_sectors,
+						    t->logical_block_size);
+
+	return ret;
+}
+
+/**
+ * blk_stack_limits - adjust queue_limits for stacked devices
+ * @t:	the stacking driver limits (top device)
+ * @b:  the underlying queue limits (bottom, component device)
+ * @start:  first data sector within component device
+ *
+ * Description:
+ *    This function is used by stacking drivers like MD and DM to ensure
+ *    that all component devices have compatible block sizes and
+ *    alignments.  The stacking driver must provide a queue_limits
+ *    struct (top) and then iteratively call the stacking function for
+ *    all component (bottom) devices.  The stacking function will
+ *    attempt to combine the values and ensure proper alignment.
+ *
+ *    Returns 0 if the top and bottom queue_limits are compatible.  The
+ *    top device's block sizes and alignment offsets may be adjusted to
+ *    ensure alignment with the bottom device. If no compatible sizes
+ *    and alignments exist, -1 is returned and the resulting top
+ *    queue_limits will have the misaligned flag set to indicate that
+ *    the alignment_offset is undefined.
+ */
+int blk_stack_limits(struct queue_limits *t, struct queue_limits *b,
+		     sector_t start)
+{
+	unsigned int alignment;
+	int ret;
+
+	t->features |= (b->features & BLK_FEAT_INHERIT_MASK);
+	blk_stack_path_limits(t, b);
+
+	t->max_sectors = min_not_zero(t->max_sectors, b->max_sectors);
+	t->max_user_sectors = min_not_zero(t->max_user_sectors,
+			b->max_user_sectors);
+	t->max_user_wzeroes_unmap_sectors =
+			min(t->max_user_wzeroes_unmap_sectors,
+			    b->max_user_wzeroes_unmap_sectors);
+
+	ret = blk_stack_topology_limits(t, b, start);
 
 	/* Discard alignment and granularity */
 	if (b->discard_granularity) {
@@ -911,8 +992,9 @@ int blk_stack_limits(struct queue_limits *t, struct queue_limits *b,
 
 		t->max_discard_sectors = min_not_zero(t->max_discard_sectors,
 						      b->max_discard_sectors);
-		t->max_hw_discard_sectors = min_not_zero(t->max_hw_discard_sectors,
-							 b->max_hw_discard_sectors);
+		t->max_hw_discard_sectors =
+			min_not_zero(t->max_hw_discard_sectors,
+				     b->max_hw_discard_sectors);
 		t->discard_granularity = max(t->discard_granularity,
 					     b->discard_granularity);
 		t->discard_alignment = lcm_not_zero(t->discard_alignment, alignment) %
