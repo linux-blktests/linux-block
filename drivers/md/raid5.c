@@ -7288,6 +7288,9 @@ static ssize_t
 raid5_store_skip_copy(struct mddev *mddev, const char *page, size_t len)
 {
 	struct r5conf *conf;
+	struct request_queue *q = NULL;
+	struct queue_limits lim;
+	struct queue_limits *limp = NULL;
 	unsigned long new;
 	int err;
 
@@ -7297,23 +7300,33 @@ raid5_store_skip_copy(struct mddev *mddev, const char *page, size_t len)
 		return -EINVAL;
 	new = !!new;
 
+	/* q->limits_lock nests outside both, see md_start_sync() */
+	if (!mddev_is_dm(mddev)) {
+		q = mddev->gendisk->queue;
+		lim = queue_limits_start_update(q);
+		limp = &lim;
+	}
+
 	err = mddev_suspend_and_lock(mddev);
-	if (err)
+	if (err) {
+		if (limp)
+			queue_limits_cancel_update(q);
 		return err;
+	}
 	conf = mddev->private;
 	if (!conf)
 		err = -ENODEV;
 	else if (new != conf->skip_copy) {
-		struct request_queue *q = mddev->gendisk->queue;
-		struct queue_limits lim = queue_limits_start_update(q);
-
 		conf->skip_copy = new;
-		if (new)
-			lim.features |= BLK_FEAT_STABLE_WRITES;
-		else
-			lim.features &= ~BLK_FEAT_STABLE_WRITES;
-		err = queue_limits_commit_update(q, &lim);
+		if (limp) {
+			if (new)
+				limp->features |= BLK_FEAT_STABLE_WRITES;
+			else
+				limp->features &= ~BLK_FEAT_STABLE_WRITES;
+		}
 	}
+	if (limp)
+		err = queue_limits_commit_update(q, limp) ?: err;
 	mddev_unlock_and_resume(mddev);
 	return err ?: len;
 }
@@ -7931,7 +7944,8 @@ static int raid5_create_ctx_pool(struct r5conf *conf)
 	return conf->ctx_pool ? 0 : -ENOMEM;
 }
 
-static int raid5_set_limits(struct mddev *mddev)
+static int raid5_set_limits(struct mddev *mddev,
+			    struct queue_limits *caller_lim)
 {
 	struct r5conf *conf = mddev->private;
 	struct queue_limits lim;
@@ -7983,10 +7997,19 @@ static int raid5_set_limits(struct mddev *mddev)
 	/* No restrictions on the number of segments in the request */
 	lim.max_segments = USHRT_MAX;
 
+	/*
+	 * The caller owns an update and commits it itself; taking
+	 * q->limits_lock here would take it a second time.
+	 */
+	if (caller_lim) {
+		*caller_lim = lim;
+		return 0;
+	}
+
 	return queue_limits_set(mddev->gendisk->queue, &lim);
 }
 
-static int raid5_run(struct mddev *mddev)
+static int raid5_run(struct mddev *mddev, struct queue_limits *lim)
 {
 	struct r5conf *conf;
 	int dirty_parity_disks = 0;
@@ -8246,7 +8269,7 @@ static int raid5_run(struct mddev *mddev)
 	md_set_array_sectors(mddev, raid5_size(mddev, 0, 0));
 
 	if (!mddev_is_dm(mddev)) {
-		ret = raid5_set_limits(mddev);
+		ret = raid5_set_limits(mddev, lim);
 		if (ret)
 			goto abort;
 	}
@@ -8441,7 +8464,8 @@ abort:
 	return err;
 }
 
-static int raid5_add_disk(struct mddev *mddev, struct md_rdev *rdev)
+static int raid5_add_disk(struct mddev *mddev, struct md_rdev *rdev,
+			  struct queue_limits *lim)
 {
 	struct r5conf *conf = mddev->private;
 	int ret, err = -EEXIST;
@@ -8728,7 +8752,7 @@ static int raid5_start_reshape(struct mddev *mddev)
 		rdev_for_each(rdev, mddev)
 			if (rdev->raid_disk < 0 &&
 			    !test_bit(Faulty, &rdev->flags)) {
-				if (raid5_add_disk(mddev, rdev) == 0) {
+				if (raid5_add_disk(mddev, rdev, NULL) == 0) {
 					if (rdev->raid_disk
 					    >= conf->previous_raid_disks)
 						set_bit(In_sync, &rdev->flags);
@@ -8799,7 +8823,7 @@ static void end_reshape(struct r5conf *conf)
 		wake_up(&conf->wait_for_reshape);
 
 		mddev_update_io_opt(conf->mddev,
-			conf->raid_disks - conf->max_degraded);
+			conf->raid_disks - conf->max_degraded, NULL);
 	}
 }
 
