@@ -120,14 +120,11 @@ out:
 				   NULL);
 }
 
-int blk_rq_integrity_map_user(struct request *rq, void __user *ubuf,
-			      ssize_t bytes)
+int blk_rq_integrity_map_user(struct request *rq, struct iov_iter *iter)
 {
 	int ret;
-	struct iov_iter iter;
 
-	iov_iter_ubuf(&iter, rq_data_dir(rq), ubuf, bytes);
-	ret = bio_integrity_map_user(rq->bio, &iter);
+	ret = bio_integrity_map_user(rq->bio, iter);
 	if (ret)
 		return ret;
 
