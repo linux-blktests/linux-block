@@ -122,7 +122,60 @@ A simple IO scheduler that provides an example of a minimal ufq scheduler.
 Populates commonly used kernel-exposed BPF interfaces for testing the UFQ
 scheduler framework in the kernel.
 
-### bpftool feature detection (`llvm`, `libcap`, `libbfd`)
+## pfq
+
+Priority Fair Queue (PFQ) is an eBPF I/O scheduler built on the UFQ framework.
+It provides weighted fair scheduling, request merging, and preferential
+service for configured interactive threads.
+
+UFQ handles block-layer integration and request lifecycle management, calling
+PFQ's initialization, insertion, dispatch, and completion callbacks through
+`struct_ops`. PFQ implements the scheduling policy; the userspace loader
+loads the BPF program, configures it, and attaches the callbacks.
+
+### Scheduling policy
+
+Each disk has 96 logical queues, grouped by priority class, priority level,
+and I/O type (read, write, or synchronous write). Requests with the same
+classification share a queue. Scheduling has two levels:
+
+- **Between queues:** a service tree orders queues by virtual time. When
+  selecting a new queue, PFQ chooses the one with the lowest virtual time.
+  Each dispatch increases that queue's virtual time in proportion to the
+  request's sector count divided by the queue's weight. A higher weight
+  therefore gives more service. A queue can dispatch a bounded batch of
+  requests before participating in selection again.
+- **Within a queue:** expired FIFO requests take precedence. Otherwise, PFQ
+  selects candidates by sector position, preferring metadata and shorter seek
+  distances. The sector index also supports adjacent-request merging.
+
+Requests marked `BLK_MQ_INSERT_AT_HEAD` enter a separate list and are
+dispatched before requests in the fair queues.
+
+Configured interactive threads use the SPECIAL class, whose read requests
+receive additional weight. An empty SPECIAL read queue may briefly retain
+its service slot to wait for more requests. Later scheduler callbacks check
+when this idle hold expires.
+
+### Building and running
+
+Use a kernel built with `CONFIG_IOSCHED_UFQ=y`. From this directory, run:
+
+```bash
+$ make pfq
+$ sudo ./build/bin/pfq
+```
+
+Repeat `-i NAME` to configure interactive threads:
+
+```bash
+$ sudo ./build/bin/pfq -i firefox -i code
+```
+
+Names are matched exactly and case-sensitively against the current thread's
+`comm`. Without `-i`, requests use normal I/O priority classification.
+
+## bpftool feature detection (`llvm`, `libcap`, `libbfd`)
 
 While building bpftool, you may see lines similar to:
 
