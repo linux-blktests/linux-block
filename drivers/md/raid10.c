@@ -2095,7 +2095,8 @@ static int raid10_spare_active(struct mddev *mddev)
 	return count;
 }
 
-static int raid10_add_disk(struct mddev *mddev, struct md_rdev *rdev)
+static int raid10_add_disk(struct mddev *mddev, struct md_rdev *rdev,
+			   struct queue_limits *lim)
 {
 	struct r10conf *conf = mddev->private;
 	int err = -EEXIST;
@@ -2130,7 +2131,12 @@ static int raid10_add_disk(struct mddev *mddev, struct md_rdev *rdev)
 			continue;
 		}
 
-		err = mddev_stack_new_rdev(mddev, rdev);
+		if (lim == MDDEV_STACK_SKIP)
+			err = 0;
+		else if (lim)
+			err = mddev_stack_rdev_into(mddev, rdev, lim);
+		else
+			err = mddev_stack_new_rdev(mddev, rdev);
 		if (err)
 			return err;
 		p->head_position = 0;
@@ -2147,7 +2153,12 @@ static int raid10_add_disk(struct mddev *mddev, struct md_rdev *rdev)
 		clear_bit(In_sync, &rdev->flags);
 		set_bit(Replacement, &rdev->flags);
 		rdev->raid_disk = repl_slot;
-		err = mddev_stack_new_rdev(mddev, rdev);
+		if (lim == MDDEV_STACK_SKIP)
+			err = 0;
+		else if (lim)
+			err = mddev_stack_rdev_into(mddev, rdev, lim);
+		else
+			err = mddev_stack_new_rdev(mddev, rdev);
 		if (err)
 			return err;
 		conf->fullsync = 1;
@@ -3919,7 +3930,8 @@ static unsigned int raid10_nr_stripes(struct r10conf *conf)
 	return raid_disks / conf->geo.near_copies;
 }
 
-static int raid10_set_queue_limits(struct mddev *mddev)
+static int raid10_set_queue_limits(struct mddev *mddev,
+				   struct queue_limits *caller_lim)
 {
 	struct r10conf *conf = mddev->private;
 	struct queue_limits lim;
@@ -3937,10 +3949,19 @@ static int raid10_set_queue_limits(struct mddev *mddev)
 	err = mddev_stack_rdev_limits(mddev, &lim, MDDEV_STACK_INTEGRITY);
 	if (err)
 		return err;
+	/*
+	 * The caller owns an update and commits it itself; taking
+	 * q->limits_lock here would take it a second time.
+	 */
+	if (caller_lim) {
+		*caller_lim = lim;
+		return 0;
+	}
+
 	return queue_limits_set(mddev->gendisk->queue, &lim);
 }
 
-static int raid10_run(struct mddev *mddev)
+static int raid10_run(struct mddev *mddev, struct queue_limits *lim)
 {
 	struct r10conf *conf;
 	int i, disk_idx;
@@ -4009,7 +4030,7 @@ static int raid10_run(struct mddev *mddev)
 	}
 
 	if (!mddev_is_dm(conf->mddev)) {
-		int err = raid10_set_queue_limits(mddev);
+		int err = raid10_set_queue_limits(mddev, lim);
 
 		if (err) {
 			ret = err;
@@ -4484,7 +4505,7 @@ out:
 		rdev_for_each(rdev, mddev)
 			if (rdev->raid_disk < 0 &&
 			    !test_bit(Faulty, &rdev->flags)) {
-				if (raid10_add_disk(mddev, rdev) == 0) {
+				if (raid10_add_disk(mddev, rdev, NULL) == 0) {
 					if (rdev->raid_disk >=
 					    conf->prev.raid_disks)
 						set_bit(In_sync, &rdev->flags);
@@ -4921,7 +4942,7 @@ static void end_reshape(struct r10conf *conf)
 	conf->reshape_safe = MaxSector;
 	spin_unlock_irq(&conf->device_lock);
 
-	mddev_update_io_opt(conf->mddev, raid10_nr_stripes(conf));
+	mddev_update_io_opt(conf->mddev, raid10_nr_stripes(conf), NULL);
 	conf->fullsync = 0;
 }
 

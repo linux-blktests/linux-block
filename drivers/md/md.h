@@ -294,6 +294,11 @@ enum flag_bits {
 				 * serial bios.
 				 */
 	Nonrot,			/* non-rotational device (SSD) */
+	HolderLinked,		/* bd_link_disk_holder() succeeded for this
+				 * leg.  The link is made before the array is
+				 * locked, as it takes disk->open_mutex,
+				 * see md_import_new_disk().
+				 */
 };
 
 static inline int is_badblock(struct md_rdev *rdev, sector_t s, sector_t sectors,
@@ -554,6 +559,10 @@ struct mddev {
 	/* used for register new sync thread */
 	struct work_struct sync_work;
 
+	/* deferred io_opt update, see mddev_update_io_opt() */
+	struct work_struct	io_opt_work;
+	unsigned int		io_opt_nr_stripes;
+
 	/* "lock" protects:
 	 *   flush_bio transition from NULL to !NULL
 	 *   rdev superblocks, events
@@ -756,7 +765,12 @@ struct md_personality
 	 * start up works that do NOT require md_thread. tasks that
 	 * requires md_thread should go into start()
 	 */
-	int (*run)(struct mddev *mddev);
+	/*
+	 * @lim: a queue limits update the caller owns, or NULL.  Non-NULL
+	 * means stack into it rather than take q->limits_lock, which has to
+	 * nest outside reconfig_mutex, see md_start_sync().
+	 */
+	int (*run)(struct mddev *mddev, struct queue_limits *lim);
 	/* start up works that require md threads */
 	int (*start)(struct mddev *mddev);
 	void (*free)(struct mddev *mddev, void *priv);
@@ -765,7 +779,8 @@ struct md_personality
 	 * if appropriate, and should abort recovery if needed
 	 */
 	void (*error_handler)(struct mddev *mddev, struct md_rdev *rdev);
-	int (*hot_add_disk) (struct mddev *mddev, struct md_rdev *rdev);
+	int (*hot_add_disk)(struct mddev *mddev, struct md_rdev *rdev,
+			    struct queue_limits *lim);
 	int (*hot_remove_disk) (struct mddev *mddev, struct md_rdev *rdev);
 	int (*spare_active) (struct mddev *mddev);
 	sector_t (*sync_request)(struct mddev *mddev, sector_t sector_nr,
@@ -954,7 +969,7 @@ extern void mddev_destroy(struct mddev *mddev);
 void md_init_stacking_limits(struct queue_limits *lim);
 struct mddev *md_alloc(dev_t dev, char *name);
 void mddev_put(struct mddev *mddev);
-extern int md_run(struct mddev *mddev);
+extern int md_run(struct mddev *mddev, struct queue_limits *lim);
 extern int md_start(struct mddev *mddev);
 extern void md_stop(struct mddev *mddev);
 extern void md_stop_writes(struct mddev *mddev);
@@ -1041,13 +1056,42 @@ struct mdu_disk_info_s;
 extern int mdp_major;
 void md_autostart_arrays(int part);
 int md_set_array_info(struct mddev *mddev, struct mdu_array_info_s *info);
-int md_add_new_disk(struct mddev *mddev, struct mdu_disk_info_s *info);
-int do_md_run(struct mddev *mddev);
+/*
+ * A leg opened before the array was locked, with the mddev fields that
+ * selected the branch and the superblock format.  Opening takes
+ * disk->open_mutex, which must not nest inside reconfig_mutex; the fields
+ * are read unlocked and md_add_new_disk() rechecks them.
+ */
+struct md_new_disk {
+	struct md_rdev *rdev;
+	bool stacks;		/* the add can reach ->hot_add_disk() */
+	bool have_pers;
+	bool have_raid_disks;
+	int persistent;
+	int major_version;
+	int minor_version;
+};
+
+int md_import_new_disk(struct mddev *mddev, struct mdu_disk_info_s *info,
+		       struct md_new_disk *nd);
+void md_put_new_disk(struct mddev *mddev, struct md_new_disk *nd);
+int md_add_new_disk(struct mddev *mddev, struct mdu_disk_info_s *info,
+		    struct md_new_disk *nd, struct queue_limits *lim);
+int do_md_run(struct mddev *mddev, struct queue_limits *lim);
 #define MDDEV_STACK_INTEGRITY	(1u << 0)
 int mddev_stack_rdev_limits(struct mddev *mddev, struct queue_limits *lim,
 		unsigned int flags);
 int mddev_stack_new_rdev(struct mddev *mddev, struct md_rdev *rdev);
-void mddev_update_io_opt(struct mddev *mddev, unsigned int nr_stripes);
+int mddev_stack_rdev_into(struct mddev *mddev, struct md_rdev *rdev,
+			  struct queue_limits *lim);
+/*
+ * Sentinel for the queue_limits argument of ->hot_add_disk().  The caller has
+ * no update to stack into and must not take q->limits_lock itself, so the leg
+ * is added with the array's current limits.
+ */
+#define MDDEV_STACK_SKIP	((struct queue_limits *)ERR_PTR(-EAGAIN))
+void mddev_update_io_opt(struct mddev *mddev, unsigned int nr_stripes,
+			 struct queue_limits *lim);
 
 extern const struct block_device_operations md_fops;
 

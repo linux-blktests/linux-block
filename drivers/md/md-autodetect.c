@@ -126,6 +126,9 @@ static void __init md_setup_drive(struct md_setup_args *args)
 	dev_t devices[MD_SB_DISKS + 1], mdev;
 	struct mdu_array_info_s ainfo = { };
 	struct mddev *mddev;
+	struct request_queue *q = NULL;
+	struct queue_limits lim;
+	struct queue_limits *limp = NULL;
 	int err = 0, i;
 	char name[16];
 
@@ -205,6 +208,7 @@ static void __init md_setup_drive(struct md_setup_args *args)
 			.major	= MAJOR(devices[i]),
 			.minor	= MINOR(devices[i]),
 		};
+		struct md_new_disk nd;
 
 		if (args->level != LEVEL_NONE) {
 			dinfo.number = i;
@@ -213,14 +217,44 @@ static void __init md_setup_drive(struct md_setup_args *args)
 				(1 << MD_DISK_ACTIVE) | (1 << MD_DISK_SYNC);
 		}
 
-		md_add_new_disk(mddev, &dinfo);
+		/*
+		 * Opening a leg takes disk->open_mutex, which must not nest
+		 * inside reconfig_mutex, see md_import_new_disk().  Drop the
+		 * array lock around it; this is __init and the array is not
+		 * reachable yet, so nothing else can touch it in between.
+		 */
+		mddev_unlock(mddev);
+		if (md_import_new_disk(mddev, &dinfo, &nd)) {
+			mddev_lock_nointr(mddev);
+			continue;
+		}
+		mddev_lock_nointr(mddev);
+
+		md_add_new_disk(mddev, &dinfo, &nd, NULL);
+		md_put_new_disk(mddev, &nd);
+	}
+
+	/*
+	 * do_md_run() restacks the array's limits, and q->limits_lock must
+	 * not nest inside reconfig_mutex, so start the update with the array
+	 * unlocked.  This is __init and the array is not reachable yet.
+	 */
+	if (!err && !mddev_is_dm(mddev)) {
+		mddev_unlock(mddev);
+		q = mddev->gendisk->queue;
+		lim = queue_limits_start_update(q);
+		limp = &lim;
+		mddev_lock_nointr(mddev);
 	}
 
 	if (!err)
-		err = do_md_run(mddev);
+		err = do_md_run(mddev, limp);
 	if (err)
 		pr_warn("md: starting %s failed\n", name);
 out_unlock:
+	/* apply the limits before the array takes I/O */
+	if (limp)
+		queue_limits_commit_update(q, limp);
 	mddev_unlock_and_resume(mddev);
 out_mddev_put:
 	mddev_put(mddev);

@@ -3258,7 +3258,7 @@ size_check:
 	/* Keep array frozen until resume. */
 	md_frozen_sync_thread(&rs->md);
 
-	r = md_run(&rs->md);
+	r = md_run(&rs->md, NULL);
 	rs->md.in_sync = 0; /* Assume already marked dirty */
 	if (r) {
 		ti->error = "Failed to run raid array";
@@ -3923,7 +3923,7 @@ static void attempt_restore_of_faulty_devices(struct raid_set *rs)
 			clear_bit(Faulty, &r->flags);
 			clear_bit(WriteErrorSeen, &r->flags);
 
-			if (mddev->pers->hot_add_disk(mddev, r)) {
+			if (mddev->pers->hot_add_disk(mddev, r, NULL)) {
 				/* Failed to revive this device, try next */
 				r->raid_disk = r->saved_raid_disk = -1;
 				r->flags = flags;
