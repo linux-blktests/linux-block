@@ -144,6 +144,23 @@ void nvme_mpath_start_freeze(struct nvme_subsystem *subsys)
 			blk_freeze_queue_start(h->disk->queue);
 }
 
+static struct block_device *nvme_disk_to_part(struct gendisk *disk,
+						u8 partno)
+{
+	/* Quick lookup for whole disk */
+	if (!partno)
+		return disk->part0;
+	return xa_load(&disk->part_tbl, partno);
+}
+
+static struct block_device *nvme_to_disk_part(struct gendisk *disk,
+					struct block_device *bdev)
+{
+	if (!bdev)
+		return disk->part0;
+	return nvme_disk_to_part(disk, bdev_partno(bdev));
+}
+
 void nvme_failover_req(struct request *req)
 {
 	struct nvme_ns *ns = req->q->queuedata;
@@ -165,8 +182,10 @@ void nvme_failover_req(struct request *req)
 	}
 
 	spin_lock_irqsave(&ns->head->requeue_lock, flags);
-	for (bio = req->bio; bio; bio = bio->bi_next)
-		bio_set_dev(bio, ns->head->disk->part0);
+	for (bio = req->bio; bio; bio = bio->bi_next) {
+		bio_set_dev(bio, nvme_to_disk_part(ns->head->disk,
+				bio->bi_bdev));
+	}
 	blk_steal_bios(&ns->head->requeue_list, req);
 	spin_unlock_irqrestore(&ns->head->requeue_lock, flags);
 
@@ -194,8 +213,9 @@ void nvme_mpath_start_request(struct request *rq)
 		return;
 
 	nvme_req(rq)->flags |= NVME_MPATH_IO_STATS;
-	nvme_req(rq)->start_time = bdev_start_io_acct(disk->part0, req_op(rq),
-						      jiffies);
+	nvme_req(rq)->start_time = bdev_start_io_acct(
+			nvme_to_disk_part(disk, rq->part),
+			req_op(rq), jiffies);
 }
 EXPORT_SYMBOL_GPL(nvme_mpath_start_request);
 
@@ -208,7 +228,8 @@ void nvme_mpath_end_request(struct request *rq)
 
 	if (!(nvme_req(rq)->flags & NVME_MPATH_IO_STATS))
 		return;
-	bdev_end_io_acct(ns->head->disk->part0, req_op(rq),
+	bdev_end_io_acct(nvme_to_disk_part(ns->head->disk,
+			 rq->part), req_op(rq),
 			 blk_rq_bytes(rq) >> SECTOR_SHIFT,
 			 nvme_req(rq)->start_time);
 }
@@ -530,11 +551,21 @@ static bool nvme_available_path(struct nvme_ns_head *head)
 	return nvme_mpath_queue_if_no_path(head);
 }
 
+static struct block_device *nvme_find_path_bdev(struct nvme_ns_head *head,
+						u8 partno)
+{
+	struct nvme_ns *ns = nvme_find_path(head);
+
+	if (!ns)
+		return NULL;
+	return nvme_disk_to_part(ns->disk, partno);
+}
+
 static void nvme_ns_head_submit_bio(struct bio *bio)
 {
 	struct nvme_ns_head *head = bio->bi_bdev->bd_disk->private_data;
 	struct device *dev = disk_to_dev(head->disk);
-	struct nvme_ns *ns;
+	struct block_device *bdev;
 	int srcu_idx;
 
 	/*
@@ -547,9 +578,9 @@ static void nvme_ns_head_submit_bio(struct bio *bio)
 		return;
 
 	srcu_idx = srcu_read_lock(&head->srcu);
-	ns = nvme_find_path(head);
-	if (likely(ns)) {
-		bio_set_dev(bio, ns->disk->part0);
+	bdev = nvme_find_path_bdev(head, bdev_partno(bio->bi_bdev));
+	if (likely(bdev)) {
+		bio_set_dev(bio, bdev);
 		/*
 		 * Use BIO_REMAPPED to skip bio_check_eod() when this bio
 		 * enters submit_bio_noacct() for the per-path device. The EOD
@@ -557,7 +588,7 @@ static void nvme_ns_head_submit_bio(struct bio *bio)
 		 */
 		bio_set_flag(bio, BIO_REMAPPED);
 		bio->bi_opf |= REQ_NVME_MPATH;
-		trace_block_bio_remap(bio, disk_devt(ns->head->disk),
+		trace_block_bio_remap(bio, disk_devt(head->disk),
 				      bio->bi_iter.bi_sector);
 		submit_bio_noacct(bio);
 	} else if (nvme_available_path(head)) {
@@ -623,6 +654,23 @@ static int nvme_ns_head_report_zones(struct gendisk *disk, sector_t sector,
 #define nvme_ns_head_report_zones	NULL
 #endif /* CONFIG_BLK_DEV_ZONED */
 
+static void nvme_ns_head_disk_changed(struct gendisk *disk)
+{
+	struct nvme_ns_head *head = disk->private_data;
+	struct nvme_ns *ns;
+	int srcu_idx;
+
+	lockdep_assert_held(&disk->open_mutex);
+
+	srcu_idx = srcu_read_lock(&head->srcu);
+	list_for_each_entry_srcu(ns, &head->list, siblings,
+				 srcu_read_lock_held(&head->srcu)) {
+		if (bdev_clone_partitions(head->disk, ns->disk))
+			clear_bit(NVME_NS_READY, &ns->flags);
+	}
+	srcu_read_unlock(&head->srcu, srcu_idx);
+}
+
 const struct block_device_operations nvme_ns_head_ops = {
 	.owner		= THIS_MODULE,
 	.submit_bio	= nvme_ns_head_submit_bio,
@@ -634,6 +682,7 @@ const struct block_device_operations nvme_ns_head_ops = {
 	.get_unique_id	= nvme_ns_head_get_unique_id,
 	.report_zones	= nvme_ns_head_report_zones,
 	.pr_ops		= &nvme_pr_ops,
+	.disk_changed_notify	= nvme_ns_head_disk_changed,
 };
 
 static const struct file_operations nvme_ns_head_chr_fops = {
@@ -1357,6 +1406,20 @@ void nvme_mpath_remove_sysfs_link(struct nvme_ns *ns)
 
 void nvme_mpath_add_disk(struct nvme_ns *ns, __le32 anagrpid)
 {
+	struct nvme_ns_head *head = ns->head;
+	int ret;
+
+	if (!head->disk)
+		return;
+
+	mutex_lock(&head->disk->open_mutex);
+	ret = bdev_clone_partitions(head->disk, ns->disk);
+	mutex_unlock(&head->disk->open_mutex);
+	if (ret) {
+		clear_bit(NVME_NS_READY, &ns->flags);
+		return;
+	}
+
 	if (nvme_ctrl_use_ana(ns->ctrl)) {
 		struct nvme_ana_group_desc desc = {
 			.grpid = anagrpid,
