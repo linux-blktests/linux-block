@@ -129,6 +129,8 @@ struct ublk_uring_cmd_pdu {
 	union {
 		struct request *req;
 		struct request *req_list;
+		/* links commands claimed by ublk_claim_queue_cmds() */
+		struct io_uring_cmd *next_claimed;
 	};
 
 	/*
@@ -190,6 +192,14 @@ struct ublk_batch_io_data {
 
 /* atomic RW with ubq->cancel_lock */
 #define UBLK_IO_FLAG_CANCELED	0x80000000
+
+/*
+ * Set next to UBLK_IO_FLAG_CANCELED by a cancel which took a command
+ * before io_uring marked it cancelable, the issue path completes the
+ * command then, see ublk_take_canceled_cmd().  Set and cleared under
+ * io->lock.
+ */
+#define UBLK_IO_FLAG_CANCEL_DEFERRED	0x40000000
 
 /*
  * Initialize refcount to a large number to include any registered buffers.
@@ -2409,7 +2419,7 @@ static void ublk_reset_ch_dev(struct ublk_device *ub)
 	for (i = 0; i < ub->dev_info.nr_hw_queues; i++) {
 		struct ublk_queue *ubq = ublk_get_queue(ub, i);
 
-		/* Sync with ublk_cancel_cmd() */
+		/* Sync with ublk_claim_cmd() */
 		spin_lock(&ubq->cancel_lock);
 		ublk_queue_reinit(ub, ubq);
 		spin_unlock(&ubq->cancel_lock);
@@ -2603,6 +2613,16 @@ static void ublk_ch_release_work_fn(struct work_struct *work)
 		}
 	}
 unlock:
+	/*
+	 * A ->force_abort left set here was set against the server which is
+	 * gone, clear it so that ublk_queue_reset_io_flags() does not count
+	 * it against the next one, whose requests ->canceling holds back
+	 * until its queues are ready.  Do it under ub->mutex, under which
+	 * ublk_stop_dev_unlocked() sets the flag and relies on it until
+	 * del_gendisk() returns.
+	 */
+	for (i = 0; i < ub->dev_info.nr_hw_queues; i++)
+		WRITE_ONCE(ublk_get_queue(ub, i)->force_abort, false);
 	mutex_unlock(&ub->mutex);
 	ublk_put_disk(disk);
 
@@ -2730,11 +2750,16 @@ static void ublk_abort_queue(struct ublk_device *ub, struct ublk_queue *ubq)
 		ublk_abort_batch_queue(ub, ubq);
 }
 
-static void ublk_start_cancel(struct ublk_device *ub)
+/*
+ * Returns the disk reference it took.  The caller drops it after
+ * cancel_mutex, the last put ends up in disk_release().
+ */
+static struct gendisk *ublk_start_cancel(struct ublk_device *ub)
+	__must_hold(&ub->cancel_mutex)
 {
+	/* sync with ublk_ctrl_start_dev() publishing the disk */
 	struct gendisk *disk = ublk_get_disk(ub);
 
-	mutex_lock(&ub->cancel_mutex);
 	if (ub->canceling)
 		goto out;
 
@@ -2748,29 +2773,37 @@ static void ublk_start_cancel(struct ublk_device *ub)
 		blk_mq_unquiesce_queue(disk->queue);
 	} else {
 		/*
-		 * Disk not yet allocated by ublk_ctrl_start_dev(), so
-		 * there is no request queue and ublk_queue_rq() cannot
-		 * be running.  Just set the flag; if start_dev proceeds
-		 * later, new I/O will see canceling and be aborted.
+		 * Disk not published by ublk_ctrl_start_dev() or detached
+		 * already, so ublk_queue_rq() cannot be running.  Just set
+		 * the flag, START_DEV fails on canceled commands instead
+		 * of adding a disk on top of them.
 		 */
 		ublk_set_canceling(ub, true);
 	}
 out:
-	mutex_unlock(&ub->cancel_mutex);
-	ublk_put_disk(disk);
+	return disk;
 }
 
-static void ublk_cancel_cmd(struct ublk_queue *ubq, u16 tag,
-		unsigned int issue_flags)
+/*
+ * Mark a fetched command as canceled and take it off the io, the caller
+ * completes it
+ */
+static struct io_uring_cmd *ublk_claim_cmd(struct ublk_queue *ubq, u16 tag)
 {
 	struct ublk_io *io = &ubq->ios[tag];
 	struct ublk_device *ub = ubq->dev;
 	struct io_uring_cmd *cmd = NULL;
 	struct request *req;
-	bool done;
 
+	/*
+	 * ublk_fill_io_cmd() runs under io->lock, so either the io is not
+	 * active yet or its command is in io->cmd.  The request the command
+	 * was committed for is ended after that, check it in here as well, so
+	 * that one seen idle goes with the command fetched for the next one.
+	 */
+	ublk_io_lock(io);
 	if (!(io->flags & UBLK_IO_FLAG_ACTIVE))
-		return;
+		goto unlock;
 
 	/*
 	 * Don't try to cancel this command if the request is started for
@@ -2784,19 +2817,30 @@ static void ublk_cancel_cmd(struct ublk_queue *ubq, u16 tag,
 	 */
 	req = blk_mq_tag_to_rq(ub->tag_set.tags[ubq->q_id], tag);
 	if (req && blk_mq_request_started(req) && req->tag == tag)
-		return;
+		goto unlock;
 
 	spin_lock(&ubq->cancel_lock);
-	done = !!(io->flags & UBLK_IO_FLAG_CANCELED);
-	if (!done) {
+	if (!(io->flags & UBLK_IO_FLAG_CANCELED)) {
 		io->flags |= UBLK_IO_FLAG_CANCELED;
 		cmd = io->cmd;
 		io->cmd = NULL;
+		/*
+		 * The issue path stores the command before ublk_prep_cancel()
+		 * marks it cancelable, and completing it in between would
+		 * leave a completed request on io_uring's list of cancelable
+		 * commands.  Leave the completion to the issue path then, it
+		 * looks for this once the command is marked.
+		 */
+		if (!(READ_ONCE(cmd->flags) & IORING_URING_CMD_CANCELABLE)) {
+			io->flags |= UBLK_IO_FLAG_CANCEL_DEFERRED;
+			cmd = NULL;
+		}
 	}
 	spin_unlock(&ubq->cancel_lock);
+unlock:
+	ublk_io_unlock(io);
 
-	if (!done && cmd)
-		io_uring_cmd_done(cmd, UBLK_IO_RES_ABORT, issue_flags);
+	return cmd;
 }
 
 /*
@@ -2827,23 +2871,45 @@ static void ublk_batch_cancel_cmd(struct ublk_queue *ubq,
 	}
 }
 
-static void ublk_batch_cancel_queue(struct ublk_queue *ubq)
+/*
+ * Move the parked fetch commands of a batch queue to @fcmd_list, for
+ * ublk_batch_complete_fcmds(); the active one is left to its dispatcher.
+ * They stay linked, and the cancel callback of their ring may still take
+ * one off @fcmd_list first: whoever unlinks a command under evts_lock
+ * completes it.
+ */
+static void ublk_batch_claim_fcmds(struct ublk_queue *ubq,
+				   struct list_head *fcmd_list)
 {
 	struct ublk_batch_fetch_cmd *fcmd;
-	LIST_HEAD(fcmd_list);
 
 	spin_lock(&ubq->evts_lock);
 	ubq->force_abort = true;
-	list_splice_init(&ubq->fcmd_head, &fcmd_list);
+	list_splice_init(&ubq->fcmd_head, fcmd_list);
 	fcmd = READ_ONCE(ubq->active_fcmd);
 	if (fcmd)
 		list_move(&fcmd->node, &ubq->fcmd_head);
 	spin_unlock(&ubq->evts_lock);
+}
 
-	while (!list_empty(&fcmd_list)) {
-		fcmd = list_first_entry(&fcmd_list,
-				struct ublk_batch_fetch_cmd, node);
-		ublk_batch_cancel_cmd(ubq, fcmd, IO_URING_F_UNLOCKED);
+static void ublk_batch_complete_fcmds(struct ublk_queue *ubq,
+				      struct list_head *fcmd_list)
+{
+	struct ublk_batch_fetch_cmd *fcmd;
+
+	for (;;) {
+		spin_lock(&ubq->evts_lock);
+		fcmd = list_first_entry_or_null(fcmd_list,
+						struct ublk_batch_fetch_cmd, node);
+		if (fcmd)
+			list_del_init(&fcmd->node);
+		spin_unlock(&ubq->evts_lock);
+		if (!fcmd)
+			break;
+
+		io_uring_cmd_done(fcmd->cmd, UBLK_IO_RES_ABORT,
+				  IO_URING_F_UNLOCKED);
+		ublk_batch_free_fcmd(fcmd);
 	}
 }
 
@@ -2853,8 +2919,13 @@ static void ublk_batch_cancel_fn(struct io_uring_cmd *cmd,
 	struct ublk_uring_cmd_pdu *pdu = ublk_get_uring_cmd_pdu(cmd);
 	struct ublk_batch_fetch_cmd *fcmd = pdu->fcmd;
 	struct ublk_queue *ubq = pdu->ubq;
+	struct ublk_device *ub = ubq->dev;
+	struct gendisk *disk;
 
-	ublk_start_cancel(ubq->dev);
+	mutex_lock(&ub->cancel_mutex);
+	disk = ublk_start_cancel(ub);
+	mutex_unlock(&ub->cancel_mutex);
+	ublk_put_disk(disk);
 
 	ublk_batch_cancel_cmd(ubq, fcmd, issue_flags);
 }
@@ -2879,7 +2950,10 @@ static void ublk_uring_cmd_cancel_fn(struct io_uring_cmd *cmd,
 {
 	struct ublk_uring_cmd_pdu *pdu = ublk_get_uring_cmd_pdu(cmd);
 	struct ublk_queue *ubq = pdu->ubq;
+	struct io_uring_cmd *claimed;
 	struct task_struct *task;
+	struct ublk_device *ub;
+	struct gendisk *disk;
 	struct ublk_io *io;
 
 	if (WARN_ON_ONCE(!ubq))
@@ -2888,15 +2962,28 @@ static void ublk_uring_cmd_cancel_fn(struct io_uring_cmd *cmd,
 	if (WARN_ON_ONCE(pdu->tag >= ubq->q_depth))
 		return;
 
+	ub = ubq->dev;
 	task = io_uring_cmd_get_task(cmd);
 	io = &ubq->ios[pdu->tag];
 	if (WARN_ON_ONCE(task && task != io->task))
 		return;
 
-	ublk_start_cancel(ubq->dev);
+	/*
+	 * Mark the queues and the command in one cancel_mutex section, so
+	 * that a queue getting ready meantime either finds the command
+	 * canceled or clears ->canceling first and gets marked again here.
+	 * Complete it outside, ublk_claim_cmd()'s other callers have to.
+	 */
+	mutex_lock(&ub->cancel_mutex);
+	disk = ublk_start_cancel(ub);
+	/* ublk_stop_dev() may have claimed the command already */
+	WARN_ON_ONCE(io->cmd && io->cmd != cmd);
+	claimed = ublk_claim_cmd(ubq, pdu->tag);
+	mutex_unlock(&ub->cancel_mutex);
+	ublk_put_disk(disk);
 
-	WARN_ON_ONCE(io->cmd != cmd);
-	ublk_cancel_cmd(ubq, pdu->tag, issue_flags);
+	if (claimed)
+		io_uring_cmd_done(claimed, UBLK_IO_RES_ABORT, issue_flags);
 }
 
 static inline bool ublk_queue_ready(const struct ublk_queue *ubq)
@@ -2909,20 +2996,75 @@ static inline bool ublk_dev_ready(const struct ublk_device *ub)
 	return ub->nr_queue_ready == ub->dev_info.nr_hw_queues;
 }
 
-static void ublk_cancel_queue(struct ublk_queue *ubq)
+/*
+ * Claim the fetched commands of a queue and link them for completion
+ * outside of cancel_mutex.  A batch queue keeps its commands on the fetch
+ * command list, mark it the way ublk_batch_claim_fcmds() does instead.
+ */
+static struct io_uring_cmd *ublk_claim_queue_cmds(struct ublk_queue *ubq,
+						  struct io_uring_cmd *claimed)
+	__must_hold(&ubq->dev->cancel_mutex)
 {
-	u16 i;
+	u16 tag;
 
 	if (ublk_support_batch_io(ubq)) {
-		ublk_batch_cancel_queue(ubq);
-		return;
+		spin_lock(&ubq->evts_lock);
+		ubq->force_abort = true;
+		spin_unlock(&ubq->evts_lock);
+		return claimed;
 	}
 
-	for (i = 0; i < ubq->q_depth; i++)
-		ublk_cancel_cmd(ubq, i, IO_URING_F_UNLOCKED);
+	for (tag = 0; tag < ubq->q_depth; tag++) {
+		struct io_uring_cmd *cmd = ublk_claim_cmd(ubq, tag);
+
+		if (cmd) {
+			ublk_get_uring_cmd_pdu(cmd)->next_claimed = claimed;
+			claimed = cmd;
+		}
+	}
+	return claimed;
 }
 
-/* Cancel all pending commands, must be called after del_gendisk() returns */
+static void ublk_complete_claimed_cmds(struct io_uring_cmd *cmd)
+{
+	while (cmd) {
+		struct io_uring_cmd *next =
+			ublk_get_uring_cmd_pdu(cmd)->next_claimed;
+
+		io_uring_cmd_done(cmd, UBLK_IO_RES_ABORT, IO_URING_F_UNLOCKED);
+		cmd = next;
+	}
+}
+
+static void ublk_cancel_queue(struct ublk_queue *ubq)
+{
+	struct ublk_device *ub = ubq->dev;
+	struct io_uring_cmd *claimed = NULL;
+	LIST_HEAD(fcmds);
+
+	/*
+	 * A queue which is not canceling any more was made ready by a new
+	 * server after the marking, leave it alone.  Decide that in the
+	 * cancel_mutex section which takes the commands, the fetch commands
+	 * of a batch queue too, and complete them after it.
+	 */
+	mutex_lock(&ub->cancel_mutex);
+	if (ubq->canceling) {
+		claimed = ublk_claim_queue_cmds(ubq, NULL);
+		if (ublk_support_batch_io(ubq))
+			ublk_batch_claim_fcmds(ubq, &fcmds);
+	}
+	mutex_unlock(&ub->cancel_mutex);
+	ublk_complete_claimed_cmds(claimed);
+	if (ublk_support_batch_io(ubq))
+		ublk_batch_complete_fcmds(ubq, &fcmds);
+}
+
+/*
+ * Complete the fetched commands of every queue which is still canceling,
+ * ublk_queue_rq() must not be able to dispatch to them: either
+ * del_gendisk() has returned or ->canceling is visible to it
+ */
 static void ublk_cancel_dev(struct ublk_device *ub)
 {
 	u16 i;
@@ -3008,34 +3150,80 @@ static void ublk_stop_dev_unlocked(struct ublk_device *ub)
 
 static void ublk_stop_dev(struct ublk_device *ub)
 {
+	struct io_uring_cmd *claimed = NULL;
+	u16 i;
+
 	mutex_lock(&ub->mutex);
 	ublk_stop_dev_unlocked(ub);
-	mutex_unlock(&ub->mutex);
+	/*
+	 * No disk is attached any more, ublk_queue_rq() can't be running and
+	 * nothing needs to be quiesced, but START_DEV may take ub->mutex as
+	 * soon as it is dropped.  Mark the queues and the commands before
+	 * that, so that a queue getting ready meantime stays canceling and
+	 * such a start sees it.
+	 */
+	mutex_lock(&ub->cancel_mutex);
+	ublk_set_canceling(ub, true);
+	for (i = 0; i < ub->dev_info.nr_hw_queues; i++)
+		claimed = ublk_claim_queue_cmds(ublk_get_queue(ub, i), claimed);
+	mutex_unlock(&ub->cancel_mutex);
+	/*
+	 * The disk is deleted already, so a partition scan work still
+	 * pending or running only finds it gone, and it is fine to wait for
+	 * it here.  Do that before START_DEV can add a new disk and schedule
+	 * a scan for it, which must not be canceled.
+	 */
 	cancel_work_sync(&ub->partition_scan_work);
+	mutex_unlock(&ub->mutex);
+	ublk_complete_claimed_cmds(claimed);
 	ublk_cancel_dev(ub);
 }
 
-static void ublk_reset_io_flags(struct ublk_queue *ubq, struct ublk_io *io)
+static bool ublk_queue_has_canceled_io(const struct ublk_queue *ubq)
+	__must_hold(&ubq->cancel_lock)
 {
-	/* UBLK_IO_FLAG_CANCELED can be cleared now */
-	spin_lock(&ubq->cancel_lock);
-	io->flags &= ~UBLK_IO_FLAG_CANCELED;
-	spin_unlock(&ubq->cancel_lock);
+	u16 i;
+
+	/*
+	 * The ios of a UBLK_F_BATCH_IO queue are not canceled one by one,
+	 * canceling the queue sets ->force_abort instead.
+	 * ublk_ch_release_work_fn() clears the flag when a server goes away,
+	 * so one seen here was not left behind by an earlier server.
+	 */
+	if (ublk_support_batch_io(ubq))
+		return READ_ONCE(ubq->force_abort);
+
+	for (i = 0; i < ubq->q_depth; i++) {
+		if (ubq->ios[i].flags & UBLK_IO_FLAG_CANCELED)
+			return true;
+	}
+	return false;
 }
 
 /* reset per-queue io flags */
 static void ublk_queue_reset_io_flags(struct ublk_queue *ubq)
 {
+	struct ublk_device *ub = ubq->dev;
+
+	mutex_lock(&ub->cancel_mutex);
 	spin_lock(&ubq->cancel_lock);
-	ubq->canceling = false;
+	/*
+	 * A command canceled after being fetched is still counted as ready
+	 * but can't take requests, so the queue has to stay canceling.
+	 */
+	if (!ublk_queue_has_canceled_io(ubq)) {
+		ubq->canceling = false;
+		/* not every queue is marked now, let the next cancel redo it */
+		ub->canceling = false;
+	}
 	spin_unlock(&ubq->cancel_lock);
+	mutex_unlock(&ub->cancel_mutex);
 	ubq->fail_io = false;
 	ubq->force_abort = false;
 }
 
 /* device can only be started after all IOs are ready */
-static void ublk_mark_io_ready(struct ublk_device *ub, u16 q_id,
-	struct ublk_io *io)
+static void ublk_mark_io_ready(struct ublk_device *ub, u16 q_id)
 	__must_hold(&ub->mutex)
 {
 	struct ublk_queue *ubq = ublk_get_queue(ub, q_id);
@@ -3044,7 +3232,6 @@ static void ublk_mark_io_ready(struct ublk_device *ub, u16 q_id,
 		ub->unprivileged_daemons = true;
 
 	ubq->nr_io_ready++;
-	ublk_reset_io_flags(ubq, io);
 
 	/* Check if this specific queue is now fully ready */
 	if (ublk_queue_ready(ubq)) {
@@ -3058,17 +3245,9 @@ static void ublk_mark_io_ready(struct ublk_device *ub, u16 q_id,
 		ublk_queue_reset_io_flags(ubq);
 	}
 
-	/* Check if all queues are ready */
-	if (ublk_dev_ready(ub)) {
-		/*
-		 * All queues ready - clear device-level canceling flag
-		 * and wake ublk_dev_ready() waiters.
-		 */
-		mutex_lock(&ub->cancel_mutex);
-		ub->canceling = false;
-		mutex_unlock(&ub->cancel_mutex);
+	/* All queues ready - wake ublk_dev_ready() waiters */
+	if (ublk_dev_ready(ub))
 		wake_up_var(&ub->nr_queue_ready);
-	}
 }
 
 static inline int ublk_check_cmd_op(u32 cmd_op)
@@ -3144,6 +3323,9 @@ ublk_fill_io_cmd(struct ublk_io *io, struct io_uring_cmd *cmd)
 {
 	struct request *req = io->req;
 
+	/* io->cmd shares its storage with io->req, switch them under io->lock */
+	lockdep_assert_held(&io->lock);
+
 	io->cmd = cmd;
 	io->flags |= UBLK_IO_FLAG_ACTIVE;
 	/* now this cmd slot is owned by ublk driver */
@@ -3165,6 +3347,24 @@ static inline void ublk_prep_cancel(struct io_uring_cmd *cmd,
 	pdu->ubq = ubq;
 	pdu->tag = tag;
 	io_uring_cmd_mark_cancelable(cmd, issue_flags);
+}
+
+/*
+ * Called by the issue path after ublk_prep_cancel(): a cancel which found
+ * the command before it was marked took it off the io and left completing
+ * it here.  io->lock orders this against ublk_claim_cmd(), which sees the
+ * marking if it runs after this, and completes the command itself then.
+ */
+static bool ublk_take_canceled_cmd(struct ublk_io *io)
+{
+	bool canceled;
+
+	ublk_io_lock(io);
+	canceled = io->flags & UBLK_IO_FLAG_CANCEL_DEFERRED;
+	io->flags &= ~UBLK_IO_FLAG_CANCEL_DEFERRED;
+	ublk_io_unlock(io);
+
+	return canceled;
 }
 
 static void ublk_io_release(void *priv)
@@ -3269,6 +3469,8 @@ static int ublk_check_fetch_buf(const struct ublk_device *ub, __u64 buf_addr)
 static int __ublk_fetch(struct io_uring_cmd *cmd, struct ublk_device *ub,
 			struct ublk_io *io, u16 q_id)
 {
+	struct ublk_queue *ubq = ublk_get_queue(ub, q_id);
+
 	/* UBLK_IO_FETCH_REQ is only allowed before dev is setup */
 	if (ublk_dev_ready(ub))
 		return -EBUSY;
@@ -3279,7 +3481,16 @@ static int __ublk_fetch(struct io_uring_cmd *cmd, struct ublk_device *ub,
 
 	WARN_ON_ONCE(io->flags & UBLK_IO_FLAG_OWNED_BY_SRV);
 
+	/*
+	 * ublk_cancel_dev() runs without ub->mutex, publish the command under
+	 * cancel_lock so that a cancel either misses the io or finds it whole,
+	 * and drop a stale UBLK_IO_FLAG_CANCELED in the same section first so
+	 * that one set from now on stays.
+	 */
+	spin_lock(&ubq->cancel_lock);
+	io->flags &= ~UBLK_IO_FLAG_CANCELED;
 	ublk_fill_io_cmd(io, cmd);
+	spin_unlock(&ubq->cancel_lock);
 
 	if (ublk_dev_support_batch_io(ub))
 		WRITE_ONCE(io->task, NULL);
@@ -3302,11 +3513,14 @@ static int ublk_fetch(struct io_uring_cmd *cmd, struct ublk_device *ub,
 	 */
 	mutex_lock(&ub->mutex);
 	ret = ublk_validate_io_buf(ub, cmd, &auto_buf);
-	if (!ret)
+	if (!ret) {
+		ublk_io_lock(io);
 		ret = __ublk_fetch(cmd, ub, io, q_id);
+		ublk_io_unlock(io);
+	}
 	if (!ret) {
 		ublk_apply_io_buf(ub, io, cmd, buf_addr, &auto_buf, NULL);
-		ublk_mark_io_ready(ub, q_id, io);
+		ublk_mark_io_ready(ub, q_id);
 	}
 	mutex_unlock(&ub->mutex);
 	return ret;
@@ -3417,6 +3631,8 @@ static int ublk_ch_uring_cmd_local(struct io_uring_cmd *cmd,
 			goto out;
 
 		ublk_prep_cancel(cmd, issue_flags, ubq, tag);
+		if (ublk_take_canceled_cmd(io))
+			io_uring_cmd_done(cmd, UBLK_IO_RES_ABORT, issue_flags);
 		return -EIOCBQUEUED;
 	}
 
@@ -3460,7 +3676,9 @@ static int ublk_ch_uring_cmd_local(struct io_uring_cmd *cmd,
 		if (ret)
 			goto out;
 		io->res = result;
+		ublk_io_lock(io);
 		req = ublk_fill_io_cmd(io, cmd);
+		ublk_io_unlock(io);
 		ublk_apply_io_buf(ub, io, cmd, addr, &auto_buf, &buf_idx);
 		if (buf_idx != UBLK_INVALID_BUF_IDX)
 			io_buffer_unregister(cmd, buf_idx, issue_flags);
@@ -3478,7 +3696,9 @@ static int ublk_ch_uring_cmd_local(struct io_uring_cmd *cmd,
 		 * uring_cmd active first and prepare for handling new requeued
 		 * request
 		 */
+		ublk_io_lock(io);
 		req = ublk_fill_io_cmd(io, cmd);
+		ublk_io_unlock(io);
 		io->buf.addr = addr;
 		if (likely(ublk_get_data(ubq, io, req))) {
 			__ublk_prep_compl_io_cmd(io, req);
@@ -3489,6 +3709,8 @@ static int ublk_ch_uring_cmd_local(struct io_uring_cmd *cmd,
 		goto out;
 	}
 	ublk_prep_cancel(cmd, issue_flags, ubq, tag);
+	if (ublk_take_canceled_cmd(io))
+		io_uring_cmd_done(cmd, UBLK_IO_RES_ABORT, issue_flags);
 	return -EIOCBQUEUED;
 
  out:
@@ -3723,7 +3945,7 @@ static int ublk_batch_prep_io(struct ublk_queue *ubq,
 	ublk_io_unlock(io);
 
 	if (!ret)
-		ublk_mark_io_ready(data->ub, ubq->q_id, io);
+		ublk_mark_io_ready(data->ub, ubq->q_id);
 
 	return ret;
 }
@@ -4432,10 +4654,34 @@ static bool ublk_validate_user_pid(struct ublk_device *ub, pid_t ublksrv_pid)
 }
 
 /*
+ * The commands canceled by ublk_claim_cmd() can't be fetched again
+ * before the queues are reinitialized, so a ready device must not go live
+ * while a queue is canceling or holds a command canceled after the fetch.
+ */
+static bool ublk_dev_cmds_canceled(struct ublk_device *ub)
+	__must_hold(&ub->cancel_mutex)
+{
+	u16 i;
+
+	for (i = 0; i < ub->dev_info.nr_hw_queues; i++) {
+		struct ublk_queue *ubq = ublk_get_queue(ub, i);
+		bool canceled;
+
+		spin_lock(&ubq->cancel_lock);
+		canceled = ubq->canceling || ublk_queue_has_canceled_io(ubq);
+		spin_unlock(&ubq->cancel_lock);
+		if (canceled)
+			return true;
+	}
+	return false;
+}
+
+/*
  * Wait until all queues have fetched their I/O commands, and return with
- * ub->mutex held and readiness guaranteed: then every queue's ->canceling
- * is cleared. Ready may regress between wakeup and mutex_lock() (F_BATCH
- * UNPREP, daemon death), so re-check it under the mutex and wait again.
+ * ub->mutex held and readiness guaranteed. Ready may regress between wakeup
+ * and mutex_lock() (F_BATCH UNPREP, daemon death), so re-check it under the
+ * mutex and wait again. The commands may still get canceled after being
+ * fetched, callers check ublk_dev_cmds_canceled().
  */
 static int ublk_wait_dev_ready_and_lock(struct ublk_device *ub)
 {
@@ -4470,6 +4716,7 @@ static int ublk_ctrl_start_dev(struct ublk_device *ub,
 	};
 	struct gendisk *disk;
 	int ret = -EINVAL;
+	bool canceled;
 
 	if (ublksrv_pid <= 0)
 		return -EINVAL;
@@ -4555,8 +4802,20 @@ static int ublk_ctrl_start_dev(struct ublk_device *ub,
 	disk->fops = &ub_fops;
 	disk->private_data = ub;
 
+	/*
+	 * Check and publish under cancel_mutex, so either the canceled
+	 * commands are seen here or ublk_start_cancel() sees the disk.
+	 */
+	mutex_lock(&ub->cancel_mutex);
+	canceled = ublk_dev_cmds_canceled(ub);
+	if (!canceled)
+		ub->ub_disk = disk;
+	mutex_unlock(&ub->cancel_mutex);
+	if (canceled) {
+		ret = -ENODEV;
+		goto out_put_disk;
+	}
 	ub->dev_info.ublksrv_pid = ub->ublksrv_tgid;
-	ub->ub_disk = disk;
 
 	ublk_apply_params(ub);
 
@@ -4603,6 +4862,7 @@ out_put_cdev:
 		ublk_detach_disk(ub);
 		ublk_put_device(ub);
 	}
+out_put_disk:
 	if (ret)
 		put_disk(disk);
 out_unlock:
@@ -5129,6 +5389,7 @@ static int ublk_ctrl_end_recovery(struct ublk_device *ub,
 {
 	int ublksrv_pid = (int)header->data[0];
 	int ret = -EINVAL;
+	bool canceled;
 
 	pr_devel("%s: Waiting for all FETCH_REQs, dev id %d...\n", __func__,
 		 header->dev_id);
@@ -5149,6 +5410,13 @@ static int ublk_ctrl_end_recovery(struct ublk_device *ub,
 
 	if (!ublk_dev_in_recoverable_state(ub)) {
 		ret = -EBUSY;
+		goto out_unlock;
+	}
+	mutex_lock(&ub->cancel_mutex);
+	canceled = ublk_dev_cmds_canceled(ub);
+	mutex_unlock(&ub->cancel_mutex);
+	if (canceled) {
+		ret = -ENODEV;
 		goto out_unlock;
 	}
 	ub->dev_info.ublksrv_pid = ub->ublksrv_tgid;
