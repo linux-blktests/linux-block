@@ -4272,6 +4272,10 @@ static void sd_remove(struct scsi_device *sdp)
 
 	scsi_autopm_get_device(sdkp->device);
 
+	/* Device is gone; avoid sync_filesystem() hang in del_gendisk(). */
+	if (sdkp->device->host->surprise_removal)
+		blk_mark_disk_dead(sdkp->disk);
+
 	device_del(&sdkp->disk_dev);
 	del_gendisk(sdkp->disk);
 	if (!sdkp->suspended)
