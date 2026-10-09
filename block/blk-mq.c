@@ -4989,6 +4989,10 @@ int blk_mq_alloc_tag_set(struct blk_mq_tag_set *set)
 
 	mutex_init(&set->tag_list_lock);
 	INIT_LIST_HEAD(&set->tag_list);
+#ifdef CONFIG_BLK_DEBUG_FS
+	set->debugfs_id = -1;
+#endif
+	blk_mq_tagset_debugfs_register(set);
 
 	return 0;
 
@@ -5033,6 +5037,8 @@ EXPORT_SYMBOL_GPL(blk_mq_alloc_sq_tag_set);
 void blk_mq_free_tag_set(struct blk_mq_tag_set *set)
 {
 	int i, j;
+
+	blk_mq_tagset_debugfs_unregister(set);
 
 	for (i = 0; i < set->nr_hw_queues; i++)
 		__blk_mq_free_map_and_rqs(set, i);
@@ -5218,6 +5224,7 @@ static void __blk_mq_update_nr_hw_queues(struct blk_mq_tag_set *set,
 		blk_mq_debugfs_unregister_hctxs(q);
 		blk_mq_sysfs_unregister_hctxs(q);
 	}
+	blk_mq_tagset_debugfs_remove_tags(set);
 
 	/*
 	 * Switch IO scheduler to 'none', cleaning up the data associated
@@ -5278,6 +5285,7 @@ switch_back:
 		blk_mq_remove_hw_queues_cpuhp(q);
 		blk_mq_add_hw_queues_cpuhp(q);
 	}
+	blk_mq_tagset_debugfs_create_tags(set);
 
 out_free_ctx:
 	blk_mq_free_sched_ctx_batch(&elv_tbl);
