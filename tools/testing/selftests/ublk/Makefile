@@ -1,6 +1,6 @@
 # SPDX-License-Identifier: GPL-2.0
 
-CFLAGS += -O3 -Wl,-no-as-needed -Wall -I $(top_srcdir)/usr/include
+CFLAGS += -O3 -Wl,-no-as-needed -Wall $(KHDR_INCLUDES)
 ifneq ($(WERROR),0)
 	CFLAGS += -Werror
 endif
@@ -83,6 +83,7 @@ LOCAL_HDRS += $(wildcard *.h)
 include ../lib.mk
 
 $(OUTPUT)/kublk: $(filter-out $(STANDALONE_UTILS),$(wildcard *.c))
+$(TEST_GEN_PROGS_EXTENDED): | headers
 
 check:
 	shellcheck -x -f gcc *.sh
