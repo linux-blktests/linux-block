@@ -1810,8 +1810,9 @@ static int recv_dless_read(struct drbd_peer_device *peer_device, struct drbd_req
 		data_size -= digest_size;
 	}
 
-	if (data_size < 0) {
-		drbd_err(peer_device, "Invalid data reply size\n");
+	if (data_size < 0 || data_size != req->i.size) {
+		drbd_err(peer_device, "Invalid data reply size %d, expected %u\n",
+			 data_size, req->i.size);
 		return -EIO;
 	}
 
