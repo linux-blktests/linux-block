@@ -584,7 +584,7 @@ static int elevator_switch(struct request_queue *q, struct elv_change_ctx *ctx)
 	if (new_e) {
 		ret = blk_mq_init_sched(q, new_e, &ctx->res);
 		if (ret)
-			goto out_unfreeze;
+			goto out_unquiesce;
 		ctx->new = q->elevator;
 	} else {
 		blk_queue_flag_clear(QUEUE_FLAG_SQ_SCHED, q);
@@ -594,7 +594,7 @@ static int elevator_switch(struct request_queue *q, struct elv_change_ctx *ctx)
 	}
 	blk_add_trace_msg(q, "elv switch: %s", ctx->name);
 
-out_unfreeze:
+out_unquiesce:
 	if (!ctx->no_quiesce)
 		blk_mq_unquiesce_queue(q);
 
