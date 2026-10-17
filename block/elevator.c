@@ -573,7 +573,8 @@ static int elevator_switch(struct request_queue *q, struct elv_change_ctx *ctx)
 			return -EINVAL;
 	}
 
-	blk_mq_quiesce_queue(q);
+	if (!ctx->no_quiesce)
+		blk_mq_quiesce_queue(q);
 
 	if (q->elevator) {
 		ctx->old = q->elevator;
@@ -583,7 +584,7 @@ static int elevator_switch(struct request_queue *q, struct elv_change_ctx *ctx)
 	if (new_e) {
 		ret = blk_mq_init_sched(q, new_e, &ctx->res);
 		if (ret)
-			goto out_unfreeze;
+			goto out_unquiesce;
 		ctx->new = q->elevator;
 	} else {
 		blk_queue_flag_clear(QUEUE_FLAG_SQ_SCHED, q);
@@ -593,8 +594,9 @@ static int elevator_switch(struct request_queue *q, struct elv_change_ctx *ctx)
 	}
 	blk_add_trace_msg(q, "elv switch: %s", ctx->name);
 
-out_unfreeze:
-	blk_mq_unquiesce_queue(q);
+out_unquiesce:
+	if (!ctx->no_quiesce)
+		blk_mq_unquiesce_queue(q);
 
 	if (ret) {
 		pr_warn("elv: switch to \"%s\" failed, falling back to \"none\"\n",
@@ -731,6 +733,7 @@ void elevator_set_default(struct request_queue *q)
 	struct elv_change_ctx ctx = {
 		.name = "mq-deadline",
 		.no_uevent = true,
+		.no_quiesce = true,
 	};
 	int err;
 
