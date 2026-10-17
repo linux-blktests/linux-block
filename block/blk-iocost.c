@@ -472,8 +472,8 @@ struct ioc_gq {
 	 *
 	 * When an idle cgroup becomes active its `active` goes from 0 to
 	 * `weight`.  `inuse` is the surplus adjusted active weight.
-	 * `active` and `inuse` are used to calculate `hweight_active` and
-	 * `hweight_inuse`.
+	 * `active` and `inuse` determine the hierarchical weights cached in
+	 * `hweight_cache`.
 	 *
 	 * `last_inuse` remembers `inuse` while an iocg is idle to persist
 	 * surplus adjustments.
@@ -520,7 +520,9 @@ struct ioc_gq {
 	u64				child_active_sum;
 	u64				child_inuse_sum;
 	u64				child_adjusted_sum;
-	int				hweight_gen;
+	/* Generation in bits 63:32; active - 1 and inuse - 1 in 31:16/15:0. */
+	atomic64_t			hweight_cache;
+	/* Donation workspace, protected by ioc->lock. */
 	u32				hweight_active;
 	u32				hweight_inuse;
 	u32				hweight_donating;
@@ -1154,13 +1156,17 @@ static void current_hweight(struct ioc_gq *iocg, u32 *hw_activep, u32 *hw_inusep
 {
 	struct ioc *ioc = iocg->ioc;
 	int lvl;
-	u32 hwa, hwi;
-	int ioc_gen;
+	u32 hwa, hwi, ioc_gen;
+	u64 cache;
 
-	/* hot path - if uptodate, use cached */
-	ioc_gen = atomic_read(&ioc->hweight_gen);
-	if (ioc_gen == iocg->hweight_gen)
+	/* Read the generation and both weights as one atomic snapshot. */
+	ioc_gen = (u32)atomic_read(&ioc->hweight_gen);
+	cache = (u64)atomic64_read(&iocg->hweight_cache);
+	if ((u32)(cache >> 32) == ioc_gen) {
+		hwa = ((cache >> 16) & (WEIGHT_ONE - 1)) + 1;
+		hwi = (cache & (WEIGHT_ONE - 1)) + 1;
 		goto out;
+	}
 
 	/*
 	 * Paired with wmb in commit_weights(). If we saw the updated
@@ -1194,14 +1200,22 @@ static void current_hweight(struct ioc_gq *iocg, u32 *hw_activep, u32 *hw_inusep
 		hwi = div64_u64((u64)hwi * inuse, inuse_sum);
 	}
 
-	iocg->hweight_active = max_t(u32, hwa, 1);
-	iocg->hweight_inuse = max_t(u32, hwi, 1);
-	iocg->hweight_gen = ioc_gen;
+	hwa = max_t(u32, hwa, 1);
+	hwi = max_t(u32, hwi, 1);
+	/*
+	 * Each weight is in [1, WEIGHT_ONE]. Subtracting one preserves its
+	 * full range in 16 bits, leaving 32 bits for the generation. An
+	 * interrupt or another CPU can only observe a complete snapshot.
+	 * A late refresher may overwrite a newer cache, but its generation
+	 * stays paired with its own weights and forces a future refresh.
+	 */
+	cache = ((u64)ioc_gen << 32) | ((u64)(hwa - 1) << 16) | (hwi - 1);
+	atomic64_set(&iocg->hweight_cache, (s64)cache);
 out:
 	if (hw_activep)
-		*hw_activep = iocg->hweight_active;
+		*hw_activep = hwa;
 	if (hw_inusep)
-		*hw_inusep = iocg->hweight_inuse;
+		*hw_inusep = hwi;
 }
 
 /*
@@ -1300,10 +1314,12 @@ static bool iocg_activate(struct ioc_gq *iocg, struct ioc_now *now)
 
 	/*
 	 * Activate, propagate weight and start period timer if not
-	 * running.  Reset hweight_gen to avoid accidental match from
-	 * wrapping.
+	 * running. Invalidate the cached generation to avoid accidental match
+	 * from wrapping.
 	 */
-	iocg->hweight_gen = atomic_read(&ioc->hweight_gen) - 1;
+	atomic64_set(&iocg->hweight_cache,
+		     ((u64)(u32)(atomic_read(&ioc->hweight_gen) - 1) << 32) |
+		     (u32)atomic64_read(&iocg->hweight_cache));
 	list_add(&iocg->active_list, &ioc->active_iocgs);
 
 	propagate_weights(iocg, iocg->weight,
@@ -1863,7 +1879,7 @@ static void transfer_surpluses(struct list_head *surpluses, struct ioc_now *now)
 	list_for_each_entry(iocg, surpluses, surplus_list) {
 		u32 hwa;
 
-		current_hweight(iocg, &hwa, NULL);
+		current_hweight(iocg, &hwa, &iocg->hweight_inuse);
 		after_sum += iocg->hweight_after_donation;
 
 		if (iocg->hweight_after_donation > hwa) {
@@ -1946,8 +1962,10 @@ static void transfer_surpluses(struct list_head *surpluses, struct ioc_now *now)
 
 		iocg->hweight_donating = min(iocg->hweight_donating,
 					     iocg->hweight_active);
-		iocg->hweight_after_donation = min(iocg->hweight_after_donation,
-						   iocg->hweight_donating - 1);
+		if (iocg->hweight_donating > 1)
+			iocg->hweight_after_donation =
+				min(iocg->hweight_after_donation,
+				    iocg->hweight_donating - 1);
 		if (WARN_ON_ONCE(iocg->hweight_active <= 1 ||
 				 iocg->hweight_donating <= 1 ||
 				 iocg->hweight_after_donation == 0)) {
@@ -1956,6 +1974,7 @@ static void transfer_surpluses(struct list_head *surpluses, struct ioc_now *now)
 			pr_cont(": active=%u donating=%u after=%u\n",
 				iocg->hweight_active, iocg->hweight_donating,
 				iocg->hweight_after_donation);
+			goto out;
 		}
 	}
 
@@ -2054,6 +2073,7 @@ static void transfer_surpluses(struct list_head *surpluses, struct ioc_now *now)
 		__propagate_weights(iocg, iocg->active, inuse, true, now);
 	}
 
+out:
 	/* walk list should be dissolved after use */
 	list_for_each_entry_safe(iocg, tiocg, &inner_walk, walk_list)
 		list_del_init(&iocg->walk_list);
@@ -2360,7 +2380,7 @@ static void ioc_timer_fn(struct timer_list *timer)
 				 */
 				TRACE_IOCG_PATH(inuse_shortage, iocg, &now,
 						iocg->inuse, iocg->active,
-						iocg->hweight_inuse, new_hwi);
+						old_hwi, new_hwi);
 
 				__propagate_weights(iocg, iocg->active,
 						    iocg->active, true, &now);
@@ -3032,6 +3052,9 @@ static void ioc_pd_init(struct blkg_policy_data *pd)
 	INIT_LIST_HEAD(&iocg->active_list);
 	INIT_LIST_HEAD(&iocg->walk_list);
 	INIT_LIST_HEAD(&iocg->surplus_list);
+	atomic64_set(&iocg->hweight_cache,
+		     ((u64)(u32)(atomic_read(&ioc->hweight_gen) - 1) << 32) |
+		     U32_MAX);
 	iocg->hweight_active = WEIGHT_ONE;
 	iocg->hweight_inuse = WEIGHT_ONE;
 
