@@ -74,6 +74,7 @@ struct elevator_mq_ops {
 	void (*insert_requests)(struct blk_mq_hw_ctx *hctx, struct list_head *list,
 			blk_insert_t flags);
 	struct request *(*dispatch_request)(struct blk_mq_hw_ctx *);
+	bool (*skip_request)(struct request *rq);
 	bool (*has_work)(struct blk_mq_hw_ctx *);
 	void (*completed_request)(struct request *, u64);
 	void (*requeue_request)(struct request *);
