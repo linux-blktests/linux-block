@@ -714,8 +714,22 @@ blkdev_direct_write(struct kiocb *iocb, struct iov_iter *from)
 
 static ssize_t blkdev_buffered_write(struct kiocb *iocb, struct iov_iter *from)
 {
-	return iomap_file_buffered_write(iocb, from, &blkdev_iomap_ops, NULL,
-			NULL);
+	struct inode *inode = bdev_file_inode(iocb->ki_filp);
+	ssize_t ret;
+
+	/* Buffered fallback waits for writeback, which NOWAIT cannot allow. */
+	if (iocb->ki_flags & IOCB_NOWAIT)
+		return -EAGAIN;
+
+	/*
+	 * Take i_rwsem to avoid racing with set_blocksize() changing
+	 * i_blkbits/folio order and truncating the page cache.
+	 */
+	inode_lock_shared(inode);
+	ret = iomap_file_buffered_write(iocb, from, &blkdev_iomap_ops, NULL,
+					NULL);
+	inode_unlock_shared(inode);
+	return ret;
 }
 
 /*
@@ -774,14 +788,7 @@ static ssize_t blkdev_write_iter(struct kiocb *iocb, struct iov_iter *from)
 			ret = direct_write_fallback(iocb, from, ret,
 					blkdev_buffered_write(iocb, from));
 	} else {
-		/*
-		 * Take i_rwsem and invalidate_lock to avoid racing with
-		 * set_blocksize changing i_blkbits/folio order and punching
-		 * out the pagecache.
-		 */
-		inode_lock_shared(bd_inode);
 		ret = blkdev_buffered_write(iocb, from);
-		inode_unlock_shared(bd_inode);
 	}
 
 	if (ret > 0)
