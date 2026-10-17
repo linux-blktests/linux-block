@@ -1174,8 +1174,8 @@ int w_e_end_csum_rs_req(struct drbd_work *w, int cancel)
 		 * introducing more locking mechanisms */
 		if (peer_device->connection->csums_tfm) {
 			digest_size = crypto_shash_digestsize(peer_device->connection->csums_tfm);
-			D_ASSERT(device, digest_size == di->digest_size);
-			digest = kmalloc(digest_size, GFP_NOIO);
+			if (digest_size == di->digest_size)
+				digest = kmalloc(digest_size, GFP_NOIO);
 		}
 		if (digest) {
 			drbd_csum_ee(peer_device->connection->csums_tfm, peer_req, digest);
@@ -1301,8 +1301,8 @@ int w_e_end_ov_reply(struct drbd_work *w, int cancel)
 		if (digest) {
 			drbd_csum_ee(peer_device->connection->verify_tfm, peer_req, digest);
 
-			D_ASSERT(device, digest_size == di->digest_size);
-			eq = !memcmp(digest, di->digest, digest_size);
+			eq = digest_size == di->digest_size &&
+			     !memcmp(digest, di->digest, digest_size);
 			kfree(digest);
 		}
 	}
