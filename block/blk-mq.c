@@ -2750,17 +2750,26 @@ static bool blk_mq_get_budget_and_tag(struct request *rq)
 static void blk_mq_try_issue_directly(struct blk_mq_hw_ctx *hctx,
 		struct request *rq)
 {
+	bool use_sched = rq->rq_flags & RQF_USE_SCHED;
+	bool run_queue_async = use_sched || (rq->cmd_flags & REQ_NOWAIT);
 	blk_status_t ret;
 
 	if (blk_mq_hctx_stopped(hctx) || blk_queue_quiesced(rq->q)) {
 		blk_mq_insert_request(rq, 0);
-		blk_mq_run_hw_queue(hctx, false);
+		blk_mq_run_hw_queue(hctx, use_sched);
 		return;
 	}
 
-	if ((rq->rq_flags & RQF_USE_SCHED) || !blk_mq_get_budget_and_tag(rq)) {
+	if (use_sched) {
+		struct elevator_mq_ops *ops = &rq->q->elevator->type->ops;
+
+		if (ops->skip_request)
+			use_sched = !ops->skip_request(rq);
+	}
+
+	if (use_sched || !blk_mq_get_budget_and_tag(rq)) {
 		blk_mq_insert_request(rq, 0);
-		blk_mq_run_hw_queue(hctx, rq->cmd_flags & REQ_NOWAIT);
+		blk_mq_run_hw_queue(hctx, run_queue_async);
 		return;
 	}
 
@@ -2926,9 +2935,14 @@ static void blk_mq_dispatch_list(struct rq_list *rqs, bool from_sched)
 		spin_unlock(&this_hctx->lock);
 		blk_mq_run_hw_queue(this_hctx, from_sched);
 	} else if (this_hctx->queue->elevator) {
-		this_hctx->queue->elevator->type->ops.insert_requests(this_hctx,
-				&list, 0);
-		blk_mq_run_hw_queue(this_hctx, from_sched);
+		if (!this_hctx->dispatch_busy && !from_sched)
+			blk_mq_run_dispatch_ops(this_hctx->queue,
+				blk_mq_try_issue_list_directly(this_hctx, &list));
+		if (!list_empty(&list)) {
+			this_hctx->queue->elevator->type->ops.insert_requests(
+					this_hctx, &list, 0);
+			blk_mq_run_hw_queue(this_hctx, from_sched);
+		}
 	} else {
 		blk_mq_insert_requests(this_hctx, this_ctx, &list, from_sched);
 	}
@@ -2983,12 +2997,21 @@ void blk_mq_flush_plug_list(struct blk_plug *plug, bool from_schedule)
 static void blk_mq_try_issue_list_directly(struct blk_mq_hw_ctx *hctx,
 		struct list_head *list)
 {
+	struct elevator_queue *e = hctx->queue->elevator;
 	int queued = 0;
 	blk_status_t ret = BLK_STS_OK;
 
 	while (!list_empty(list)) {
 		struct request *rq = list_first_entry(list, struct request,
 				queuelist);
+
+		/* Scheduler requests need approval and dispatch accounting. */
+		if (e && (READ_ONCE(hctx->dispatch_busy) ||
+			  blk_mq_hctx_stopped(hctx) ||
+			  blk_queue_quiesced(hctx->queue) ||
+			  !e->type->ops.skip_request ||
+			  !e->type->ops.skip_request(rq)))
+			break;
 
 		list_del_init(&rq->queuelist);
 		ret = blk_mq_request_issue_directly(rq, list_empty(list));
@@ -3009,7 +3032,7 @@ static void blk_mq_try_issue_list_directly(struct blk_mq_hw_ctx *hctx,
 	}
 
 out:
-	if (ret != BLK_STS_OK)
+	if (ret != BLK_STS_OK || !list_empty(list))
 		blk_mq_commit_rqs(hctx, queued, false);
 }
 
@@ -3211,8 +3234,7 @@ new_request:
 	}
 
 	hctx = rq->mq_hctx;
-	if ((rq->rq_flags & RQF_USE_SCHED) ||
-	    (hctx->dispatch_busy && (q->nr_hw_queues == 1 || !is_sync))) {
+	if (hctx->dispatch_busy && (q->nr_hw_queues == 1 || !is_sync)) {
 		blk_mq_insert_request(rq, 0);
 		blk_mq_run_hw_queue(hctx, true);
 	} else {
