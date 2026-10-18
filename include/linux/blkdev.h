@@ -1598,6 +1598,7 @@ struct block_device_operations {
 			enum blk_unique_id id_type);
 	struct module *owner;
 	const struct pr_ops *pr_ops;
+	bool sync_queue_before_release;
 
 	/*
 	 * Special callback for probing GPT entry at a given sector.

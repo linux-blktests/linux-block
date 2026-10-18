@@ -753,7 +753,9 @@ static void bd_end_claim(struct block_device *bdev, void *holder)
 static void blkdev_flush_mapping(struct block_device *bdev)
 {
 	WARN_ON_ONCE(bdev->bd_holders);
-	sync_blockdev(bdev);
+	/* See bd_early_sync() for this behavior. */
+	if (!bdev->bd_disk->fops->sync_queue_before_release)
+		sync_blockdev(bdev);
 	kill_bdev(bdev);
 	bdev_write_inode(bdev);
 }
@@ -1180,11 +1182,45 @@ static inline void bd_early_sync(struct gendisk *disk, struct block_device *bdev
 	 * Therefore, this bdev->bd_openers == 1 + bdev->bd_closers condition
 	 * guarantees that any thread who might become the last opener performs
 	 * synchronization which should be done before holding open_mutex.
+	 *
+	 * Also, wait for all in-flight BIOs to complete if
+	 * sync_queue_before_release is set, due to reasons listed below.
+	 *
+	 * (1) sync_blockdev() fails to wait for completion of writeback when
+	 *     filemap_fdatawrite_range() returned -EIO after some write BIOs
+	 *     have been submitted. Also, sync_blockdev() does not wait for
+	 *     completion of read BIOs submitted by e.g. filesystem's readahead
+	 *     behavior. To wait for completion of already submitted BIOs, we
+	 *     need to freeze block layer's queue which we are about to close.
+	 * (2) At least, lo_release() (one of bdev->bd_disk->fops->release()
+	 *     targets) depends on that there is no in-flight BIO when
+	 *     lo_release() is called. If this dependency is broken, the kernel
+	 *     crashes due to lo_rw_aio() trying to process in-flight BIOs
+	 *     after blkdev_flush_mapping() and lo_release() are called.
+	 * (3) lo_release() is not allowed to freeze block layer's queue due to
+	 *     circular locking dependency which involves open_mutex. Also,
+	 *     lo_release() is required to complete fput() from __loop_clr_fd()
+	 *     before lo_release() returns to usermode, for existing userspace
+	 *     programs depend on such behavior. These constraints make it
+	 *     impossible for lo_release() to defer queue freezing and fput()
+	 *     to delayed context such as WQ or task work.
+	 * (4) If blkdev_flush_mapping() submits new BIOs, there might be
+	 *     in-flight BIOs when bdev->bd_disk->fops->release() is called.
+	 *     Since lo_release() cannot accept such possibility, we freeze
+	 *     queue here and forbid further submission of BIOs after we
+	 *     unfreeze queue and re-acquires open_mutex.
+	 * (5) Whether to wait for all in-flight BIOs to complete is an opt-in
+	 *     basis switch, for this behavior is required by loop module which
+	 *     cannot freeze queue with open_mutex held due to circular locking
+	 *     dependency.
 	 */
 	if (atomic_read(&bdev->bd_openers) == 1 + bdev->bd_closers) {
 		bdev->bd_closers++;
 		mutex_unlock(&disk->open_mutex);
 		sync_blockdev(bdev);
+		if (disk->fops->sync_queue_before_release)
+			blk_mq_unfreeze_queue(bdev->bd_queue,
+					      blk_mq_freeze_queue(bdev->bd_queue));
 		mutex_lock(&disk->open_mutex);
 		bdev->bd_closers--;
 	}

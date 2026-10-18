@@ -1796,6 +1796,7 @@ static const struct block_device_operations lo_fops = {
 	.compat_ioctl =	lo_compat_ioctl,
 #endif
 	.free_disk =	lo_free_disk,
+	.sync_queue_before_release = true,
 };
 
 /*
