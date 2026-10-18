@@ -1150,6 +1150,46 @@ static inline void bd_yield_claim(struct file *bdev_file)
 		bd_end_claim(bdev, holder);
 }
 
+static inline void bd_early_sync(struct gendisk *disk, struct block_device *bdev)
+{
+	/*
+	 * Temporarily drop open_mutex and process writeback (which could take
+	 * several minutes to complete) for this "bdev", if current thread is
+	 * the last opener (or one of threads who might become the last opener)
+	 * when current thread re-acquires open_mutex.
+	 *
+	 * It is safe for this "bdev" to temporarily drop open_mutex here, for
+	 * this "bdev" owns one bd_openers count (avoiding possibility of UAF),
+	 * and bdev_release() has not yet modified any state for this "bdev".
+	 * In essence, bd_early_sync() is doing what we can do (or what we
+	 * should have done) before calling bdev_release().
+	 *
+	 * It is safe if another thread called blkdev_get_{whole,part}() from
+	 * bdev_open() while current thread temporarily dropped open_mutex, for
+	 * the bd_openers elevated by another thread prevents current thread
+	 * from calling blkdev_flush_mapping() when current thread re-acquired
+	 * open_mutex and calls blkdev_put_{whole,part}().
+	 *
+	 * It is also safe if another thread called blkdev_get_{whole,part}()
+	 * from bdev_open() and initiated bdev_release() while current thread
+	 * temporarily dropped open_mutex, for the bd_closers elevated by
+	 * current thread prevents another thread from skipping this step
+	 * (another thread is evaluated as one of threads who might become
+	 * the last opener) and sync_blockdev() is designed to be thread-safe.
+	 *
+	 * Therefore, this bdev->bd_openers == 1 + bdev->bd_closers condition
+	 * guarantees that any thread who might become the last opener performs
+	 * synchronization which should be done before holding open_mutex.
+	 */
+	if (atomic_read(&bdev->bd_openers) == 1 + bdev->bd_closers) {
+		bdev->bd_closers++;
+		mutex_unlock(&disk->open_mutex);
+		sync_blockdev(bdev);
+		mutex_lock(&disk->open_mutex);
+		bdev->bd_closers--;
+	}
+}
+
 void bdev_release(struct file *bdev_file)
 {
 	struct block_device *bdev = file_bdev(bdev_file);
@@ -1160,17 +1200,11 @@ void bdev_release(struct file *bdev_file)
 	if (IS_ERR(holder))
 		goto put_no_open;
 
-	/*
-	 * Sync early if it looks like we're the last one.  If someone else
-	 * opens the block device between now and the decrement of bd_openers
-	 * then we did a sync that we didn't need to, but that's not the end
-	 * of the world and we want to avoid long (could be several minute)
-	 * syncs while holding the mutex.
-	 */
-	if (atomic_read(&bdev->bd_openers) == 1)
-		sync_blockdev(bdev);
-
 	mutex_lock(&disk->open_mutex);
+	bd_early_sync(disk, bdev);
+	if (bdev_is_partition(bdev))
+		bd_early_sync(disk, bdev_whole(bdev));
+
 	bdev_yield_write_access(bdev_file);
 
 	if (holder)
