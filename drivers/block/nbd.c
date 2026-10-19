@@ -1530,6 +1530,10 @@ retry:
 	blk_mq_update_nr_hw_queues(&nbd->tag_set, num_connections);
 	mutex_lock(&nbd->config_lock);
 
+	/* The device may have been started or reconfigured while unlocked. */
+	if (nbd->pid)
+		return -EBUSY;
+
 	/* if another code path updated nr_hw_queues, retry until succeed */
 	if (num_connections != config->num_connections) {
 		num_connections = config->num_connections;
