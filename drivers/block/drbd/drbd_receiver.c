@@ -2711,7 +2711,17 @@ static int receive_DataRequest(struct drbd_connection *connection, struct packet
 		break;
 
 	case P_OV_REPLY:
-	case P_CSUM_RS_REQUEST:
+	case P_CSUM_RS_REQUEST: {
+		struct crypto_shash *tfm = pi->cmd == P_CSUM_RS_REQUEST ?
+			peer_device->connection->csums_tfm :
+			peer_device->connection->verify_tfm;
+
+		if (!tfm || pi->size != crypto_shash_digestsize(tfm)) {
+			drbd_err(device, "%s: unexpected digest size %u\n",
+				 cmdname(pi->cmd), pi->size);
+			goto out_free_e;
+		}
+
 		di = kmalloc(sizeof(*di) + pi->size, GFP_NOIO);
 		if (!di)
 			goto out_free_e;
@@ -2742,6 +2752,7 @@ static int receive_DataRequest(struct drbd_connection *connection, struct packet
 			goto submit_for_resync;
 		}
 		break;
+	}
 
 	case P_OV_REQUEST:
 		if (device->ov_start_sector == ~(sector_t)0 &&
