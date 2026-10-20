@@ -56,9 +56,16 @@ static inline int task_nice_ioclass(struct task_struct *task)
  */
 static inline int __get_task_ioprio(struct task_struct *p)
 {
-	struct io_context *ioc = p->io_context;
+	struct io_context *ioc;
 	int prio;
 
+	/*
+	 * Only the current task itself drops its io_context, in
+	 * exit_io_context(), so a non-NULL ioc is always valid.  However,
+	 * another task may change ->io_context or ioc->ioprio, so make sure
+	 * to get the latest value with READ_ONCE().
+	 */
+	ioc = READ_ONCE(p->io_context);
 	if (!ioc)
 		return IOPRIO_PRIO_VALUE(task_nice_ioclass(p),
 					 task_nice_ioprio(p));
@@ -66,7 +73,7 @@ static inline int __get_task_ioprio(struct task_struct *p)
 	if (p != current)
 		lockdep_assert_held(&p->alloc_lock);
 
-	prio = ioc->ioprio;
+	prio = READ_ONCE(ioc->ioprio);
 	if (IOPRIO_PRIO_CLASS(prio) == IOPRIO_CLASS_NONE)
 		prio = IOPRIO_PRIO_VALUE(task_nice_ioclass(p),
 					 task_nice_ioprio(p));
