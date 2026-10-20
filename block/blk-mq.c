@@ -5234,6 +5234,7 @@ fallback:
 			set->nr_hw_queues = prev_nr_hw_queues;
 			goto fallback;
 		}
+		queue_set_hctx_shared(q, set->flags & BLK_MQ_F_TAG_QUEUE_SHARED);
 		blk_mq_map_swqueue(q);
 		/* The new hctxs don't know yet that they share their tags */
 		if (set->flags & BLK_MQ_F_TAG_QUEUE_SHARED)
