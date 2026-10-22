@@ -1,0 +1,191 @@
+#!/bin/bash
+# SPDX-License-Identifier: GPL-3.0+
+# Copyright (c) 2026 Aaron Tomlin <atomlin@atomlin.com>
+#
+# Test that deferred blk-mq queue dispatch (&hctx->run_work) is not executed
+# by kblockd workers on isolated CPUs.
+#
+# When a hardware queue experiences backpressure or resource starvation (e.g.
+# upon tag exhaustion), blk_mq_delay_run_hw_queue() schedules deferred queue
+# dispatch. When I/O is submitted from an isolated CPU, blk_mq_hctx_next_cpu()
+# must steer &hctx->run_work to an online housekeeping CPU rather than running
+# on the local isolated CPU's worker pool, avoiding SCHED_FIFO worker
+# starvation and latency jitter.
+
+. tests/block/rc
+. common/cgroup
+. common/null_blk
+. common/fio
+
+DESCRIPTION="test deferred blk-mq queue work placement with isolated CPUs"
+QUICK=1
+
+requires() {
+	_have_root
+	_have_null_blk
+	_have_fio
+	_require_min_cpus 2
+	_have_cgroup2_controller_file cpuset cpuset.cpus.partition
+	_have_tracefs
+	_have_tracepoint "workqueue/workqueue_execute_start"
+	modprobe -q mq-deadline 2>/dev/null || true
+}
+
+isolate_cpu() {
+	local cpu="$1"
+	local partition
+
+	_init_cgroup2 || return 1
+	_set_attr "+cpuset" "$(_cgroup2_base_dir)/cgroup.subtree_control"
+	_set_attr "${cpu}" "${CGROUP2_DIR}/cpuset.cpus"
+	_set_attr "isolated" "${CGROUP2_DIR}/cpuset.cpus.partition"
+
+	partition=$(cat "${CGROUP2_DIR}/cpuset.cpus.partition")
+	if [[ "${partition}" != "isolated" ]]; then
+		SKIP_REASONS+=("failed to isolate CPU ${cpu}: ${partition}")
+		_exit_cgroup2
+		return 1
+	fi
+
+	return 0
+}
+
+start_trace() {
+	local trace_dir="$1"
+	local event="${trace_dir}/events/workqueue/workqueue_execute_start"
+
+	_set_attr "" "${trace_dir}/trace"
+	_set_attr "function.function == blk_mq_run_work_fn" "${event}/filter" 2>/dev/null || true
+	_set_attr 1 "${event}/enable"
+}
+
+stop_trace() {
+	local trace_dir="$1"
+	local isolated_cpu="$2"
+
+	_set_attr 0 "${trace_dir}/events/workqueue/workqueue_execute_start/enable"
+
+	local isol_hits=0
+	if [[ -f "${trace_dir}/per_cpu/cpu${isolated_cpu}/trace" ]]; then
+		isol_hits=$(grep -c "blk_mq_run_work_fn" \
+			"${trace_dir}/per_cpu/cpu${isolated_cpu}/trace" 2>/dev/null || true)
+	fi
+
+	local total_hits=0
+	total_hits=$(grep -c "blk_mq_run_work_fn" \
+		"${trace_dir}/trace" 2>/dev/null || true)
+
+	echo "${isol_hits}:${total_hits}"
+}
+
+run_io() {
+	local dev="$1"
+	local cpu="$2"
+
+	(
+		local allowed
+		_set_attr "${BASHPID}" "${CGROUP2_DIR}/cgroup.procs"
+		allowed=$(awk '/^Cpus_allowed_list:/ { print $2 }' "/proc/${BASHPID}/status")
+		if [[ "${allowed}" != "${cpu}" ]]; then
+			echo "FAIL: workload not confined to isolated CPU ${cpu} (runs on ${allowed})"
+			exit 1
+		fi
+
+		# Submit concurrent I/O with iodepth > hw_queue_depth to induce tag
+		# exhaustion and force asynchronous queue dispatch (&hctx->run_work)
+		_run_fio --name=tag_exhaustion \
+			--filename="/dev/${dev}" \
+			--ioengine=psync \
+			--rw=randwrite \
+			--direct=1 \
+			--bs=4k \
+			--size=64k \
+			--numjobs=4 \
+			--iodepth=8 \
+			>>"${FULL}" 2>&1
+	)
+}
+
+test_workqueue_placement() {
+	local dev="$1"
+	local cpu="$2"
+	local test_desc="$3"
+	local trace_dir="$4"
+
+	if ! _write_queue_sched "mq-deadline" "/sys/block/${dev}/queue/scheduler"; then
+		echo "FAIL: ${test_desc}: failed to set mq-deadline scheduler"
+		return 1
+	fi
+
+	start_trace "${trace_dir}"
+	run_io "${dev}" "${cpu}" || echo "FAIL: ${test_desc}: I/O execution failed"
+	udevadm settle
+
+	local res
+	res=$(stop_trace "${trace_dir}" "${cpu}")
+	local isol_hits="${res%%:*}"
+	local total_hits="${res##*:}"
+
+	if [[ -n "${FULL}" ]]; then
+		echo "${test_desc}: isol_hits=${isol_hits} total_hits=${total_hits}" >>"${FULL}"
+	fi
+
+	if [[ "${isol_hits}" -gt 0 ]]; then
+		echo "FAIL: ${test_desc}: ${isol_hits} blk_mq_run_work_fn worker runs on isolated CPU ${cpu}"
+	fi
+
+	if [[ "${total_hits}" -eq 0 ]]; then
+		echo "FAIL: ${test_desc}: no deferred queue executions observed"
+	fi
+}
+
+test() {
+	echo "Running ${TEST_NAME}"
+
+	local cpu
+	local nr_cpus
+	local trace_dir="/sys/kernel/debug/tracing/instances/blktests-${TEST_NAME//\//-}"
+
+	nr_cpus=$(nproc)
+	cpu=$(awk -F'[-,]' '{ print $NF }' /sys/devices/system/cpu/online)
+	if ! isolate_cpu "${cpu}"; then
+		return 1
+	fi
+
+	mkdir "${trace_dir}" || return 1
+
+	# Test 1: Single-queue device (nr_hw_queues == 1)
+	local nullb_sq_params=(
+		submit_queues=1
+		hw_queue_depth=1
+		irqmode=2
+		completion_nsec=10000000
+		power=1
+	)
+	if _configure_null_blk nullb1 "${nullb_sq_params[@]}"; then
+		test_workqueue_placement nullb1 "${cpu}" "single-queue" "${trace_dir}"
+	else
+		echo "FAIL: failed to configure single-queue null_blk"
+	fi
+	_exit_null_blk
+
+	# Test 2: Multi-queue device where isolated CPU maps to empty hctx
+	local nullb_mq_params=(
+		submit_queues="${nr_cpus}"
+		hw_queue_depth=1
+		irqmode=2
+		completion_nsec=10000000
+		power=1
+	)
+	if _configure_null_blk nullb1 "${nullb_mq_params[@]}"; then
+		test_workqueue_placement nullb1 "${cpu}" "multi-queue empty hctx" "${trace_dir}"
+	else
+		echo "FAIL: failed to configure multi-queue null_blk"
+	fi
+	_exit_null_blk
+
+	rmdir "${trace_dir}"
+	_exit_cgroup2
+
+	echo "Test complete"
+}
