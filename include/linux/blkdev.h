@@ -610,6 +610,12 @@ struct request_queue {
 	 */
 	struct mutex		elevator_lock;
 
+	/*
+	 * Serializes queue/scheduler writes. Lock order: update_nr_hwq_lock
+	 * (read), this lock, then the queue freeze.
+	 */
+	struct mutex		elevator_store_lock;
+
 	struct mutex		sysfs_lock;
 	/*
 	 * Protects queue limits and also sysfs attribute read_ahead_kb.
