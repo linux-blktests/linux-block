@@ -277,9 +277,14 @@ int set_task_ioprio(struct task_struct *task, int ioprio)
 		if (task->io_context)
 			kmem_cache_free(iocontext_cachep, ioc);
 		else
-			task->io_context = ioc;
+			/*
+			 * Make the ioc initialization visible before the
+			 * pointer.  Readers use READ_ONCE(), whose address
+			 * dependency is enough, like rcu_dereference().
+			 */
+			smp_store_release(&task->io_context, ioc);
 	}
-	task->io_context->ioprio = ioprio;
+	WRITE_ONCE(task->io_context->ioprio, ioprio);
 out:
 	task_unlock(task);
 	return 0;
