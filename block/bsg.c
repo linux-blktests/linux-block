@@ -132,6 +132,8 @@ static long bsg_ioctl(struct file *file, unsigned int cmd, unsigned long arg)
 	case SG_SET_TIMEOUT:
 		if (get_user(val, intp))
 			return -EFAULT;
+		if (val < 0)
+			return -EIO;
 		bd->timeout = clock_t_to_jiffies(val);
 		return 0;
 	case SG_GET_TIMEOUT:
