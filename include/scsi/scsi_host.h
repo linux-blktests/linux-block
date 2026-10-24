@@ -698,6 +698,9 @@ struct Scsi_Host {
 	/* Host responded with short (<36 bytes) INQUIRY result */
 	unsigned short_inquiry:1;
 
+	/* Device is physically gone; skip sync in sd_remove() */
+	unsigned surprise_removal:1;
+
 	/* The transport requires the LUN bits NOT to be stored in CDB[1] */
 	unsigned no_scsi2_lun_in_cdb:1;
 

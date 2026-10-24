@@ -930,6 +930,9 @@ static void quiesce_and_remove_host(struct us_data *us)
 	if (us->pusb_dev->state == USB_STATE_NOTATTACHED) {
 		set_bit(US_FLIDX_DISCONNECTING, &us->dflags);
 		wake_up(&us->delay_wait);
+
+		/* Device is physically gone, cannot handle I/O */
+		host->surprise_removal = 1;
 	}
 
 	/*
