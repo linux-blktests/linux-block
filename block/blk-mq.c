@@ -9,6 +9,7 @@
 #include <linux/module.h>
 #include <linux/backing-dev.h>
 #include <linux/bio.h>
+#include <linux/bitmap.h>
 #include <linux/blkdev.h>
 #include <linux/blk-integrity.h>
 #include <linux/kmemleak.h>
@@ -4170,9 +4171,74 @@ static void __blk_mq_free_map_and_rqs(struct blk_mq_tag_set *set,
 	set->tags[hctx_idx] = NULL;
 }
 
+static void blk_mq_update_mapped_tags_bitmap(struct blk_mq_tag_set *set)
+{
+	unsigned int i, cpu;
+
+	bitmap_zero(set->mapped_tags_bitmap, set->nr_hw_queues);
+	if (set->nr_hw_queues == 1) {
+		__set_bit(0, set->mapped_tags_bitmap);
+		return;
+	}
+
+	for (i = 0; i < set->nr_maps; i++) {
+		struct blk_mq_queue_map *map = &set->map[i];
+
+		if (!map->nr_queues)
+			continue;
+		for_each_possible_cpu(cpu)
+			__set_bit(map->mq_map[cpu], set->mapped_tags_bitmap);
+	}
+}
+
+static void blk_mq_alloc_mapped_tags(struct blk_mq_tag_set *set)
+{
+	unsigned int cpu, i;
+	bool remapped = false;
+
+	lockdep_assert_held_write(&set->update_nr_hwq_lock);
+
+	for_each_possible_cpu(cpu) {
+		for (i = 0; i < set->nr_maps; i++) {
+			struct blk_mq_queue_map *map = &set->map[i];
+			unsigned int hctx_idx;
+
+			if (!map->nr_queues)
+				continue;
+			hctx_idx = map->mq_map[cpu];
+			if (!set->tags[hctx_idx] &&
+			    !__blk_mq_alloc_map_and_rqs(set, hctx_idx)) {
+				/* Queue 0 always has tags available for fallback. */
+				map->mq_map[cpu] = 0;
+				remapped = true;
+			}
+		}
+	}
+	if (remapped)
+		blk_mq_update_mapped_tags_bitmap(set);
+}
+
+static bool blk_mq_tagset_tags_mapped(struct blk_mq_tag_set *set,
+				      unsigned int hctx_idx)
+{
+	return test_bit(hctx_idx, set->mapped_tags_bitmap);
+}
+
+/* The queue maps must be stable and the unused tags no longer in use. */
+static void blk_mq_free_unmapped_tags(struct blk_mq_tag_set *set)
+{
+	unsigned int i;
+
+	/* Keep queue 0 as a fallback if a later tag allocation fails. */
+	for (i = 1; i < set->nr_hw_queues; i++) {
+		if (set->tags[i] && !blk_mq_tagset_tags_mapped(set, i))
+			__blk_mq_free_map_and_rqs(set, i);
+	}
+}
+
 static void blk_mq_map_swqueue(struct request_queue *q)
 {
-	unsigned int j, hctx_idx;
+	unsigned int j;
 	unsigned long i;
 	struct blk_mq_hw_ctx *hctx;
 	struct blk_mq_ctx *ctx;
@@ -4184,11 +4250,7 @@ static void blk_mq_map_swqueue(struct request_queue *q)
 		hctx->dispatch_from = NULL;
 	}
 
-	/*
-	 * Map software to hardware queues.
-	 *
-	 * If the cpu isn't present, the cpu is mapped to first hctx.
-	 */
+	/* Map software to hardware queues. */
 	for_each_possible_cpu(i) {
 
 		ctx = per_cpu_ptr(q->queue_ctx, i);
@@ -4198,19 +4260,6 @@ static void blk_mq_map_swqueue(struct request_queue *q)
 						HCTX_TYPE_DEFAULT, i);
 				continue;
 			}
-			hctx_idx = set->map[j].mq_map[i];
-			/* unmapped hw queue can be remapped after CPU topo changed */
-			if (!set->tags[hctx_idx] &&
-			    !__blk_mq_alloc_map_and_rqs(set, hctx_idx)) {
-				/*
-				 * If tags initialization fail for some hctx,
-				 * that hctx won't be brought online.  In this
-				 * case, remap the current ctx to hctx[0] which
-				 * is guaranteed to always have tags allocated
-				 */
-				set->map[j].mq_map[i] = 0;
-			}
-
 			hctx = blk_mq_map_queue_type(q, j, i);
 			ctx->hctxs[j] = hctx;
 			/*
@@ -4241,18 +4290,8 @@ static void blk_mq_map_swqueue(struct request_queue *q)
 	queue_for_each_hw_ctx(q, hctx, i) {
 		int cpu;
 
-		/*
-		 * If no software queues are mapped to this hardware queue,
-		 * disable it and free the request entries.
-		 */
+		/* Disable hardware queues with no mapped software queues. */
 		if (!hctx->nr_ctx) {
-			/* Never unmap queue 0.  We need it as a
-			 * fallback in case of a new remap fails
-			 * allocation
-			 */
-			if (i)
-				__blk_mq_free_map_and_rqs(set, i);
-
 			hctx->tags = NULL;
 			continue;
 		}
@@ -4793,12 +4832,18 @@ static void blk_mq_update_queue_map(struct blk_mq_tag_set *set)
 		BUG_ON(set->nr_maps > 1);
 		blk_mq_map_queues(&set->map[HCTX_TYPE_DEFAULT]);
 	}
+	blk_mq_update_mapped_tags_bitmap(set);
 }
 
+/*
+ * On successful growth, also install a larger mapped_tags_bitmap. The caller
+ * rebuilds its contents when updating the queue maps under update_nr_hwq_lock.
+ */
 static struct blk_mq_tags **blk_mq_prealloc_tag_set_tags(
 				struct blk_mq_tag_set *set,
 				int new_nr_hw_queues)
 {
+	unsigned long *new_mapped_tags_bitmap;
 	struct blk_mq_tags **new_tags;
 	int i;
 
@@ -4809,6 +4854,13 @@ static struct blk_mq_tags **blk_mq_prealloc_tag_set_tags(
 				GFP_KERNEL, set->numa_node);
 	if (!new_tags)
 		return ERR_PTR(-ENOMEM);
+
+	new_mapped_tags_bitmap = bitmap_zalloc_node(new_nr_hw_queues, GFP_KERNEL,
+						    set->numa_node);
+	if (!new_mapped_tags_bitmap) {
+		kfree(new_tags);
+		return ERR_PTR(-ENOMEM);
+	}
 
 	if (set->tags)
 		memcpy(new_tags, set->tags, set->nr_hw_queues *
@@ -4826,12 +4878,15 @@ static struct blk_mq_tags **blk_mq_prealloc_tag_set_tags(
 		cond_resched();
 	}
 
+	bitmap_free(set->mapped_tags_bitmap);
+	set->mapped_tags_bitmap = new_mapped_tags_bitmap;
 	return new_tags;
 out_unwind:
 	while (--i >= set->nr_hw_queues) {
 		if (!blk_mq_is_shared_tags(set->flags))
 			blk_mq_free_map_and_rqs(set, new_tags[i], i);
 	}
+	bitmap_free(new_mapped_tags_bitmap);
 	kfree(new_tags);
 	return ERR_PTR(-ENOMEM);
 }
@@ -4895,9 +4950,17 @@ int blk_mq_alloc_tag_set(struct blk_mq_tag_set *set)
 		if (ret)
 			goto out_free_srcu;
 	}
+
+	set->mapped_tags_bitmap = bitmap_zalloc_node(set->nr_hw_queues, GFP_KERNEL,
+						     set->numa_node);
+	if (!set->mapped_tags_bitmap) {
+		ret = -ENOMEM;
+		goto out_cleanup_srcu;
+	}
+
 	ret = init_srcu_struct(&set->tags_srcu);
 	if (ret)
-		goto out_cleanup_srcu;
+		goto out_free_mapped_tags_bitmap;
 
 	init_rwsem(&set->update_nr_hwq_lock);
 
@@ -4922,9 +4985,14 @@ int blk_mq_alloc_tag_set(struct blk_mq_tag_set *set)
 	ret = blk_mq_alloc_set_map_and_rqs(set);
 	if (ret)
 		goto out_free_mq_map;
+	blk_mq_free_unmapped_tags(set);
 
 	mutex_init(&set->tag_list_lock);
 	INIT_LIST_HEAD(&set->tag_list);
+#ifdef CONFIG_BLK_DEBUG_FS
+	set->debugfs_id = -1;
+#endif
+	blk_mq_tagset_debugfs_register(set);
 
 	return 0;
 
@@ -4937,6 +5005,9 @@ out_free_mq_map:
 	set->tags = NULL;
 out_cleanup_tags_srcu:
 	cleanup_srcu_struct(&set->tags_srcu);
+out_free_mapped_tags_bitmap:
+	bitmap_free(set->mapped_tags_bitmap);
+	set->mapped_tags_bitmap = NULL;
 out_cleanup_srcu:
 	if (set->flags & BLK_MQ_F_BLOCKING)
 		cleanup_srcu_struct(set->srcu);
@@ -4967,6 +5038,8 @@ void blk_mq_free_tag_set(struct blk_mq_tag_set *set)
 {
 	int i, j;
 
+	blk_mq_tagset_debugfs_unregister(set);
+
 	for (i = 0; i < set->nr_hw_queues; i++)
 		__blk_mq_free_map_and_rqs(set, i);
 
@@ -4982,6 +5055,9 @@ void blk_mq_free_tag_set(struct blk_mq_tag_set *set)
 
 	kfree(set->tags);
 	set->tags = NULL;
+
+	bitmap_free(set->mapped_tags_bitmap);
+	set->mapped_tags_bitmap = NULL;
 
 	srcu_barrier(&set->tags_srcu);
 	cleanup_srcu_struct(&set->tags_srcu);
@@ -5148,6 +5224,7 @@ static void __blk_mq_update_nr_hw_queues(struct blk_mq_tag_set *set,
 		blk_mq_debugfs_unregister_hctxs(q);
 		blk_mq_sysfs_unregister_hctxs(q);
 	}
+	blk_mq_tagset_debugfs_remove_tags(set);
 
 	/*
 	 * Switch IO scheduler to 'none', cleaning up the data associated
@@ -5173,6 +5250,7 @@ static void __blk_mq_update_nr_hw_queues(struct blk_mq_tag_set *set,
 
 fallback:
 	blk_mq_update_queue_map(set);
+	blk_mq_alloc_mapped_tags(set);
 	list_for_each_entry(q, &set->tag_list, tag_set_list) {
 		__blk_mq_realloc_hw_ctxs(set, q);
 
@@ -5189,6 +5267,8 @@ fallback:
 		}
 		blk_mq_map_swqueue(q);
 	}
+	/* All queues have stopped using tags excluded by the new maps. */
+	blk_mq_free_unmapped_tags(set);
 switch_back:
 	/* The blk_mq_elv_switch_back unfreezes queue for us. */
 	list_for_each_entry(q, &set->tag_list, tag_set_list) {
@@ -5205,6 +5285,7 @@ switch_back:
 		blk_mq_remove_hw_queues_cpuhp(q);
 		blk_mq_add_hw_queues_cpuhp(q);
 	}
+	blk_mq_tagset_debugfs_create_tags(set);
 
 out_free_ctx:
 	blk_mq_free_sched_ctx_batch(&elv_tbl);
