@@ -74,6 +74,7 @@ struct block_device {
 #ifdef CONFIG_SECURITY
 	void			*bd_security;
 #endif
+	int			bd_closers;
 	/*
 	 * keep this out-of-line as it's both big and not needed in the fast
 	 * path

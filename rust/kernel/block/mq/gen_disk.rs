@@ -145,6 +145,7 @@ impl GenDiskBuilder {
             pr_ops: core::ptr::null_mut(),
             free_disk: None,
             poll_bio: None,
+            sync_queue_before_release: false,
         };
 
         // SAFETY: `gendisk` is a valid pointer as we initialized it above
