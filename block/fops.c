@@ -810,13 +810,8 @@ static ssize_t blkdev_write_iter(struct kiocb *iocb, struct iov_iter *from)
 				else if (!blkdev_dio_fua(iocb, bdev))
 					need_sync = true;
 			} else {
-				ssize_t ret2;
-
-				inode_lock_shared(bd_inode);
-				ret2 = blkdev_buffered_write(iocb, from);
-				inode_unlock_shared(bd_inode);
 				ret = direct_write_fallback(iocb, from, ret,
-							    ret2);
+						blkdev_buffered_write(iocb, from));
 				need_sync = true;
 			}
 		} else if (ret > 0 && !blkdev_dio_fua(iocb, bdev)) {
