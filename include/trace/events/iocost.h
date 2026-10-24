@@ -34,6 +34,8 @@ DECLARE_EVENT_CLASS(iocost_iocg_state,
 	),
 
 	TP_fast_assign(
+		u64 cache = (u64)atomic64_read(&iocg->hweight_cache);
+
 		__assign_str(devname);
 		__assign_str(cgroup);
 		__entry->now = now->now;
@@ -44,8 +46,8 @@ DECLARE_EVENT_CLASS(iocost_iocg_state,
 		__entry->vtime = vtime;
 		__entry->weight = iocg->weight;
 		__entry->inuse = iocg->inuse;
-		__entry->hweight_active = iocg->hweight_active;
-		__entry->hweight_inuse = iocg->hweight_inuse;
+		__entry->hweight_active = ((cache >> 16) & (WEIGHT_ONE - 1)) + 1;
+		__entry->hweight_inuse = (cache & (WEIGHT_ONE - 1)) + 1;
 	),
 
 	TP_printk("[%s:%s] now=%llu:%llu vrate=%llu "
