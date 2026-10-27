@@ -3246,13 +3246,13 @@ static ssize_t ioc_weight_write(struct kernfs_open_file *of, char *buf,
 	struct blkg_conf_ctx ctx;
 	struct ioc_now now;
 	struct ioc_gq *iocg;
-	u32 v;
+	u64 v;
 	int ret;
 
 	if (!strchr(buf, ':')) {
 		struct blkcg_gq *blkg;
 
-		if (!sscanf(buf, "default %u", &v) && !sscanf(buf, "%u", &v))
+		if (!sscanf(buf, "default %llu", &v) && !sscanf(buf, "%llu", &v))
 			return -EINVAL;
 
 		if (v < CGROUP_WEIGHT_MIN || v > CGROUP_WEIGHT_MAX)
@@ -3292,7 +3292,7 @@ static ssize_t ioc_weight_write(struct kernfs_open_file *of, char *buf,
 	if (!strncmp(ctx.body, "default", 7)) {
 		v = 0;
 	} else {
-		if (!sscanf(ctx.body, "%u", &v))
+		if (!sscanf(ctx.body, "%llu", &v))
 			goto unprep;
 		if (v < CGROUP_WEIGHT_MIN || v > CGROUP_WEIGHT_MAX)
 			goto unprep;
