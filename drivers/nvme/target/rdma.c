@@ -862,10 +862,23 @@ static void nvmet_rdma_write_data_done(struct ib_cq *cq, struct ib_wc *wc)
 		rsp->req.cqe->status = cpu_to_le16(status << 1);
 	nvmet_rdma_rw_ctx_destroy(rsp);
 
+	/*
+	 * The request has been completed and its reference is put, so nothing
+	 * keeps the release work from draining the queue pair. While we hold
+	 * sq->ref it waits in nvmet_sq_destroy(), and the SEND is posted ahead
+	 * of the drain. If the ref is dead, nobody is left to read a response.
+	 */
+	if (unlikely(!percpu_ref_tryget_live(&queue->nvme_sq.ref))) {
+		nvmet_rdma_release_rsp(rsp);
+		return;
+	}
+
 	if (unlikely(ib_post_send(cm_id->qp, &rsp->send_wr, NULL))) {
 		pr_err("sending cmd response failed\n");
 		nvmet_rdma_release_rsp(rsp);
 	}
+
+	percpu_ref_put(&queue->nvme_sq.ref);
 }
 
 static void nvmet_rdma_use_inline_sg(struct nvmet_rdma_rsp *rsp, u32 len,
