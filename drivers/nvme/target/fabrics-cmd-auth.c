@@ -47,7 +47,7 @@ static u8 nvmet_auth_negotiate(struct nvmet_req *req, void *d, u32 tl)
 {
 	struct nvmet_ctrl *ctrl = req->sq->ctrl;
 	struct nvmf_auth_dhchap_negotiate_data *data = d;
-	int i, hash_id = 0, fallback_hash_id = 0, dhgid, fallback_dhgid;
+	int i, hash_id = 0, fallback_hash_id = 0;
 
 	if (tl < sizeof(*data) +
 			sizeof(struct nvmf_auth_dhchap_protocol_descriptor))
@@ -115,32 +115,15 @@ static u8 nvmet_auth_negotiate(struct nvmet_req *req, void *d, u32 tl)
 	}
 	req->sq->shash_id = hash_id;
 
-	dhgid = -1;
-	fallback_dhgid = -1;
 	for (i = 0; i < data->auth_protocol[0].dhchap.dhlen; i++) {
-		int tmp_dhgid = data->auth_protocol[0].dhchap.idlist[i + 30];
-
-		if (tmp_dhgid != ctrl->dh_gid) {
-			dhgid = tmp_dhgid;
+		if (data->auth_protocol[0].dhchap.idlist[i + 30] == ctrl->dh_gid)
 			break;
-		}
-		if (fallback_dhgid < 0) {
-			const char *kpp = nvme_auth_dhgroup_kpp(tmp_dhgid);
-
-			if (crypto_has_kpp(kpp, 0, 0))
-				fallback_dhgid = tmp_dhgid;
-		}
 	}
-	if (dhgid < 0) {
-		if (fallback_dhgid < 0) {
-			pr_debug("%s: ctrl %d qid %d: no usable DH group found\n",
-				 __func__, ctrl->cntlid, req->sq->qid);
-			return NVME_AUTH_DHCHAP_FAILURE_DHGROUP_UNUSABLE;
-		}
+	if (i == data->auth_protocol[0].dhchap.dhlen) {
 		pr_debug("%s: ctrl %d qid %d: configured DH group %s not found\n",
 			 __func__, ctrl->cntlid, req->sq->qid,
-			 nvme_auth_dhgroup_name(fallback_dhgid));
-		ctrl->dh_gid = fallback_dhgid;
+			 nvme_auth_dhgroup_name(ctrl->dh_gid));
+		return NVME_AUTH_DHCHAP_FAILURE_DHGROUP_UNUSABLE;
 	}
 	if (ctrl->dh_gid == NVME_AUTH_DHGROUP_NULL && ctrl->concat) {
 		pr_debug("%s: ctrl %d qid %d: NULL DH group invalid "
