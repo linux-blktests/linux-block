@@ -1249,7 +1249,8 @@ static int nvme_tcp_try_send_data(struct nvme_tcp_request *req)
 	while (true) {
 		struct bio_vec bvec;
 		struct msghdr msg = {
-			.msg_flags = MSG_DONTWAIT | MSG_SPLICE_PAGES,
+			.msg_flags = MSG_DONTWAIT | MSG_NOSIGNAL |
+				     MSG_SPLICE_PAGES,
 		};
 		struct page *page = nvme_tcp_req_cur_page(req);
 		size_t offset = nvme_tcp_req_cur_offset(req);
@@ -1308,7 +1309,9 @@ static int nvme_tcp_try_send_cmd_pdu(struct nvme_tcp_request *req)
 	struct nvme_tcp_queue *queue = req->queue;
 	struct nvme_tcp_cmd_pdu *pdu = nvme_tcp_req_cmd_pdu(req);
 	struct bio_vec bvec;
-	struct msghdr msg = { .msg_flags = MSG_DONTWAIT | MSG_SPLICE_PAGES, };
+	struct msghdr msg = {
+		.msg_flags = MSG_DONTWAIT | MSG_NOSIGNAL | MSG_SPLICE_PAGES,
+	};
 	bool inline_data = nvme_tcp_has_inline_data(req);
 	u8 hdgst = nvme_tcp_hdgst_len(queue);
 	int len = sizeof(*pdu) + hdgst - req->offset;
@@ -1349,7 +1352,9 @@ static int nvme_tcp_try_send_data_pdu(struct nvme_tcp_request *req)
 	struct nvme_tcp_queue *queue = req->queue;
 	struct nvme_tcp_data_pdu *pdu = nvme_tcp_req_data_pdu(req);
 	struct bio_vec bvec;
-	struct msghdr msg = { .msg_flags = MSG_DONTWAIT | MSG_MORE, };
+	struct msghdr msg = {
+		.msg_flags = MSG_DONTWAIT | MSG_NOSIGNAL | MSG_MORE,
+	};
 	u8 hdgst = nvme_tcp_hdgst_len(queue);
 	int len = sizeof(*pdu) - req->offset + hdgst;
 	int ret;
@@ -1384,7 +1389,7 @@ static int nvme_tcp_try_send_ddgst(struct nvme_tcp_request *req)
 	size_t offset = req->offset;
 	u32 h2cdata_left = req->h2cdata_left;
 	int ret;
-	struct msghdr msg = { .msg_flags = MSG_DONTWAIT };
+	struct msghdr msg = { .msg_flags = MSG_DONTWAIT | MSG_NOSIGNAL };
 	struct kvec iov = {
 		.iov_base = (u8 *)&req->ddgst + req->offset,
 		.iov_len = NVME_TCP_DIGEST_LENGTH - req->offset
@@ -1696,7 +1701,7 @@ static int nvme_tcp_init_connection(struct nvme_tcp_queue *queue)
 	struct nvme_tcp_icresp_pdu *icresp;
 	char cbuf[CMSG_LEN(sizeof(char))] = {};
 	u8 ctype;
-	struct msghdr msg = {};
+	struct msghdr msg = { .msg_flags = MSG_NOSIGNAL };
 	struct kvec iov;
 	bool ctrl_hdgst, ctrl_ddgst;
 	u32 maxh2cdata;
