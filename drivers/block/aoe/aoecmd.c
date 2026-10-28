@@ -974,7 +974,7 @@ ataid_complete(struct aoedev *d, struct aoetgt *t, unsigned char *id)
 			d->fw_ver, (long long)ssize);
 	d->ssize = ssize;
 	d->geo.start = 0;
-	if (d->flags & (DEVFL_GDALLOC|DEVFL_NEWSIZE))
+	if (d->flags & (DEVFL_GDALLOC | DEVFL_NEWSIZE | DEVFL_TKILL))
 		return;
 	if (d->gd != NULL)
 		d->flags |= DEVFL_NEWSIZE;
