@@ -269,6 +269,7 @@ void nvmet_execute_auth_send(struct nvmet_req *req)
 	u8 dhchap_status;
 
 	mutex_lock(&req->sq->auth_lock);
+	mutex_lock(&ctrl->auth_lock);
 
 	if (req->cmd->auth_send.secp != NVME_AUTH_DHCHAP_PROTOCOL_IDENTIFIER) {
 		status = NVME_SC_INVALID_FIELD | NVME_STATUS_DNR;
@@ -297,6 +298,7 @@ void nvmet_execute_auth_send(struct nvmet_req *req)
 	}
 	if (unlikely(tl != req->transfer_len)) {
 		pr_debug("%s: transfer length mismatch (%u)\n", __func__, tl);
+		mutex_unlock(&ctrl->auth_lock);
 		mutex_unlock(&req->sq->auth_lock);
 		nvmet_check_transfer_len(req, tl);
 		return;
@@ -442,6 +444,7 @@ done:
 		nvmet_ctrl_fatal_error(ctrl);
 
 complete:
+	mutex_unlock(&ctrl->auth_lock);
 	mutex_unlock(&req->sq->auth_lock);
 	nvmet_req_complete(req, status);
 }
@@ -562,6 +565,7 @@ void nvmet_execute_auth_receive(struct nvmet_req *req)
 	u16 status = 0;
 
 	mutex_lock(&req->sq->auth_lock);
+	mutex_lock(&ctrl->auth_lock);
 
 	if (req->cmd->auth_receive.secp != NVME_AUTH_DHCHAP_PROTOCOL_IDENTIFIER) {
 		status = NVME_SC_INVALID_FIELD | NVME_STATUS_DNR;
@@ -590,6 +594,7 @@ void nvmet_execute_auth_receive(struct nvmet_req *req)
 	}
 	if (unlikely(al != req->transfer_len)) {
 		pr_debug("%s: transfer length mismatch (%u)\n", __func__, al);
+		mutex_unlock(&ctrl->auth_lock);
 		mutex_unlock(&req->sq->auth_lock);
 		nvmet_check_transfer_len(req, al);
 		return;
@@ -650,6 +655,7 @@ done:
 		nvmet_auth_sq_free(req->sq);
 		nvmet_ctrl_fatal_error(ctrl);
 	}
+	mutex_unlock(&ctrl->auth_lock);
 	mutex_unlock(&req->sq->auth_lock);
 	nvmet_req_complete(req, status);
 }

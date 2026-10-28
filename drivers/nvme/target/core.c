@@ -1642,6 +1642,7 @@ struct nvmet_ctrl *nvmet_alloc_ctrl(struct nvmet_alloc_ctrl_args *args)
 	if (!ctrl)
 		goto out_put_subsystem;
 	mutex_init(&ctrl->lock);
+	mutex_init(&ctrl->auth_lock);
 
 	ctrl->port = args->port;
 	ctrl->ops = args->ops;
@@ -1728,7 +1729,10 @@ struct nvmet_ctrl *nvmet_alloc_ctrl(struct nvmet_alloc_ctrl_args *args)
 
 	nvmet_start_keep_alive_timer(ctrl);
 
+	/* An I/O queue may connect as soon as the controller is on the list. */
+	mutex_lock(&ctrl->auth_lock);
 	dhchap_status = nvmet_setup_auth(ctrl, args->sq, false);
+	mutex_unlock(&ctrl->auth_lock);
 	if (dhchap_status) {
 		pr_err("Failed to setup authentication, dhchap status %u\n",
 		       dhchap_status);
