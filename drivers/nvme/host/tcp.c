@@ -766,11 +766,14 @@ static int nvme_tcp_handle_comp(struct nvme_tcp_queue *queue,
 	 * for them but rather special case them here.
 	 */
 	if (unlikely(nvme_is_aen_req(nvme_tcp_queue_id(queue),
-				     cqe->command_id)))
+				     cqe->command_id))) {
+		if (nvme_tcp_req_busy(queue, &queue->ctrl->async_req))
+			return -EBUSY;
 		nvme_complete_async_event(&queue->ctrl->ctrl, cqe->status,
 				&cqe->result);
-	else
+	} else {
 		ret = nvme_tcp_process_nvme_cqe(queue, cqe);
+	}
 
 	return ret;
 }
@@ -1646,6 +1649,8 @@ static int nvme_tcp_alloc_async_req(struct nvme_tcp_ctrl *ctrl)
 		return -ENOMEM;
 
 	async->queue = &ctrl->queues[0];
+	init_llist_node(&async->lentry);
+	INIT_LIST_HEAD(&async->entry);
 	return 0;
 }
 
@@ -2884,6 +2889,10 @@ static void nvme_tcp_submit_async_event(struct nvme_ctrl *arg)
 	struct nvme_command *cmd = &pdu->cmd;
 	u8 hdgst = nvme_tcp_hdgst_len(queue);
 
+	/* A controller which completes it twice makes us come here twice */
+	if (nvme_tcp_req_busy(queue, &ctrl->async_req))
+		return;
+
 	memset(pdu, 0, sizeof(*pdu));
 	pdu->hdr.type = nvme_tcp_cmd;
 	if (queue->hdr_digest)
@@ -2900,8 +2909,6 @@ static void nvme_tcp_submit_async_event(struct nvme_ctrl *arg)
 	ctrl->async_req.offset = 0;
 	ctrl->async_req.curr_bio = NULL;
 	ctrl->async_req.data_len = 0;
-	init_llist_node(&ctrl->async_req.lentry);
-	INIT_LIST_HEAD(&ctrl->async_req.entry);
 
 	nvme_tcp_queue_request(&ctrl->async_req, true);
 }
