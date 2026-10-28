@@ -162,6 +162,7 @@ struct nvme_tcp_queue_setup_ctx {
 struct nvme_tcp_ctrl {
 	/* read only in the hot path */
 	struct nvme_tcp_queue	*queues;
+	int			nr_queues;	/* allocated, see queue_count */
 	struct blk_mq_tag_set	tag_set;
 
 	/* other member variables */
@@ -1668,8 +1669,6 @@ static void nvme_tcp_free_queue(struct nvme_ctrl *nctrl, int qid)
 	if (!test_and_clear_bit(NVME_TCP_Q_ALLOCATED, &queue->flags))
 		return;
 
-	page_frag_cache_drain(&queue->pf_cache);
-
 	/**
 	 * Prevent memory reclaim from triggering block I/O during socket
 	 * teardown. The socket release path fput -> tcp_close ->
@@ -1692,7 +1691,6 @@ static void nvme_tcp_free_queue(struct nvme_ctrl *nctrl, int qid)
 
 	kfree(queue->pdu);
 	mutex_destroy(&queue->send_mutex);
-	mutex_destroy(&queue->pf_cache_lock);
 }
 
 static int nvme_tcp_init_connection(struct nvme_tcp_queue *queue)
@@ -2021,7 +2019,6 @@ static int nvme_tcp_alloc_queue(struct nvme_ctrl *nctrl, int qid,
 	INIT_LIST_HEAD(&queue->send_list);
 	mutex_init(&queue->send_mutex);
 	INIT_WORK(&queue->io_work, nvme_tcp_io_work);
-	mutex_init(&queue->pf_cache_lock);
 
 	if (qid > 0)
 		queue->cmnd_capsule_len = nctrl->ioccsz * 16;
@@ -2153,7 +2150,6 @@ err_sock:
 	queue->sock = NULL;
 err_destroy_mutex:
 	mutex_destroy(&queue->send_mutex);
-	mutex_destroy(&queue->pf_cache_lock);
 	return ret;
 }
 
@@ -2840,6 +2836,10 @@ static void nvme_tcp_stop_ctrl(struct nvme_ctrl *ctrl)
 static void nvme_tcp_free_ctrl(struct nvme_ctrl *nctrl)
 {
 	struct nvme_tcp_ctrl *ctrl = to_tcp_ctrl(nctrl);
+	int i;
+
+	for (i = 0; i < ctrl->nr_queues; i++)
+		page_frag_cache_drain(&ctrl->queues[i].pf_cache);
 
 	if (list_empty_careful(&ctrl->list))
 		goto free_ctrl;
@@ -3265,9 +3265,15 @@ static struct nvme_tcp_ctrl *nvme_tcp_alloc_ctrl(struct device *dev,
 		ret = -ENOMEM;
 		goto out_free_ctrl;
 	}
-	/* A poller may try the lock of a queue that has been freed */
-	for (i = 0; i < ctrl->ctrl.queue_count; i++)
+	ctrl->nr_queues = ctrl->ctrl.queue_count;
+	/*
+	 * A poller may try the lock of a queue that has been freed, and a
+	 * request of a new namespace may be set up for one.
+	 */
+	for (i = 0; i < ctrl->nr_queues; i++) {
 		mutex_init(&ctrl->queues[i].queue_lock);
+		mutex_init(&ctrl->queues[i].pf_cache_lock);
+	}
 
 	ctrl->net = get_net(current->nsproxy->net_ns);
 
