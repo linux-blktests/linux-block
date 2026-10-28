@@ -90,7 +90,8 @@
 		| UBLK_F_BATCH_IO \
 		| UBLK_F_NO_AUTO_PART_SCAN \
 		| UBLK_F_SHMEM_ZC \
-		| UBLK_F_IO_DESC_SIZE)
+		| UBLK_F_IO_DESC_SIZE \
+		| UBLK_F_SUPPORT_RQ_AFFINITY)
 
 #define UBLK_F_ALL_RECOVERY_FLAGS (UBLK_F_USER_RECOVERY \
 		| UBLK_F_USER_RECOVERY_REISSUE \
@@ -466,6 +467,11 @@ static inline bool ublk_dev_support_user_copy(const struct ublk_device *ub)
 	return ub->dev_info.flags & UBLK_F_USER_COPY;
 }
 
+static inline bool ublk_dev_support_rq_affinity(const struct ublk_device *ub)
+{
+	return ub->dev_info.flags & UBLK_F_SUPPORT_RQ_AFFINITY;
+}
+
 static inline bool ublk_dev_is_zoned(const struct ublk_device *ub)
 {
 	return ub->dev_info.flags & UBLK_F_ZONED;
@@ -798,7 +804,8 @@ static void ublk_setup_iod_zoned(struct ublk_queue *ubq, struct request *req)
 #endif
 
 static inline void __ublk_complete_rq(struct request *req, struct ublk_io *io,
-				      bool need_map, struct io_comp_batch *iob);
+				      bool need_map, bool rq_affinity,
+				      struct io_comp_batch *iob);
 
 static dev_t ublk_chr_devt;
 static const struct class ublk_chr_class = {
@@ -1210,13 +1217,15 @@ static inline bool ublk_get_req_ref(struct ublk_io *io)
 	return refcount_inc_not_zero(&io->ref);
 }
 
-static inline void ublk_put_req_ref(struct ublk_io *io, struct request *req)
+static inline void ublk_put_req_ref(const struct ublk_device *ub,
+				    struct ublk_io *io, struct request *req)
 {
 	if (!refcount_dec_and_test(&io->ref))
 		return;
 
 	/* ublk_need_map_io() and ublk_need_req_ref() are mutually exclusive */
-	__ublk_complete_rq(req, io, false, NULL);
+	__ublk_complete_rq(req, io, false, ublk_dev_support_rq_affinity(ub),
+			   NULL);
 }
 
 static inline bool ublk_sub_req_ref(struct ublk_io *io)
@@ -1560,9 +1569,33 @@ static void ublk_end_request(struct request *req, blk_status_t error)
 	local_bh_enable();
 }
 
+/*
+ * Runs after blk_mq_complete_request_remote() redirected a fully successful
+ * @req to the submitting CPU. May run on a CPU other than the ublk server's,
+ * so don't touch ublk_io/ublk_queue here.
+ */
+static void ublk_end_rq(struct request *req)
+{
+	blk_mq_end_request(req, BLK_STS_OK);
+}
+
+/*
+ * Only a fully completed request is redirected: partial completion,
+ * errors and the copy-back failure cases keep completing inline.
+ * rq_affinity=0 also completes inline, even on a single hw queue.
+ */
+static inline bool ublk_complete_rq_remote(struct request *req,
+					   struct ublk_io *io, bool rq_affinity)
+{
+	return rq_affinity && io->res == blk_rq_bytes(req) &&
+	       test_bit(QUEUE_FLAG_SAME_COMP, &req->q->queue_flags) &&
+	       blk_mq_complete_request_remote(req);
+}
+
 /* todo: handle partial completion */
 static inline void __ublk_complete_rq(struct request *req, struct ublk_io *io,
-				      bool need_map, struct io_comp_batch *iob)
+				      bool need_map, bool rq_affinity,
+				      struct io_comp_batch *iob)
 {
 	unsigned int unmapped_bytes;
 	blk_status_t res = BLK_STS_OK;
@@ -1599,6 +1632,9 @@ static inline void __ublk_complete_rq(struct request *req, struct ublk_io *io,
 		io->res = unmapped_bytes;
 	}
 
+	if (ublk_complete_rq_remote(req, io, rq_affinity))
+		return;
+
 	/*
 	 * Run bio->bi_end_io() with softirqs disabled. If the final fput
 	 * happens off this path, then that will prevent ublk's blkdev_release()
@@ -1625,6 +1661,8 @@ static inline void __ublk_complete_rq(struct request *req, struct ublk_io *io,
 
 	return;
 exit:
+	if (res == BLK_STS_OK && ublk_complete_rq_remote(req, io, rq_affinity))
+		return;
 	ublk_end_request(req, res);
 }
 
@@ -2358,6 +2396,7 @@ static const struct blk_mq_ops ublk_mq_ops = {
 	.queue_rqs      = ublk_queue_rqs,
 	.init_hctx	= ublk_init_hctx,
 	.timeout	= ublk_timeout,
+	.complete	= ublk_end_rq,
 };
 
 static const struct blk_mq_ops ublk_batch_mq_ops = {
@@ -2366,6 +2405,7 @@ static const struct blk_mq_ops ublk_batch_mq_ops = {
 	.queue_rqs      = ublk_batch_queue_rqs,
 	.init_hctx	= ublk_init_hctx,
 	.timeout	= ublk_timeout,
+	.complete	= ublk_end_rq,
 };
 
 static void ublk_queue_reinit(struct ublk_device *ub, struct ublk_queue *ubq)
@@ -2715,7 +2755,8 @@ static void __ublk_fail_req(struct ublk_device *ub, struct ublk_io *io,
 		blk_mq_requeue_request(req, false);
 	else {
 		io->res = -EIO;
-		__ublk_complete_rq(req, io, ublk_dev_need_map_io(ub), NULL);
+		__ublk_complete_rq(req, io, ublk_dev_need_map_io(ub),
+				   ublk_dev_support_rq_affinity(ub), NULL);
 	}
 }
 
@@ -3266,7 +3307,7 @@ static void ublk_io_release(void *priv)
 	if (current == io->task && io->task_registered_buffers)
 		io->task_registered_buffers--;
 	else
-		ublk_put_req_ref(io, rq);
+		ublk_put_req_ref(ubq->dev, io, rq);
 }
 
 static int ublk_register_io_buf(struct io_uring_cmd *cmd,
@@ -3288,7 +3329,7 @@ static int ublk_register_io_buf(struct io_uring_cmd *cmd,
 	ret = io_buffer_register_request(cmd, req, ublk_io_release, index,
 					 issue_flags);
 	if (ret) {
-		ublk_put_req_ref(io, req);
+		ublk_put_req_ref(ub, io, req);
 		return ret;
 	}
 
@@ -3559,7 +3600,8 @@ static int ublk_ch_uring_cmd_local(struct io_uring_cmd *cmd,
 		if (req_op(req) == REQ_OP_ZONE_APPEND)
 			req->__sector = addr;
 		if (compl)
-			__ublk_complete_rq(req, io, ublk_dev_need_map_io(ub), NULL);
+			__ublk_complete_rq(req, io, ublk_dev_need_map_io(ub),
+					   ublk_dev_support_rq_affinity(ub), NULL);
 		break;
 	}
 	case UBLK_IO_NEED_GET_DATA:
@@ -3616,7 +3658,7 @@ static inline struct request *__ublk_check_and_get_req(struct ublk_device *ub,
 
 	return req;
 fail_put:
-	ublk_put_req_ref(io, req);
+	ublk_put_req_ref(ub, io, req);
 	return NULL;
 }
 
@@ -3907,7 +3949,9 @@ static int ublk_batch_commit_io(struct ublk_queue *ubq,
 	if (req_op(req) == REQ_OP_ZONE_APPEND)
 		req->__sector = ublk_batch_zone_lba(uc, elem);
 	if (compl)
-		__ublk_complete_rq(req, io, ublk_dev_need_map_io(data->ub), data->iob);
+		__ublk_complete_rq(req, io, ublk_dev_need_map_io(data->ub),
+				   ublk_dev_support_rq_affinity(data->ub),
+				   data->iob);
 	return 0;
 }
 
@@ -4239,7 +4283,7 @@ ublk_user_copy(struct kiocb *iocb, struct iov_iter *iter, int dir)
 
 out:
 	if (!on_daemon)
-		ublk_put_req_ref(io, req);
+		ublk_put_req_ref(ub, io, req);
 	return ret;
 }
 
