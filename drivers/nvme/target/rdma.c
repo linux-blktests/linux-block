@@ -519,7 +519,7 @@ static void nvmet_rdma_process_wr_wait_list(struct nvmet_rdma_queue *queue,
 	unsigned long flags;
 
 	spin_lock_irqsave(&queue->rsp_wr_wait_lock, flags);
-	if (done->wait_released) {
+	if (done && done->wait_released) {
 		/*
 		 * The loop below has not come back from this command yet. It is
 		 * further up this stack if the command completed in place and
@@ -551,6 +551,15 @@ static void nvmet_rdma_process_wr_wait_list(struct nvmet_rdma_queue *queue,
 			WRITE_ONCE(rsp->wait_released, NULL);
 		if (!ret) {
 			list_add(&rsp->wait_list, &queue->rsp_wr_wait_list);
+			/*
+			 * A release that came while the command was off the
+			 * list can have seen an empty list, so look at the
+			 * room again.
+			 * Pairs with the barrier in nvmet_rdma_release_rsp().
+			 */
+			smp_mb();
+			if (atomic_read(&queue->sq_wr_avail) > rsp->n_rdma)
+				continue;
 			break;
 		}
 	}
@@ -698,6 +707,11 @@ static void nvmet_rdma_release_rsp(struct nvmet_rdma_rsp *rsp)
 	struct nvmet_rdma_queue *queue = rsp->queue;
 
 	atomic_add(1 + rsp->n_rdma, &queue->sq_wr_avail);
+	/*
+	 * Give the room back ahead of the look at the wait list below.
+	 * Pairs with the smp_mb() in nvmet_rdma_process_wr_wait_list().
+	 */
+	smp_mb__after_atomic();
 
 	nvmet_rdma_free_rsp_resources(rsp);
 
@@ -1021,6 +1035,8 @@ static void nvmet_rdma_handle_command(struct nvmet_rdma_queue *queue,
 		spin_lock_irqsave(&queue->rsp_wr_wait_lock, flags);
 		list_add_tail(&cmd->wait_list, &queue->rsp_wr_wait_list);
 		spin_unlock_irqrestore(&queue->rsp_wr_wait_lock, flags);
+		/* The last response may have been released in between. */
+		nvmet_rdma_process_wr_wait_list(queue, NULL);
 	}
 
 	return;
