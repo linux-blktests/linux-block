@@ -264,6 +264,30 @@ static u32 nvmet_connect_result(struct nvmet_ctrl *ctrl, struct nvmet_sq *sq)
 		(needs_auth ? NVME_CONNECT_AUTHREQ_ATR : 0);
 }
 
+/*
+ * The identity of a TLS PSK names the host that the key was made for:
+ * "NVMe<version><type><hash> <host NQN> <subsystem NQN> ...".
+ * Whoever has proven to hold the key is that host, and no other one.
+ */
+static u16 nvmet_check_tls_host(struct nvmet_sq *sq, const char *hostnqn)
+{
+#ifdef CONFIG_NVME_TARGET_TCP_TLS
+	size_t len = strlen(hostnqn);
+	const char *id;
+
+	if (!sq->tls_key)
+		return 0;
+
+	id = strchr(sq->tls_key->description, ' ');
+	if (!id || strncmp(id + 1, hostnqn, len) || id[len + 1] != ' ') {
+		pr_warn("TLS PSK %08x does not belong to host %s\n",
+			key_serial(sq->tls_key), hostnqn);
+		return NVME_SC_CONNECT_INVALID_HOST | NVME_STATUS_DNR;
+	}
+#endif
+	return 0;
+}
+
 static void nvmet_execute_admin_connect(struct nvmet_req *req)
 {
 	struct nvmf_connect_command *c = &req->cmd->connect;
@@ -308,6 +332,10 @@ static void nvmet_execute_admin_connect(struct nvmet_req *req)
 
 	d->subsysnqn[NVMF_NQN_FIELD_LEN - 1] = '\0';
 	d->hostnqn[NVMF_NQN_FIELD_LEN - 1] = '\0';
+
+	args.status = nvmet_check_tls_host(req->sq, d->hostnqn);
+	if (args.status)
+		goto out;
 
 	args.subsysnqn = d->subsysnqn;
 	args.hostnqn = d->hostnqn;
@@ -363,6 +391,11 @@ static void nvmet_execute_io_connect(struct nvmet_req *req)
 
 	d->subsysnqn[NVMF_NQN_FIELD_LEN - 1] = '\0';
 	d->hostnqn[NVMF_NQN_FIELD_LEN - 1] = '\0';
+
+	status = nvmet_check_tls_host(req->sq, d->hostnqn);
+	if (status)
+		goto out;
+
 	ctrl = nvmet_ctrl_find_get(d->subsysnqn, d->hostnqn,
 				   le16_to_cpu(d->cntlid), req);
 	if (!ctrl) {
