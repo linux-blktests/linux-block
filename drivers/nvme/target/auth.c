@@ -299,14 +299,14 @@ int nvmet_auth_host_hash(struct nvmet_req *req, u8 *response,
 	if (IS_ERR(transformed_key))
 		return PTR_ERR(transformed_key);
 
-	ret = nvme_auth_hmac_init(&hmac, ctrl->shash_id, transformed_key->key,
-				  transformed_key->len);
+	ret = nvme_auth_hmac_init(&hmac, req->sq->shash_id,
+				  transformed_key->key, transformed_key->len);
 	if (ret)
 		goto out_free_response;
 
-	if (shash_len != nvme_auth_hmac_hash_len(ctrl->shash_id)) {
+	if (shash_len != nvme_auth_hmac_hash_len(req->sq->shash_id)) {
 		pr_err("%s: hash len mismatch (len %u digest %zu)\n", __func__,
-		       shash_len, nvme_auth_hmac_hash_len(ctrl->shash_id));
+		       shash_len, nvme_auth_hmac_hash_len(req->sq->shash_id));
 		ret = -EINVAL;
 		goto out_free_response;
 	}
@@ -317,7 +317,7 @@ int nvmet_auth_host_hash(struct nvmet_req *req, u8 *response,
 			ret = -ENOMEM;
 			goto out_free_response;
 		}
-		ret = nvme_auth_augmented_challenge(ctrl->shash_id,
+		ret = nvme_auth_augmented_challenge(req->sq->shash_id,
 						    req->sq->dhchap_skey,
 						    req->sq->dhchap_skey_len,
 						    req->sq->dhchap_c1,
@@ -371,14 +371,14 @@ int nvmet_auth_ctrl_hash(struct nvmet_req *req, u8 *response,
 	if (IS_ERR(transformed_key))
 		return PTR_ERR(transformed_key);
 
-	ret = nvme_auth_hmac_init(&hmac, ctrl->shash_id, transformed_key->key,
-				  transformed_key->len);
+	ret = nvme_auth_hmac_init(&hmac, req->sq->shash_id,
+				  transformed_key->key, transformed_key->len);
 	if (ret)
 		goto out_free_response;
 
-	if (shash_len != nvme_auth_hmac_hash_len(ctrl->shash_id)) {
+	if (shash_len != nvme_auth_hmac_hash_len(req->sq->shash_id)) {
 		pr_err("%s: hash len mismatch (len %u digest %zu)\n", __func__,
-		       shash_len, nvme_auth_hmac_hash_len(ctrl->shash_id));
+		       shash_len, nvme_auth_hmac_hash_len(req->sq->shash_id));
 		ret = -EINVAL;
 		goto out_free_response;
 	}
@@ -389,7 +389,7 @@ int nvmet_auth_ctrl_hash(struct nvmet_req *req, u8 *response,
 			ret = -ENOMEM;
 			goto out_free_response;
 		}
-		ret = nvme_auth_augmented_challenge(ctrl->shash_id,
+		ret = nvme_auth_augmented_challenge(req->sq->shash_id,
 						    req->sq->dhchap_skey,
 						    req->sq->dhchap_skey_len,
 						    req->sq->dhchap_c2,
@@ -456,7 +456,8 @@ int nvmet_auth_ctrl_sesskey(struct nvmet_req *req,
 	struct nvmet_ctrl *ctrl = req->sq->ctrl;
 	int ret;
 
-	req->sq->dhchap_skey_len = nvme_auth_hmac_hash_len(ctrl->shash_id);
+	req->sq->dhchap_skey_len =
+		nvme_auth_hmac_hash_len(req->sq->shash_id);
 	req->sq->dhchap_skey = kzalloc(req->sq->dhchap_skey_len, GFP_KERNEL);
 	if (!req->sq->dhchap_skey)
 		return -ENOMEM;
@@ -464,7 +465,7 @@ int nvmet_auth_ctrl_sesskey(struct nvmet_req *req,
 					pkey, pkey_size,
 					req->sq->dhchap_skey,
 					req->sq->dhchap_skey_len,
-					ctrl->shash_id);
+					req->sq->shash_id);
 	if (ret)
 		pr_debug("failed to compute session key, err %d\n", ret);
 #ifdef CONFIG_NVME_TARGET_AUTH_DEBUG
@@ -478,7 +479,7 @@ int nvmet_auth_ctrl_sesskey(struct nvmet_req *req,
 
 void nvmet_auth_insert_psk(struct nvmet_sq *sq)
 {
-	int hash_len = nvme_auth_hmac_hash_len(sq->ctrl->shash_id);
+	int hash_len = nvme_auth_hmac_hash_len(sq->shash_id);
 	u8 *psk, *tls_psk;
 	char *digest;
 	size_t psk_len;
@@ -487,7 +488,7 @@ void nvmet_auth_insert_psk(struct nvmet_sq *sq)
 	struct key *tls_key = NULL;
 #endif
 
-	ret = nvme_auth_generate_psk(sq->ctrl->shash_id,
+	ret = nvme_auth_generate_psk(sq->shash_id,
 				     sq->dhchap_skey,
 				     sq->dhchap_skey_len,
 				     sq->dhchap_c1, sq->dhchap_c2,
@@ -497,7 +498,7 @@ void nvmet_auth_insert_psk(struct nvmet_sq *sq)
 			__func__, sq->ctrl->cntlid, sq->qid, ret);
 		return;
 	}
-	ret = nvme_auth_generate_digest(sq->ctrl->shash_id, psk, psk_len,
+	ret = nvme_auth_generate_digest(sq->shash_id, psk, psk_len,
 					sq->ctrl->subsys->subsysnqn,
 					sq->ctrl->hostnqn, &digest);
 	if (ret) {
@@ -505,7 +506,7 @@ void nvmet_auth_insert_psk(struct nvmet_sq *sq)
 			__func__, sq->ctrl->cntlid, sq->qid, ret);
 		goto out_free_psk;
 	}
-	ret = nvme_auth_derive_tls_psk(sq->ctrl->shash_id, psk, psk_len,
+	ret = nvme_auth_derive_tls_psk(sq->shash_id, psk, psk_len,
 				       digest, &tls_psk);
 	if (ret) {
 		pr_warn("%s: ctrl %d qid %d failed to derive TLS PSK, error %d\n",
@@ -515,7 +516,7 @@ void nvmet_auth_insert_psk(struct nvmet_sq *sq)
 #ifdef CONFIG_NVME_TARGET_TCP_TLS
 	tls_key = nvme_tls_psk_refresh(NULL, sq->ctrl->hostnqn,
 				       sq->ctrl->subsys->subsysnqn,
-				       sq->ctrl->shash_id, tls_psk, psk_len,
+				       sq->shash_id, tls_psk, psk_len,
 				       digest);
 	if (IS_ERR(tls_key)) {
 		pr_warn("%s: ctrl %d qid %d failed to refresh key, error %ld\n",

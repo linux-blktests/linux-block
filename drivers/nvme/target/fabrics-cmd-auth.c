@@ -111,8 +111,9 @@ static u8 nvmet_auth_negotiate(struct nvmet_req *req, void *d, u32 tl)
 		pr_debug("%s: ctrl %d qid %d: no usable hash found, falling back to %s\n",
 			 __func__, ctrl->cntlid, req->sq->qid,
 			 nvme_auth_hmac_name(fallback_hash_id));
-		ctrl->shash_id = fallback_hash_id;
+		hash_id = fallback_hash_id;
 	}
+	req->sq->shash_id = hash_id;
 
 	dhgid = -1;
 	fallback_dhgid = -1;
@@ -454,7 +455,7 @@ static int nvmet_auth_challenge(struct nvmet_req *req, void *d, int al)
 	struct nvmf_auth_dhchap_challenge_data *data = d;
 	struct nvmet_ctrl *ctrl = req->sq->ctrl;
 	int ret = 0;
-	int hash_len = nvme_auth_hmac_hash_len(ctrl->shash_id);
+	int hash_len = nvme_auth_hmac_hash_len(req->sq->shash_id);
 	int data_size = sizeof(*data) + hash_len;
 
 	if (ctrl->dh_tfm)
@@ -469,7 +470,7 @@ static int nvmet_auth_challenge(struct nvmet_req *req, void *d, int al)
 	data->auth_type = NVME_AUTH_DHCHAP_MESSAGES;
 	data->auth_id = NVME_AUTH_DHCHAP_MESSAGE_CHALLENGE;
 	data->t_id = cpu_to_le16(req->sq->dhchap_tid);
-	data->hashid = ctrl->shash_id;
+	data->hashid = req->sq->shash_id;
 	data->hl = hash_len;
 	data->seqnum = cpu_to_le32(req->sq->dhchap_s1);
 	req->sq->dhchap_c1 = kmalloc(data->hl, GFP_KERNEL);
@@ -493,7 +494,7 @@ static int nvmet_auth_success1(struct nvmet_req *req, void *d, int al)
 {
 	struct nvmf_auth_dhchap_success1_data *data = d;
 	struct nvmet_ctrl *ctrl = req->sq->ctrl;
-	int hash_len = nvme_auth_hmac_hash_len(ctrl->shash_id);
+	int hash_len = nvme_auth_hmac_hash_len(req->sq->shash_id);
 
 	WARN_ON(al < sizeof(*data));
 	memset(data, 0, sizeof(*data));
@@ -530,7 +531,6 @@ static void nvmet_auth_failure1(struct nvmet_req *req, void *d, int al)
 
 u32 nvmet_auth_receive_data_len(struct nvmet_req *req)
 {
-	struct nvmet_ctrl *ctrl = req->sq->ctrl;
 	u32 al = le32_to_cpu(req->cmd->auth_receive.al);
 	u32 min_len;
 
@@ -544,7 +544,7 @@ u32 nvmet_auth_receive_data_len(struct nvmet_req *req)
 	case NVME_AUTH_DHCHAP_MESSAGE_SUCCESS1:
 		min_len = sizeof(struct nvmf_auth_dhchap_success1_data);
 		if (req->sq->dhchap_c2)
-			min_len += nvme_auth_hmac_hash_len(ctrl->shash_id);
+			min_len += nvme_auth_hmac_hash_len(req->sq->shash_id);
 		break;
 	default:
 		min_len = sizeof(struct nvmf_auth_dhchap_failure_data);
