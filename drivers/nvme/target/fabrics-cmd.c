@@ -377,6 +377,15 @@ static void nvmet_execute_io_connect(struct nvmet_req *req)
 		goto out_ctrl_put;
 	}
 
+	/* All queues of a controller use TLS, or none of them does. */
+	if (ctrl->tls != !!nvmet_queue_tls_keyid(req->sq)) {
+		pr_warn("ctrl %d: queue %d with%s TLS\n", ctrl->cntlid, qid,
+			ctrl->tls ? "out" : "");
+		status = NVME_SC_CONNECT_INVALID_PARAM | NVME_STATUS_DNR;
+		req->cqe->result.u32 = IPO_IATTR_CONNECT_DATA(cntlid);
+		goto out_ctrl_put;
+	}
+
 	status = nvmet_install_queue(ctrl, req);
 	if (status)
 		goto out_ctrl_put;

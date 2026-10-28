@@ -1646,6 +1646,7 @@ struct nvmet_ctrl *nvmet_alloc_ctrl(struct nvmet_alloc_ctrl_args *args)
 
 	ctrl->port = args->port;
 	ctrl->ops = args->ops;
+	ctrl->tls = args->sq && nvmet_queue_tls_keyid(args->sq);
 
 #ifdef CONFIG_NVME_TARGET_PASSTHRU
 	/* By default, set loop targets to clear IDS by default */
