@@ -1286,8 +1286,17 @@ static int nvmet_rdma_create_queue_ib(struct nvmet_rdma_queue *queue)
 	 */
 	nr_cqe = queue->recv_queue_size + 2 * queue->send_queue_size;
 
-	queue->cq = ib_cq_pool_get(ndev->device, nr_cqe + 1,
-				   queue->comp_vector, IB_POLL_WORKQUEUE);
+	/*
+	 * The host picks both sizes. Never ask ib_cq_pool_get() for more
+	 * entries than one CQ of the device can have: no CQ would ever fit,
+	 * and it would allocate new CQs until an allocation fails.
+	 */
+	if (nr_cqe + 1 > ndev->device->attrs.max_cqe)
+		queue->cq = ERR_PTR(-EINVAL);
+	else
+		queue->cq = ib_cq_pool_get(ndev->device, nr_cqe + 1,
+					   queue->comp_vector,
+					   IB_POLL_WORKQUEUE);
 	if (IS_ERR(queue->cq)) {
 		ret = PTR_ERR(queue->cq);
 		pr_err("failed to create CQ cqe= %d ret= %d\n",
