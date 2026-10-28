@@ -1955,6 +1955,8 @@ static int nvmet_tcp_tls_handshake(struct nvmet_tcp_queue *queue)
 		return -EINVAL;
 	}
 
+	/* One for the handshake, one to keep the queue until we are through */
+	kref_get(&queue->kref);
 	kref_get(&queue->kref);
 	pr_debug("queue %d: TLS ServerHello\n", queue->idx);
 	memset(&args, 0, sizeof(args));
@@ -1969,9 +1971,15 @@ static int nvmet_tcp_tls_handshake(struct nvmet_tcp_queue *queue)
 		kref_put(&queue->kref, nvmet_tcp_release_queue);
 		pr_err("failed to start TLS, err=%d\n", ret);
 	} else {
-		queue_delayed_work(nvmet_wq, &queue->tls_handshake_tmo_work,
-				   tls_handshake_timeout * HZ);
+		/* The handshake may be over, then nobody cancels the timer */
+		spin_lock_bh(&queue->state_lock);
+		if (queue->state == NVMET_TCP_Q_TLS_HANDSHAKE)
+			queue_delayed_work(nvmet_wq,
+					   &queue->tls_handshake_tmo_work,
+					   tls_handshake_timeout * HZ);
+		spin_unlock_bh(&queue->state_lock);
 	}
+	kref_put(&queue->kref, nvmet_tcp_release_queue);
 	return ret;
 }
 
