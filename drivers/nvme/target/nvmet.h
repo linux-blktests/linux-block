@@ -517,6 +517,8 @@ struct nvmet_req {
 	struct nvmet_port	*port;
 
 	void (*execute)(struct nvmet_req *req);
+	/* what nvmet_pr_execute_io() calls once it has the pc_ref */
+	void (*pr_execute)(struct nvmet_req *req);
 	const struct nvmet_fabrics_ops *ops;
 
 	struct pci_dev		*p2p_dev;
@@ -1051,7 +1053,7 @@ void nvmet_pr_exit_ns(struct nvmet_ns *ns);
 void nvmet_execute_get_log_page_resv(struct nvmet_req *req);
 u16 nvmet_set_feat_resv_notif_mask(struct nvmet_req *req, u32 mask);
 u16 nvmet_get_feat_resv_notif_mask(struct nvmet_req *req);
-u16 nvmet_pr_get_ns_pc_ref(struct nvmet_req *req);
+void nvmet_pr_set_execute(struct nvmet_req *req);
 static inline void nvmet_pr_put_ns_pc_ref(struct nvmet_pr_per_ctrl_ref *pc_ref)
 {
 	percpu_ref_put(&pc_ref->ref);

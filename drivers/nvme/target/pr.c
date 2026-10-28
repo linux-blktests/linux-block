@@ -1060,7 +1060,7 @@ unlock:
 	return status;
 }
 
-u16 nvmet_pr_get_ns_pc_ref(struct nvmet_req *req)
+static u16 nvmet_pr_get_ns_pc_ref(struct nvmet_req *req)
 {
 	struct nvmet_pr_per_ctrl_ref *pc_ref;
 
@@ -1070,6 +1070,46 @@ u16 nvmet_pr_get_ns_pc_ref(struct nvmet_req *req)
 		return NVME_SC_INTERNAL;
 	req->pc_ref = pc_ref;
 	return NVME_SC_SUCCESS;
+}
+
+static void nvmet_pr_execute_io(struct nvmet_req *req)
+{
+	u16 status;
+
+	status = nvmet_pr_get_ns_pc_ref(req);
+	if (!status) {
+		/*
+		 * The host can have lost its registration since the command was
+		 * parsed. A get that succeeds after "preempt and abort" has
+		 * resurrected the pc_ref has to see that. In percpu mode the
+		 * get orders no later load, so this pairs with the
+		 * smp_store_release() in __percpu_ref_switch_to_percpu(). While
+		 * the resurrect is under way the get is a fully ordered
+		 * atomic_long_inc_not_zero(). queue_work() in
+		 * nvmet_execute_pr_acquire() orders the unregistration before
+		 * the resurrect.
+		 */
+		smp_rmb();
+		status = nvmet_pr_check_cmd_access(req);
+	}
+	if (status) {
+		nvmet_req_complete(req, status);
+		return;
+	}
+
+	req->pr_execute(req);
+}
+
+/*
+ * "Preempt and abort" waits for the commands that hold a pc_ref. Until the
+ * transport calls ->execute(), the end of a command can depend on the host,
+ * which may still have to send the data, and on the context and the resources
+ * of the transport. So a command gets its pc_ref only then.
+ */
+void nvmet_pr_set_execute(struct nvmet_req *req)
+{
+	req->pr_execute = req->execute;
+	req->execute = nvmet_pr_execute_io;
 }
 
 static void nvmet_pr_ctrl_ns_all_cmds_done(struct percpu_ref *ref)

@@ -1171,7 +1171,7 @@ static u16 nvmet_parse_io_cmd(struct nvmet_req *req)
 		if (ret)
 			return ret;
 
-		ret = nvmet_pr_get_ns_pc_ref(req);
+		nvmet_pr_set_execute(req);
 	}
 	return ret;
 }
