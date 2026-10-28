@@ -1516,6 +1516,14 @@ static int nvme_tcp_try_recv(struct nvme_tcp_queue *queue)
 	if (consumed == -EINVAL && nvme_tcp_queue_tls(queue) &&
 	    queue->rd_enabled)
 		consumed = nvme_tcp_recv_tls_ctrl(queue);
+	if (consumed == -EKEYEXPIRED && queue->rd_enabled) {
+		/* Nobody is going to install the new key */
+		dev_err(queue->ctrl->ctrl.device,
+			"queue %d: TLS KeyUpdate is not supported\n",
+			nvme_tcp_queue_id(queue));
+		queue->rd_enabled = false;
+		nvme_tcp_error_recovery(&queue->ctrl->ctrl);
+	}
 	return consumed == -EAGAIN ? 0 : consumed;
 }
 
