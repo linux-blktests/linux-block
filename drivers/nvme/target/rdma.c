@@ -77,6 +77,8 @@ struct nvmet_rdma_rsp {
 	u32			invalidate_rkey;
 
 	struct list_head	wait_list;
+	/* set under rsp_wr_wait_lock while the wait list's loop executes us */
+	bool			*wait_released;
 	int			tag;
 };
 
@@ -511,23 +513,42 @@ static int nvmet_rdma_post_recv(struct nvmet_rdma_device *ndev,
 	return ret;
 }
 
-static void nvmet_rdma_process_wr_wait_list(struct nvmet_rdma_queue *queue)
+static void nvmet_rdma_process_wr_wait_list(struct nvmet_rdma_queue *queue,
+					    struct nvmet_rdma_rsp *done)
 {
 	unsigned long flags;
 
 	spin_lock_irqsave(&queue->rsp_wr_wait_lock, flags);
+	if (done->wait_released) {
+		/*
+		 * The loop below has not come back from this command yet. It is
+		 * further up this stack if the command completed in place and
+		 * its response could not be posted. Otherwise it runs in
+		 * another context. It goes on with the list, so leave the list
+		 * to it.
+		 */
+		*done->wait_released = true;
+		WRITE_ONCE(done->wait_released, NULL);
+		spin_unlock_irqrestore(&queue->rsp_wr_wait_lock, flags);
+		return;
+	}
 	while (!list_empty(&queue->rsp_wr_wait_list)) {
 		struct nvmet_rdma_rsp *rsp;
+		bool released = false;
 		bool ret;
 
 		rsp = list_entry(queue->rsp_wr_wait_list.next,
 				struct nvmet_rdma_rsp, wait_list);
 		list_del(&rsp->wait_list);
+		rsp->wait_released = &released;
 
 		spin_unlock_irqrestore(&queue->rsp_wr_wait_lock, flags);
 		ret = nvmet_rdma_execute_command(rsp);
 		spin_lock_irqsave(&queue->rsp_wr_wait_lock, flags);
 
+		/* A released response can be freed, or in use again. */
+		if (!released)
+			WRITE_ONCE(rsp->wait_released, NULL);
 		if (!ret) {
 			list_add(&rsp->wait_list, &queue->rsp_wr_wait_list);
 			break;
@@ -680,8 +701,9 @@ static void nvmet_rdma_release_rsp(struct nvmet_rdma_rsp *rsp)
 
 	nvmet_rdma_free_rsp_resources(rsp);
 
-	if (unlikely(!list_empty_careful(&queue->rsp_wr_wait_list)))
-		nvmet_rdma_process_wr_wait_list(queue);
+	if (unlikely(READ_ONCE(rsp->wait_released) ||
+		     !list_empty_careful(&queue->rsp_wr_wait_list)))
+		nvmet_rdma_process_wr_wait_list(queue, rsp);
 
 	nvmet_rdma_put_rsp(rsp);
 }
