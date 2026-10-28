@@ -1507,6 +1507,11 @@ struct nvmet_ctrl *nvmet_ctrl_find_get(const char *subsysnqn,
 				pr_warn("hostnqn mismatch.\n");
 				continue;
 			}
+			/* All queues of a controller come in by its port. */
+			if (ctrl->port != req->port || ctrl->ops != req->ops) {
+				pr_warn("port mismatch.\n");
+				continue;
+			}
 			if (!kref_get_unless_zero(&ctrl->ref))
 				continue;
 
