@@ -88,6 +88,8 @@ struct nvmet_pr {
 	 */
 	struct semaphore	pr_sem;
 	struct list_head	registrant_list;
+	/* The pc_refs that a running "preempt and abort" has killed. */
+	struct list_head	abort_list;
 };
 
 struct nvmet_pr_per_ctrl_ref {
@@ -95,6 +97,9 @@ struct nvmet_pr_per_ctrl_ref {
 	struct completion	free_done;
 	struct completion	confirm_done;
 	uuid_t			hostid;
+	/* Both are written under the lock of ns->pr_per_ctrl_refs. */
+	struct list_head	abort_entry;
+	bool			ctrl_gone;
 };
 
 struct nvmet_ns {

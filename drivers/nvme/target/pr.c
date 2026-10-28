@@ -468,18 +468,54 @@ static void nvmet_pr_confirm_ns_pc_ref(struct percpu_ref *ref)
 	complete(&pc_ref->confirm_done);
 }
 
+static void nvmet_pr_free_pc_ref(struct nvmet_pr_per_ctrl_ref *pc_ref)
+{
+	percpu_ref_exit(&pc_ref->ref);
+	kfree(pc_ref);
+}
+
+/*
+ * The controller goes away. "Preempt and abort" sleeps on the pc_refs on its
+ * list, so leave the free of such a pc_ref to nvmet_pr_do_abort().
+ */
+static void nvmet_pr_erase_pc_ref(struct nvmet_ns *ns, unsigned long cntlid)
+{
+	struct nvmet_pr_per_ctrl_ref *pc_ref;
+
+	xa_lock(&ns->pr_per_ctrl_refs);
+	pc_ref = __xa_erase(&ns->pr_per_ctrl_refs, cntlid);
+	if (pc_ref && !list_empty(&pc_ref->abort_entry)) {
+		pc_ref->ctrl_gone = true;
+		pc_ref = NULL;
+	}
+	xa_unlock(&ns->pr_per_ctrl_refs);
+
+	if (pc_ref)
+		nvmet_pr_free_pc_ref(pc_ref);
+}
+
 static void nvmet_pr_set_ctrl_to_abort(struct nvmet_req *req, uuid_t *hostid)
 {
 	struct nvmet_pr_per_ctrl_ref *pc_ref;
 	struct nvmet_ns *ns = req->ns;
 	unsigned long idx;
 
+	xa_lock(&ns->pr_per_ctrl_refs);
 	xa_for_each(&ns->pr_per_ctrl_refs, idx, pc_ref) {
-		if (uuid_equal(&pc_ref->hostid, hostid)) {
-			percpu_ref_kill_and_confirm(&pc_ref->ref,
-						nvmet_pr_confirm_ns_pc_ref);
-			wait_for_completion(&pc_ref->confirm_done);
-		}
+		if (uuid_equal(&pc_ref->hostid, hostid) &&
+		    list_empty(&pc_ref->abort_entry))
+			list_add_tail(&pc_ref->abort_entry,
+				      &ns->pr.abort_list);
+	}
+	xa_unlock(&ns->pr_per_ctrl_refs);
+
+	list_for_each_entry(pc_ref, &ns->pr.abort_list, abort_entry) {
+		/* Killed for another host that this command preempts. */
+		if (percpu_ref_is_dying(&pc_ref->ref))
+			continue;
+		percpu_ref_kill_and_confirm(&pc_ref->ref,
+					    nvmet_pr_confirm_ns_pc_ref);
+		wait_for_completion(&pc_ref->confirm_done);
 	}
 }
 
@@ -618,20 +654,27 @@ static u16 nvmet_pr_preempt(struct nvmet_req *req,
 static void nvmet_pr_do_abort(struct work_struct *w)
 {
 	struct nvmet_req *req = container_of(w, struct nvmet_req, r.abort_work);
-	struct nvmet_pr_per_ctrl_ref *pc_ref;
+	struct nvmet_pr_per_ctrl_ref *pc_ref, *tmp;
 	struct nvmet_ns *ns = req->ns;
-	unsigned long idx;
+	bool ctrl_gone;
 
 	/*
 	 * The target does not support abort, just wait per-controller ref to 0.
 	 */
-	xa_for_each(&ns->pr_per_ctrl_refs, idx, pc_ref) {
-		if (percpu_ref_is_dying(&pc_ref->ref)) {
-			wait_for_completion(&pc_ref->free_done);
-			reinit_completion(&pc_ref->confirm_done);
-			reinit_completion(&pc_ref->free_done);
-			percpu_ref_resurrect(&pc_ref->ref);
-		}
+	list_for_each_entry_safe(pc_ref, tmp, &ns->pr.abort_list, abort_entry) {
+		wait_for_completion(&pc_ref->free_done);
+		reinit_completion(&pc_ref->confirm_done);
+		reinit_completion(&pc_ref->free_done);
+		percpu_ref_resurrect(&pc_ref->ref);
+
+		/* Off the list, the pc_ref belongs to its controller again. */
+		xa_lock(&ns->pr_per_ctrl_refs);
+		list_del_init(&pc_ref->abort_entry);
+		ctrl_gone = pc_ref->ctrl_gone;
+		xa_unlock(&ns->pr_per_ctrl_refs);
+
+		if (ctrl_gone)
+			nvmet_pr_free_pc_ref(pc_ref);
 	}
 
 	up(&ns->pr.pr_sem);
@@ -1052,6 +1095,8 @@ static int nvmet_pr_alloc_and_insert_pc_ref(struct nvmet_ns *ns,
 	init_completion(&pc_ref->free_done);
 	init_completion(&pc_ref->confirm_done);
 	uuid_copy(&pc_ref->hostid, hostid);
+	INIT_LIST_HEAD(&pc_ref->abort_entry);
+	pc_ref->ctrl_gone = false;
 
 	ret = xa_insert(&ns->pr_per_ctrl_refs, idx, pc_ref, GFP_KERNEL);
 	if (ret)
@@ -1067,7 +1112,6 @@ free:
 int nvmet_ctrl_init_pr(struct nvmet_ctrl *ctrl)
 {
 	struct nvmet_subsys *subsys = ctrl->subsys;
-	struct nvmet_pr_per_ctrl_ref *pc_ref;
 	struct nvmet_ns *ns = NULL;
 	unsigned long idx;
 	int ret;
@@ -1095,19 +1139,14 @@ int nvmet_ctrl_init_pr(struct nvmet_ctrl *ctrl)
 
 free_per_ctrl_refs:
 	nvmet_for_each_enabled_ns(&subsys->namespaces, idx, ns) {
-		if (ns->pr.enable) {
-			pc_ref = xa_erase(&ns->pr_per_ctrl_refs, ctrl->cntlid);
-			if (pc_ref)
-				percpu_ref_exit(&pc_ref->ref);
-			kfree(pc_ref);
-		}
+		if (ns->pr.enable)
+			nvmet_pr_erase_pc_ref(ns, ctrl->cntlid);
 	}
 	return ret;
 }
 
 void nvmet_ctrl_destroy_pr(struct nvmet_ctrl *ctrl)
 {
-	struct nvmet_pr_per_ctrl_ref *pc_ref;
 	struct nvmet_ns *ns;
 	unsigned long idx;
 
@@ -1115,12 +1154,8 @@ void nvmet_ctrl_destroy_pr(struct nvmet_ctrl *ctrl)
 	mutex_destroy(&ctrl->pr_log_mgr.lock);
 
 	nvmet_for_each_enabled_ns(&ctrl->subsys->namespaces, idx, ns) {
-		if (ns->pr.enable) {
-			pc_ref = xa_erase(&ns->pr_per_ctrl_refs, ctrl->cntlid);
-			if (pc_ref)
-				percpu_ref_exit(&pc_ref->ref);
-			kfree(pc_ref);
-		}
+		if (ns->pr.enable)
+			nvmet_pr_erase_pc_ref(ns, ctrl->cntlid);
 	}
 }
 
@@ -1136,6 +1171,7 @@ int nvmet_pr_init_ns(struct nvmet_ns *ns)
 	atomic_set(&ns->pr.generation, 0);
 	sema_init(&ns->pr.pr_sem, 1);
 	INIT_LIST_HEAD(&ns->pr.registrant_list);
+	INIT_LIST_HEAD(&ns->pr.abort_list);
 	ns->pr.notify_mask = 0;
 
 	xa_init(&ns->pr_per_ctrl_refs);
