@@ -1173,6 +1173,24 @@ static inline bool nvmet_tcp_pdu_valid(u8 type)
 	return false;
 }
 
+/*
+ * The buffer took as much of the record as the PDU still wants, which may be
+ * one byte.  The rest comes with the type of the record, never with that
+ * which follows: throw it away at once.
+ */
+static void nvmet_tcp_tls_drop_rest(struct nvmet_tcp_queue *queue)
+{
+	char cbuf[CMSG_LEN(sizeof(char))] = {};
+	struct msghdr msg = {
+		.msg_control = cbuf,
+		.msg_controllen = sizeof(cbuf),
+		.msg_flags = MSG_DONTWAIT,
+	};
+
+	iov_iter_discard(&msg.msg_iter, ITER_DEST, TLS_MAX_PAYLOAD_SIZE);
+	sock_recvmsg(queue->sock, &msg, msg.msg_flags);
+}
+
 static int nvmet_tcp_tls_record_ok(struct nvmet_tcp_queue *queue,
 		struct msghdr *msg, char *cbuf, int len)
 {
@@ -1190,24 +1208,36 @@ static int nvmet_tcp_tls_record_ok(struct nvmet_tcp_queue *queue,
 		iov_iter_revert(&msg->msg_iter, len);
 		tls_alert_recv(queue->sock->sk, msg, &level, &description);
 		if (level == TLS_ALERT_LEVEL_FATAL) {
-			pr_err("queue %d: TLS Alert desc %u\n",
-			       queue->idx, description);
+			pr_err_ratelimited("queue %d: TLS Alert desc %u\n",
+					   queue->idx, description);
 			ret = -ENOTCONN;
 		} else {
-			pr_warn("queue %d: TLS Alert desc %u\n",
-			       queue->idx, description);
+			pr_warn_ratelimited("queue %d: TLS Alert desc %u\n",
+					    queue->idx, description);
 			ret = -EAGAIN;
 		}
 		break;
 	default:
 		/* discard this record type */
 		iov_iter_revert(&msg->msg_iter, len);
-		pr_err("queue %d: TLS record %d unhandled\n",
-		       queue->idx, ctype);
+		pr_err_ratelimited("queue %d: TLS record %d unhandled\n",
+				   queue->idx, ctype);
 		ret = -EAGAIN;
 		break;
 	}
+	if (ret == -EAGAIN && !(msg->msg_flags & MSG_EOR))
+		nvmet_tcp_tls_drop_rest(queue);
 	return ret;
+}
+
+/*
+ * A receive from a TLS socket ends with the record, or where the type of the
+ * records changes.  There may be more behind a record that has been dropped,
+ * and nobody will tell: have nvmet_tcp_try_recv() look again.
+ */
+static int nvmet_tcp_tls_again(int ret)
+{
+	return ret == -EAGAIN ? 1 : ret;
 }
 
 static int nvmet_tcp_try_recv_pdu(struct nvmet_tcp_queue *queue)
@@ -1224,6 +1254,7 @@ recv:
 	if (queue->tls_pskid) {
 		msg.msg_control = cbuf;
 		msg.msg_controllen = sizeof(cbuf);
+		msg.msg_flags &= ~MSG_EOR;
 	}
 	len = kernel_recvmsg(queue->sock, &msg, &iov, 1,
 			iov.iov_len, msg.msg_flags);
@@ -1232,13 +1263,13 @@ recv:
 	if (queue->tls_pskid) {
 		ret = nvmet_tcp_tls_record_ok(queue, &msg, cbuf, len);
 		if (ret < 0)
-			return ret;
+			return nvmet_tcp_tls_again(ret);
 	}
 
 	queue->offset += len;
 	queue->left -= len;
 	if (queue->left)
-		return -EAGAIN;
+		return queue->tls_pskid && len ? 1 : -EAGAIN;
 
 	if (queue->offset == sizeof(struct nvme_tcp_hdr)) {
 		u8 hdgst = nvmet_tcp_hdgst_len(queue);
@@ -1290,6 +1321,7 @@ static int nvmet_tcp_try_recv_data(struct nvmet_tcp_queue *queue)
 			/* The last receive has used it up */
 			cmd->recv_msg.msg_control = cmd->recv_cbuf;
 			cmd->recv_msg.msg_controllen = sizeof(cmd->recv_cbuf);
+			cmd->recv_msg.msg_flags &= ~MSG_EOR;
 		}
 		len = sock_recvmsg(cmd->queue->sock, &cmd->recv_msg,
 			cmd->recv_msg.msg_flags);
@@ -1299,7 +1331,7 @@ static int nvmet_tcp_try_recv_data(struct nvmet_tcp_queue *queue)
 			ret = nvmet_tcp_tls_record_ok(cmd->queue,
 					&cmd->recv_msg, cmd->recv_cbuf, len);
 			if (ret < 0)
-				return ret;
+				return nvmet_tcp_tls_again(ret);
 		}
 
 		cmd->pdu_recv += len;
@@ -1340,13 +1372,13 @@ static int nvmet_tcp_try_recv_ddgst(struct nvmet_tcp_queue *queue)
 	if (queue->tls_pskid) {
 		ret = nvmet_tcp_tls_record_ok(queue, &msg, cbuf, len);
 		if (ret < 0)
-			return ret;
+			return nvmet_tcp_tls_again(ret);
 	}
 
 	queue->offset += len;
 	queue->left -= len;
 	if (queue->left)
-		return -EAGAIN;
+		return queue->tls_pskid && len ? 1 : -EAGAIN;
 
 	if (queue->data_digest && cmd->exp_ddgst != cmd->recv_ddgst) {
 		pr_err("queue %d: cmd %d pdu (%d) data digest error: recv %#x expected %#x\n",
