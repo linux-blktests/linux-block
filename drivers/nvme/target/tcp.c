@@ -140,6 +140,7 @@ struct nvmet_tcp_cmd {
 
 enum nvmet_tcp_queue_state {
 	NVMET_TCP_Q_CONNECTING,
+	NVMET_TCP_Q_TLS_PEEK,
 	NVMET_TCP_Q_TLS_HANDSHAKE,
 	NVMET_TCP_Q_LIVE,
 	NVMET_TCP_Q_DISCONNECTING,
@@ -176,6 +177,7 @@ struct nvmet_tcp_queue {
 
 	/* TLS state */
 	key_serial_t		tls_pskid;
+	key_serial_t		tls_keyring;
 	struct delayed_work	tls_handshake_tmo_work;
 
 	unsigned long           poll_end;
@@ -1496,12 +1498,19 @@ static bool nvmet_tcp_check_queue_deadline(struct nvmet_tcp_queue *queue,
 	return !time_after(jiffies, queue->poll_end);
 }
 
+static bool nvmet_tcp_tls_peek(struct nvmet_tcp_queue *queue);
+
 static void nvmet_tcp_io_work(struct work_struct *w)
 {
 	struct nvmet_tcp_queue *queue =
 		container_of(w, struct nvmet_tcp_queue, io_work);
 	bool pending;
 	int ret, ops = 0;
+
+	if ((queue->state == NVMET_TCP_Q_TLS_PEEK ||
+	     queue->state == NVMET_TCP_Q_TLS_HANDSHAKE) &&
+	    !nvmet_tcp_tls_peek(queue))
+		return;
 
 	do {
 		pending = false;
@@ -1828,11 +1837,8 @@ static int nvmet_tcp_try_peek_pdu(struct nvmet_tcp_queue *queue)
 	struct msghdr msg = {
 		.msg_control = cbuf,
 		.msg_controllen = sizeof(cbuf),
-		.msg_flags = MSG_PEEK,
+		.msg_flags = MSG_PEEK | MSG_DONTWAIT,
 	};
-
-	if (nvmet_port_secure_channel_required(queue->port->nport))
-		return 0;
 
 	len = kernel_recvmsg(queue->sock, &msg, &iov, 1,
 			iov.iov_len, msg.msg_flags);
@@ -1955,7 +1961,7 @@ static int nvmet_tcp_tls_handshake(struct nvmet_tcp_queue *queue)
 	args.ta_sock = queue->sock;
 	args.ta_done = nvmet_tcp_tls_handshake_done;
 	args.ta_data = queue;
-	args.ta_keyring = key_serial(queue->port->nport->keyring);
+	args.ta_keyring = queue->tls_keyring;
 	args.ta_timeout_ms = tls_handshake_timeout * 1000;
 
 	ret = tls_server_hello_psk(&args, GFP_KERNEL);
@@ -1968,8 +1974,51 @@ static int nvmet_tcp_tls_handshake(struct nvmet_tcp_queue *queue)
 	}
 	return ret;
 }
+
+/*
+ * TLS is offered, but not required: the first bytes tell what the host wants.
+ * Returns true if the queue goes on without TLS.
+ */
+static bool nvmet_tcp_tls_peek(struct nvmet_tcp_queue *queue)
+{
+	int ret;
+
+	if (queue->state == NVMET_TCP_Q_TLS_HANDSHAKE) {
+		if (nvmet_tcp_tls_handshake(queue))
+			nvmet_tcp_schedule_release_queue(queue);
+		return false;
+	}
+
+	/* ->data_ready() brings us back */
+	ret = nvmet_tcp_try_peek_pdu(queue);
+	if (ret == -EAGAIN)
+		return false;
+
+	/* The upcall wants the default callbacks */
+	if (!ret)
+		nvmet_tcp_restore_socket_callbacks(queue);
+
+	spin_lock_bh(&queue->state_lock);
+	if (queue->state != NVMET_TCP_Q_TLS_PEEK) {
+		spin_unlock_bh(&queue->state_lock);
+		return false;
+	}
+	queue->state = ret ? NVMET_TCP_Q_CONNECTING : NVMET_TCP_Q_TLS_HANDSHAKE;
+	spin_unlock_bh(&queue->state_lock);
+	if (ret)
+		return true;
+
+	/*
+	 * ->data_ready() may have queued the io work meanwhile, nothing does
+	 * from now on. The handshake must not start before that run is over,
+	 * so leave it to that run.
+	 */
+	queue_work_on(queue_cpu(queue), nvmet_tcp_wq, &queue->io_work);
+	return false;
+}
 #else
 static void nvmet_tcp_tls_handshake_timeout(struct work_struct *w) {}
+static bool nvmet_tcp_tls_peek(struct nvmet_tcp_queue *queue) { return true; }
 #endif
 
 static void nvmet_tcp_alloc_queue(struct nvmet_tcp_port *port,
@@ -2039,14 +2088,16 @@ static void nvmet_tcp_alloc_queue(struct nvmet_tcp_port *port,
 		sk->sk_user_data = NULL;
 		sk->sk_data_ready = port->data_ready;
 		write_unlock_bh(&sk->sk_callback_lock);
-		if (!nvmet_tcp_try_peek_pdu(queue)) {
+		/* The port may be gone when the upcall is made */
+		queue->tls_keyring = key_serial(port->nport->keyring);
+		if (nvmet_port_secure_channel_required(port->nport)) {
 			if (!nvmet_tcp_tls_handshake(queue))
 				return;
 			/* TLS handshake failed, terminate the connection */
 			goto out_destroy_sq;
 		}
-		/* Not a TLS connection, continue with normal processing */
-		queue->state = NVMET_TCP_Q_CONNECTING;
+		/* Don't wait for the host here: others want to connect, too */
+		queue->state = NVMET_TCP_Q_TLS_PEEK;
 	}
 #endif
 
