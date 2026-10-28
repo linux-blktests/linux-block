@@ -123,6 +123,7 @@ struct nvme_tcp_queue {
 	size_t			data_remaining;
 	size_t			ddgst_remaining;
 	unsigned int		nr_cqe;
+	bool			rcv_parked;
 
 	/* send state */
 	struct nvme_tcp_request *request;
@@ -465,9 +466,27 @@ nvme_tcp_fetch_request(struct nvme_tcp_queue *queue)
 			return NULL;
 	}
 
+	WRITE_ONCE(queue->request, req);
+	/* nvme_tcp_req_busy() must find the request in one place at any time */
+	smp_wmb();
 	list_del_init(&req->entry);
 	init_llist_node(&req->lentry);
 	return req;
+}
+
+/*
+ * Does the send path still hold @req? As long as it does the request must
+ * neither be completed nor be queued once more, whatever the controller says.
+ */
+static bool nvme_tcp_req_busy(struct nvme_tcp_queue *queue,
+			      struct nvme_tcp_request *req)
+{
+	if (llist_on_list(&req->lentry) || !list_empty(&req->entry))
+		return true;
+	/* pairs with the barrier in nvme_tcp_fetch_request() */
+	smp_rmb();
+	/* pairs with the release in nvme_tcp_done_send_req() */
+	return smp_load_acquire(&queue->request) == req;
 }
 
 #define NVME_TCP_CRC_SEED (~0)
@@ -672,6 +691,9 @@ static int nvme_tcp_process_nvme_cqe(struct nvme_tcp_queue *queue,
 	}
 
 	req = blk_mq_rq_to_pdu(rq);
+	if (unlikely(nvme_tcp_req_busy(queue, req)))
+		return -EBUSY;
+
 	if (req->status == cpu_to_le16(NVME_SC_SUCCESS))
 		req->status = cqe->status;
 
@@ -707,6 +729,9 @@ static int nvme_tcp_handle_c2h_data(struct nvme_tcp_queue *queue,
 	}
 
 	req = blk_mq_rq_to_pdu(rq);
+	if (unlikely(nvme_tcp_req_busy(queue, req)))
+		return -EBUSY;
+
 	if (!blk_rq_payload_bytes(rq) || !req->curr_bio || !req->data_len) {
 		dev_err(queue->ctrl->ctrl.device,
 			"queue %d tag %#x unexpected data\n",
@@ -800,6 +825,8 @@ static int nvme_tcp_handle_r2t(struct nvme_tcp_queue *queue,
 		return -ENOENT;
 	}
 	req = blk_mq_rq_to_pdu(rq);
+	if (unlikely(nvme_tcp_req_busy(queue, req)))
+		return -EBUSY;
 
 	if (unlikely(rq_data_dir(rq) != WRITE)) {
 		dev_err(queue->ctrl->ctrl.device,
@@ -826,14 +853,6 @@ static int nvme_tcp_handle_r2t(struct nvme_tcp_queue *queue,
 		dev_err(queue->ctrl->ctrl.device,
 			"req %d unexpected r2t offset %u (expected %zu)\n",
 			rq->tag, r2t_offset, req->data_sent);
-		return -EPROTO;
-	}
-
-	if (llist_on_list(&req->lentry) ||
-	    !list_empty(&req->entry)) {
-		dev_err(queue->ctrl->ctrl.device,
-			"req %d unexpected r2t while processing request\n",
-			rq->tag);
 		return -EPROTO;
 	}
 
@@ -939,16 +958,31 @@ static int nvme_tcp_recv_pdu(struct nvme_tcp_queue *queue, struct sk_buff *skb,
 
 	switch (hdr->type) {
 	case nvme_tcp_c2h_data:
-		return nvme_tcp_handle_c2h_data(queue, (void *)queue->pdu);
+		ret = nvme_tcp_handle_c2h_data(queue, (void *)queue->pdu);
+		break;
 	case nvme_tcp_rsp:
-		nvme_tcp_init_recv_ctx(queue);
-		return nvme_tcp_handle_comp(queue, (void *)queue->pdu);
+		ret = nvme_tcp_handle_comp(queue, (void *)queue->pdu);
+		break;
 	case nvme_tcp_r2t:
-		nvme_tcp_init_recv_ctx(queue);
-		return nvme_tcp_handle_r2t(queue, (void *)queue->pdu);
+		ret = nvme_tcp_handle_r2t(queue, (void *)queue->pdu);
+		break;
 	default:
 		goto unsupported_pdu;
 	}
+
+	if (unlikely(ret == -EBUSY)) {
+		/*
+		 * The command is still being sent. Leave the end of the header
+		 * in the socket and look at it again when that is done.
+		 */
+		queue->pdu_remaining += rcv_len;
+		queue->pdu_offset -= rcv_len;
+		*offset -= rcv_len;
+		*len += rcv_len;
+	} else if (hdr->type != nvme_tcp_c2h_data) {
+		nvme_tcp_init_recv_ctx(queue);
+	}
+	return ret;
 
 unsupported_pdu:
 	dev_err(queue->ctrl->ctrl.device,
@@ -1110,6 +1144,10 @@ static int nvme_tcp_recv_skb(read_descriptor_t *desc, struct sk_buff *skb,
 		default:
 			result = -EFAULT;
 		}
+		if (unlikely(result == -EBUSY)) {
+			queue->rcv_parked = true;
+			return consumed - len;
+		}
 		if (result) {
 			dev_err(queue->ctrl->ctrl.device,
 				"receive failed:  %d\n", result);
@@ -1182,7 +1220,8 @@ done:
 
 static inline void nvme_tcp_done_send_req(struct nvme_tcp_queue *queue)
 {
-	queue->request = NULL;
+	/* pairs with nvme_tcp_req_busy() */
+	smp_store_release(&queue->request, NULL);
 }
 
 static void nvme_tcp_fail_request(struct nvme_tcp_request *req)
@@ -1430,6 +1469,7 @@ static int nvme_tcp_read_sock(struct nvme_tcp_queue *queue)
 	rd_desc.count = 1;
 	lock_sock(sk);
 	queue->nr_cqe = 0;
+	queue->rcv_parked = false;
 	consumed = sock->ops->read_sock(sk, &rd_desc, nvme_tcp_recv_skb);
 	release_sock(sk);
 	return consumed;
@@ -1527,6 +1567,22 @@ static int nvme_tcp_try_recv(struct nvme_tcp_queue *queue)
 	return consumed == -EAGAIN ? 0 : consumed;
 }
 
+/*
+ * A PDU has been left in the socket because its command is still being sent.
+ * A sender in another context does not wake us when it is done: wait for it.
+ * If there is something left to send then, either the socket is full and tells
+ * us when it has room, or io_work has been queued.
+ */
+static bool nvme_tcp_recv_again(struct nvme_tcp_queue *queue)
+{
+	bool again;
+
+	mutex_lock(&queue->send_mutex);
+	again = !queue->request && !nvme_tcp_queue_has_pending(queue);
+	mutex_unlock(&queue->send_mutex);
+	return again;
+}
+
 static void nvme_tcp_io_work(struct work_struct *w)
 {
 	struct nvme_tcp_queue *queue =
@@ -1551,6 +1607,9 @@ static void nvme_tcp_io_work(struct work_struct *w)
 			pending = true;
 		else if (unlikely(result < 0))
 			return;
+
+		if (unlikely(queue->rcv_parked) && nvme_tcp_recv_again(queue))
+			pending = true;
 
 		/* did we get some space after spending time in recv? */
 		if (nvme_tcp_queue_has_pending(queue) &&
