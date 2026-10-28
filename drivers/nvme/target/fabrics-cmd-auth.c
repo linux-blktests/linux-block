@@ -180,6 +180,9 @@ static u8 nvmet_auth_reply(struct nvmet_req *req, void *d, u32 tl)
 		if (nvmet_auth_ctrl_sesskey(req, data->rval + 2 * data->hl,
 					    dhvlen) < 0)
 			return NVME_AUTH_DHCHAP_FAILURE_DHGROUP_UNUSABLE;
+	} else if (ctrl->dh_gid != NVME_AUTH_DHGROUP_NULL) {
+		/* No DH value, no session key for the augmented challenge. */
+		return NVME_AUTH_DHCHAP_FAILURE_INCORRECT_PAYLOAD;
 	}
 
 	response = kmalloc(data->hl, GFP_KERNEL);
