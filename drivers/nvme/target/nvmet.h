@@ -441,6 +441,7 @@ struct nvmet_fabrics_ops {
 	int (*add_port)(struct nvmet_port *port);
 	void (*remove_port)(struct nvmet_port *port);
 	void (*delete_ctrl)(struct nvmet_ctrl *ctrl);
+	void (*disconnect_queue)(struct nvmet_sq *sq);
 	void (*disc_traddr)(struct nvmet_req *req,
 			struct nvmet_port *port, char *traddr);
 	ssize_t (*host_traddr)(struct nvmet_ctrl *ctrl,
@@ -622,6 +623,7 @@ void nvmet_sq_destroy(struct nvmet_sq *sq);
 int nvmet_sq_init(struct nvmet_sq *sq, struct nvmet_cq *cq);
 
 void nvmet_ctrl_fatal_error(struct nvmet_ctrl *ctrl);
+void nvmet_sq_fatal_error(struct nvmet_sq *sq);
 
 void nvmet_update_cc(struct nvmet_ctrl *ctrl, u32 new);
 
@@ -989,6 +991,7 @@ void nvmet_destroy_auth(struct nvmet_ctrl *ctrl);
 void nvmet_auth_sq_free(struct nvmet_sq *sq);
 void nvmet_auth_sq_destroy(struct nvmet_sq *sq);
 int nvmet_setup_dhgroup(struct nvmet_ctrl *ctrl, u8 dhgroup_id);
+bool nvmet_sq_auth_status(struct nvmet_sq *sq);
 bool nvmet_check_auth_status(struct nvmet_req *req);
 int nvmet_auth_host_hash(struct nvmet_req *req, u8 *response,
 			 unsigned int hash_len);
@@ -1015,6 +1018,10 @@ static inline void nvmet_auth_sq_init(struct nvmet_sq *sq)
 static inline void nvmet_destroy_auth(struct nvmet_ctrl *ctrl) {};
 static inline void nvmet_auth_sq_free(struct nvmet_sq *sq) {};
 static inline void nvmet_auth_sq_destroy(struct nvmet_sq *sq) {};
+static inline bool nvmet_sq_auth_status(struct nvmet_sq *sq)
+{
+	return true;
+}
 static inline bool nvmet_check_auth_status(struct nvmet_req *req)
 {
 	return true;

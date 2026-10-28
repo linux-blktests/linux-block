@@ -687,7 +687,7 @@ static void nvmet_rdma_release_rsp(struct nvmet_rdma_rsp *rsp)
 static void nvmet_rdma_error_comp(struct nvmet_rdma_queue *queue)
 {
 	if (queue->nvme_sq.ctrl) {
-		nvmet_ctrl_fatal_error(queue->nvme_sq.ctrl);
+		nvmet_sq_fatal_error(&queue->nvme_sq);
 	} else {
 		/*
 		 * we didn't setup the controller yet in case
@@ -1848,6 +1848,12 @@ static int nvmet_rdma_cm_handler(struct rdma_cm_id *cm_id,
 	return ret;
 }
 
+static void nvmet_rdma_disconnect_queue(struct nvmet_sq *sq)
+{
+	nvmet_rdma_queue_disconnect(container_of(sq, struct nvmet_rdma_queue,
+						 nvme_sq));
+}
+
 static void nvmet_rdma_delete_ctrl(struct nvmet_ctrl *ctrl)
 {
 	struct nvmet_rdma_queue *queue, *n;
@@ -2078,6 +2084,7 @@ static const struct nvmet_fabrics_ops nvmet_rdma_ops = {
 	.remove_port		= nvmet_rdma_remove_port,
 	.queue_response		= nvmet_rdma_queue_response,
 	.delete_ctrl		= nvmet_rdma_delete_ctrl,
+	.disconnect_queue	= nvmet_rdma_disconnect_queue,
 	.disc_traddr		= nvmet_rdma_disc_port_addr,
 	.host_traddr		= nvmet_rdma_host_port_addr,
 	.get_mdts		= nvmet_rdma_get_mdts,

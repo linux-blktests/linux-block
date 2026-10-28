@@ -412,7 +412,7 @@ static void nvmet_tcp_socket_error(struct nvmet_tcp_queue *queue, int status)
 	if (status == -EPIPE || status == -ECONNRESET || !queue->nvme_sq.ctrl)
 		kernel_sock_shutdown(queue->sock, SHUT_RDWR);
 	else
-		nvmet_ctrl_fatal_error(queue->nvme_sq.ctrl);
+		nvmet_sq_fatal_error(&queue->nvme_sq);
 }
 
 static int nvmet_tcp_map_data(struct nvmet_tcp_cmd *cmd)
@@ -2223,6 +2223,14 @@ static void nvmet_tcp_remove_port(struct nvmet_port *nport)
 	kfree(port);
 }
 
+static void nvmet_tcp_disconnect_queue(struct nvmet_sq *sq)
+{
+	struct nvmet_tcp_queue *queue =
+		container_of(sq, struct nvmet_tcp_queue, nvme_sq);
+
+	kernel_sock_shutdown(queue->sock, SHUT_RDWR);
+}
+
 static void nvmet_tcp_delete_ctrl(struct nvmet_ctrl *ctrl)
 {
 	struct nvmet_tcp_queue *queue;
@@ -2300,6 +2308,7 @@ static const struct nvmet_fabrics_ops nvmet_tcp_ops = {
 	.remove_port		= nvmet_tcp_remove_port,
 	.queue_response		= nvmet_tcp_queue_response,
 	.delete_ctrl		= nvmet_tcp_delete_ctrl,
+	.disconnect_queue	= nvmet_tcp_disconnect_queue,
 	.install_queue		= nvmet_tcp_install_queue,
 	.disc_traddr		= nvmet_tcp_disc_port_addr,
 	.host_traddr		= nvmet_tcp_host_port_addr,

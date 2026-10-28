@@ -33,6 +33,14 @@ out_unlock:
 	mutex_unlock(&sq->auth_lock);
 }
 
+static void nvmet_auth_fatal_error(struct nvmet_sq *sq, bool passed)
+{
+	if (passed)
+		nvmet_ctrl_fatal_error(sq->ctrl);
+	else
+		nvmet_sq_fatal_error(sq);
+}
+
 void nvmet_auth_sq_init(struct nvmet_sq *sq)
 {
 	/* Initialize in-band authentication */
@@ -253,11 +261,13 @@ void nvmet_execute_auth_send(struct nvmet_req *req)
 	void *d;
 	u32 tl;
 	u16 status = 0;
+	bool passed;
 	u8 dhchap_status;
 
 	mutex_lock(&req->sq->auth_lock);
 	mutex_lock(&ctrl->auth_lock);
-
+	/* A queue that fails to authenticate again is no stranger's. */
+	passed = nvmet_sq_auth_status(req->sq);
 	if (req->cmd->auth_send.secp != NVME_AUTH_DHCHAP_PROTOCOL_IDENTIFIER) {
 		status = NVME_SC_INVALID_FIELD | NVME_STATUS_DNR;
 		req->error_loc =
@@ -430,7 +440,7 @@ done:
 	/* Final states, clear up variables */
 	nvmet_auth_sq_free(req->sq);
 	if (req->sq->dhchap_step == NVME_AUTH_DHCHAP_MESSAGE_FAILURE2)
-		nvmet_ctrl_fatal_error(ctrl);
+		nvmet_auth_fatal_error(req->sq, passed);
 
 complete:
 	mutex_unlock(&ctrl->auth_lock);
@@ -551,10 +561,12 @@ void nvmet_execute_auth_receive(struct nvmet_req *req)
 	void *d;
 	u32 al;
 	u16 status = 0;
+	bool passed;
 
 	mutex_lock(&req->sq->auth_lock);
 	mutex_lock(&ctrl->auth_lock);
-
+	/* A queue that fails to authenticate again is no stranger's. */
+	passed = nvmet_sq_auth_status(req->sq);
 	if (req->cmd->auth_receive.secp != NVME_AUTH_DHCHAP_PROTOCOL_IDENTIFIER) {
 		status = NVME_SC_INVALID_FIELD | NVME_STATUS_DNR;
 		req->error_loc =
@@ -641,7 +653,7 @@ done:
 		nvmet_auth_sq_free(req->sq);
 	else if (req->sq->dhchap_step == NVME_AUTH_DHCHAP_MESSAGE_FAILURE1) {
 		nvmet_auth_sq_free(req->sq);
-		nvmet_ctrl_fatal_error(ctrl);
+		nvmet_auth_fatal_error(req->sq, passed);
 	}
 	mutex_unlock(&ctrl->auth_lock);
 	mutex_unlock(&req->sq->auth_lock);

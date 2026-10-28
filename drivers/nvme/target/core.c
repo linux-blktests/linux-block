@@ -1828,6 +1828,22 @@ void nvmet_ctrl_fatal_error(struct nvmet_ctrl *ctrl)
 }
 EXPORT_SYMBOL_GPL(nvmet_ctrl_fatal_error);
 
+/*
+ * A fatal error on one queue.  The Connect command of an I/O queue needs no
+ * secret, so until the queue has authenticated it may be anybody's: do not
+ * let it take down the controller of the host whose NQN it has named.
+ */
+void nvmet_sq_fatal_error(struct nvmet_sq *sq)
+{
+	struct nvmet_ctrl *ctrl = sq->ctrl;
+
+	if (sq->qid && ctrl->ops->disconnect_queue && !nvmet_sq_auth_status(sq))
+		ctrl->ops->disconnect_queue(sq);
+	else
+		nvmet_ctrl_fatal_error(ctrl);
+}
+EXPORT_SYMBOL_GPL(nvmet_sq_fatal_error);
+
 ssize_t nvmet_ctrl_host_traddr(struct nvmet_ctrl *ctrl,
 		char *traddr, size_t traddr_len)
 {

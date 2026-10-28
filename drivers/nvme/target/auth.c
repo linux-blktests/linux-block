@@ -261,15 +261,18 @@ void nvmet_destroy_auth(struct nvmet_ctrl *ctrl)
 #endif
 }
 
-bool nvmet_check_auth_status(struct nvmet_req *req)
+bool nvmet_sq_auth_status(struct nvmet_sq *sq)
 {
-	struct nvmet_sq *sq = req->sq;
-
 	if (!sq->ctrl->host_key || sq->authenticated)
 		return true;
 
 	/* Whoever set up the TLS session of an I/O queue knew the PSK. */
 	return sq->qid && nvmet_queue_tls_keyid(sq);
+}
+
+bool nvmet_check_auth_status(struct nvmet_req *req)
+{
+	return nvmet_sq_auth_status(req->sq);
 }
 
 int nvmet_auth_host_hash(struct nvmet_req *req, u8 *response,
