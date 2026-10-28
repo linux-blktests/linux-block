@@ -1833,8 +1833,11 @@ EXPORT_SYMBOL_GPL(nvmet_ctrl_fatal_error);
  * A fatal error on one queue.  The Connect command of an I/O queue needs no
  * secret, so until the queue has authenticated it may be anybody's: do not
  * let it take down the controller of the host whose NQN it has named.
+ *
+ * The caller holds sq->ref, as a command that is being executed does: until it
+ * is put, nvmet_sq_destroy() waits, and does not clear sq->ctrl.
  */
-void nvmet_sq_fatal_error(struct nvmet_sq *sq)
+void __nvmet_sq_fatal_error(struct nvmet_sq *sq)
 {
 	struct nvmet_ctrl *ctrl = sq->ctrl;
 
@@ -1842,6 +1845,22 @@ void nvmet_sq_fatal_error(struct nvmet_sq *sq)
 		ctrl->ops->disconnect_queue(sq);
 	else
 		nvmet_ctrl_fatal_error(ctrl);
+}
+
+/*
+ * A transport calls this with no reference of its own, concurrently with
+ * nvmet_sq_destroy(), which puts the controller and clears sq->ctrl.  As in
+ * nvmet_req_init(), the call can come after percpu_ref_exit():
+ * percpu_ref_tryget_live() then sees that the ref is dead and touches nothing
+ * that is freed.
+ */
+void nvmet_sq_fatal_error(struct nvmet_sq *sq)
+{
+	if (!percpu_ref_tryget_live(&sq->ref))
+		return;
+
+	__nvmet_sq_fatal_error(sq);
+	percpu_ref_put(&sq->ref);
 }
 EXPORT_SYMBOL_GPL(nvmet_sq_fatal_error);
 

@@ -33,12 +33,13 @@ out_unlock:
 	mutex_unlock(&sq->auth_lock);
 }
 
+/* Called from a command that is being executed, which holds sq->ref. */
 static void nvmet_auth_fatal_error(struct nvmet_sq *sq, bool passed)
 {
 	if (passed)
 		nvmet_ctrl_fatal_error(sq->ctrl);
 	else
-		nvmet_sq_fatal_error(sq);
+		__nvmet_sq_fatal_error(sq);
 }
 
 void nvmet_auth_sq_init(struct nvmet_sq *sq)
