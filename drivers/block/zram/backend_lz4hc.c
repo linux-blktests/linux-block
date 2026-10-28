@@ -4,6 +4,7 @@
 
 #include <linux/kernel.h>
 #include <linux/lz4.h>
+#include <linux/sizes.h>
 #include <linux/slab.h>
 #include <linux/vmalloc.h>
 
@@ -96,7 +97,8 @@ static int lz4hc_compress(struct zcomp_params *params, struct zcomp_ctx *ctx,
 		LZ4_resetStreamHC(zctx->cstrm, params->level);
 		ret = LZ4_loadDictHC(zctx->cstrm, params->dict,
 				     params->dict_sz);
-		if (ret != params->dict_sz)
+		/* Only the last 64 KiB of a dictionary are of use */
+		if (ret != min_t(size_t, params->dict_sz, SZ_64K))
 			return -EINVAL;
 		ret = LZ4_compress_HC_continue(zctx->cstrm, req->src, req->dst,
 					       req->src_len, req->dst_len);

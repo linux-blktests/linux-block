@@ -1867,6 +1867,10 @@ static bool nvme_init_integrity(struct nvme_ns_head *head,
 	    !(head->features & NVME_NS_METADATA_SUPPORTED))
 		return nvme_ns_has_pi(head);
 
+	/* struct blk_integrity has eight bits for the metadata size. */
+	if (head->ms > U8_MAX)
+		return false;
+
 	switch (head->pi_type) {
 	case NVME_NS_DPS_PI_TYPE3:
 		switch (head->guard_type) {

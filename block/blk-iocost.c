@@ -2920,7 +2920,8 @@ static void ioc_rqos_exit(struct rq_qos *rqos)
 
 	timer_shutdown_sync(&ioc->timer);
 	free_percpu(ioc->pcpu_stat);
-	kfree(ioc);
+	/* blkcg_print_blkgs() gets here from a pd with only RCU held */
+	kfree_rcu_mightsleep(ioc);
 }
 
 static const struct rq_qos_ops ioc_rqos_ops = {
@@ -2937,11 +2938,12 @@ static int blk_iocost_init(struct gendisk *disk)
 	struct ioc *ioc;
 	int i, cpu, ret;
 
-	ioc = kzalloc_obj(*ioc);
+	/* The caller holds rq_qos_mutex, which is taken with the queue frozen */
+	ioc = kzalloc_obj(*ioc, GFP_NOIO);
 	if (!ioc)
 		return -ENOMEM;
 
-	ioc->pcpu_stat = alloc_percpu(struct ioc_pcpu_stat);
+	ioc->pcpu_stat = alloc_percpu_gfp(struct ioc_pcpu_stat, GFP_NOIO);
 	if (!ioc->pcpu_stat) {
 		kfree(ioc);
 		return -ENOMEM;
@@ -3321,6 +3323,11 @@ static ssize_t ioc_qos_write(struct kernfs_open_file *of, char *input,
 
 	body = ctx.body;
 	disk = ctx.bdev->bd_disk;
+	/* It may have gone while the mutex was not held */
+	if (!disk_live(disk)) {
+		ret = -ENODEV;
+		goto close_bdev;
+	}
 	if (!queue_is_mq(disk->queue)) {
 		ret = -EOPNOTSUPP;
 		goto close_bdev;

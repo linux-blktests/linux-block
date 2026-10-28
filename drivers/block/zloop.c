@@ -1056,6 +1056,16 @@ static struct file *zloop_filp_open_fmt(int oflags, umode_t mode,
 		return ERR_PTR(-ENOMEM);
 	file = filp_open(p, oflags, mode);
 	kfree(p);
+	if (IS_ERR(file))
+		return file;
+
+	/* Zone files are accessed with ->read_iter() and ->write_iter(). */
+	if ((oflags & O_ACCMODE) == O_RDWR &&
+	    (!file->f_op->read_iter || !file->f_op->write_iter)) {
+		fput(file);
+		return ERR_PTR(-EINVAL);
+	}
+
 	return file;
 }
 

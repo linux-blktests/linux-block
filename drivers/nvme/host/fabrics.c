@@ -542,8 +542,19 @@ int nvmf_connect_io_queue(struct nvme_ctrl *ctrl, u16 qid)
 			NVME_SUBMIT_RESERVED |
 			NVME_SUBMIT_NOWAIT);
 	if (ret) {
-		nvmf_log_connect_error(ctrl, ret, le32_to_cpu(res.u32),
-				       &cmd, data);
+		result = le32_to_cpu(res.u32);
+		nvmf_log_connect_error(ctrl, ret, result, &cmd, data);
+		/*
+		 * The controller ID we got from the admin queue's Connect is
+		 * not known any more: the association has gone since. DNR is
+		 * right about this command and says nothing about the next
+		 * association. Don't let nvmf_should_reconnect() see it.
+		 */
+		if (ret > 0 &&
+		    (ret & NVME_SCT_SC_MASK) == NVME_SC_CONNECT_INVALID_PARAM &&
+		    result >> 16 && (result & 0xffff) ==
+				offsetof(struct nvmf_connect_data, cntlid))
+			ret = -ENOTCONN;
 		goto out_free_data;
 	}
 	result = le32_to_cpu(res.u32);

@@ -130,7 +130,7 @@ struct mtip_compat_ide_task_request_s {
  * return value
  *	 true if device removed, else false
  */
-static bool mtip_check_surprise_removal(struct driver_data *dd)
+static bool mtip_device_removed(struct driver_data *dd)
 {
 	u16 vendor_id = 0;
 
@@ -141,12 +141,32 @@ static bool mtip_check_surprise_removal(struct driver_data *dd)
 	pci_read_config_word(dd->pdev, 0x00, &vendor_id);
 	if (vendor_id == 0xFFFF) {
 		dd->sr = true;
-		if (dd->disk)
-			blk_mark_disk_dead(dd->disk);
 		return true; /* device removed */
 	}
 
 	return false; /* device present */
+}
+
+/* As above, and tell the block layer. May sleep. */
+static bool mtip_check_surprise_removal(struct driver_data *dd)
+{
+	if (!mtip_device_removed(dd))
+		return false;
+
+	if (dd->disk && !test_and_set_bit(MTIP_DDF_DISK_DEAD_BIT, &dd->dd_flag))
+		blk_mark_disk_dead(dd->disk);
+	return true;
+}
+
+/* For the interrupt handler: the service thread tells the block layer. */
+static bool mtip_check_surprise_removal_irq(struct driver_data *dd)
+{
+	if (!mtip_device_removed(dd))
+		return false;
+
+	set_bit(MTIP_PF_SR_BIT, &dd->port->flags);
+	wake_up_interruptible(&dd->port->svc_wait);
+	return true;
 }
 
 static struct mtip_cmd *mtip_cmd_from_tag(struct driver_data *dd,
@@ -436,7 +456,7 @@ static int mtip_device_reset(struct driver_data *dd)
 	int rv = 0;
 
 	if (mtip_check_surprise_removal(dd))
-		return 0;
+		return -ENODEV;
 
 	if (mtip_hba_reset(dd) < 0)
 		rv = -EFAULT;
@@ -715,7 +735,7 @@ static inline void mtip_process_errors(struct driver_data *dd, u32 port_stat)
 		dev_warn(&dd->pdev->dev,
 			"Port stat errors %x unhandled\n",
 			(port_stat & ~PORT_IRQ_HANDLED));
-		if (mtip_check_surprise_removal(dd))
+		if (mtip_check_surprise_removal_irq(dd))
 			return;
 	}
 	if (likely(port_stat & (PORT_IRQ_TF_ERR | PORT_IRQ_IF_ERR))) {
@@ -740,7 +760,7 @@ static inline irqreturn_t mtip_handle_irq(struct driver_data *data)
 		/* Acknowledge the interrupt status on the port.*/
 		port_stat = readl(port->mmio + PORT_IRQ_STAT);
 		if (unlikely(port_stat == 0xFFFFFFFF)) {
-			mtip_check_surprise_removal(dd);
+			mtip_check_surprise_removal_irq(dd);
 			return IRQ_HANDLED;
 		}
 		writel(port_stat, port->mmio + PORT_IRQ_STAT);
@@ -784,7 +804,7 @@ static inline irqreturn_t mtip_handle_irq(struct driver_data *data)
 		}
 
 		if (unlikely(port_stat & PORT_IRQ_ERR)) {
-			if (unlikely(mtip_check_surprise_removal(dd))) {
+			if (unlikely(mtip_check_surprise_removal_irq(dd))) {
 				/* don't proceed further */
 				return IRQ_HANDLED;
 			}
@@ -2492,6 +2512,9 @@ static int mtip_service_thread(void *data)
 
 		set_bit(MTIP_PF_SVC_THD_ACTIVE_BIT, &port->flags);
 
+		if (test_and_clear_bit(MTIP_PF_SR_BIT, &port->flags))
+			mtip_check_surprise_removal(dd);
+
 restart_eh:
 		/* Demux bits: start with error handling */
 		if (test_bit(MTIP_PF_EH_ACTIVE_BIT, &port->flags)) {
@@ -3864,6 +3887,17 @@ done:
 	return rv;
 }
 
+static void mtip_stop_service_thread(struct driver_data *dd)
+{
+	if (!dd->mtip_svc_handler)
+		return;
+
+	set_bit(MTIP_PF_SVC_THD_STOP_BIT, &dd->port->flags);
+	wake_up_interruptible(&dd->port->svc_wait);
+	kthread_stop(dd->mtip_svc_handler);
+	dd->mtip_svc_handler = NULL;
+}
+
 /*
  * Called for each probed device when the device is removed or the
  * driver is unloaded.
@@ -3894,16 +3928,23 @@ static void mtip_pci_remove(struct pci_dev *pdev)
 	set_bit(MTIP_DDF_REMOVE_PENDING_BIT, &dd->dd_flag);
 	mutex_lock(&dd->ioctl_mutex);
 
+	/*
+	 * Nobody will complete the commands a removed device has been given,
+	 * and del_gendisk() waits for them.
+	 */
+	if (dd->sr) {
+		mtip_stop_service_thread(dd);
+		blk_mq_quiesce_queue(dd->queue);
+		blk_mq_tagset_busy_iter(&dd->tags, mtip_abort_cmd, dd);
+		blk_mq_unquiesce_queue(dd->queue);
+	}
+
 	if (test_bit(MTIP_DDF_INIT_DONE_BIT, &dd->dd_flag))
 		del_gendisk(dd->disk);
 
 	mtip_hw_debugfs_exit(dd);
 
-	if (dd->mtip_svc_handler) {
-		set_bit(MTIP_PF_SVC_THD_STOP_BIT, &dd->port->flags);
-		wake_up_interruptible(&dd->port->svc_wait);
-		kthread_stop(dd->mtip_svc_handler);
-	}
+	mtip_stop_service_thread(dd);
 
 	if (!dd->sr) {
 		/*

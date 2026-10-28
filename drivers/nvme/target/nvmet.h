@@ -88,6 +88,8 @@ struct nvmet_pr {
 	 */
 	struct semaphore	pr_sem;
 	struct list_head	registrant_list;
+	/* The pc_refs that a running "preempt and abort" has killed. */
+	struct list_head	abort_list;
 };
 
 struct nvmet_pr_per_ctrl_ref {
@@ -95,6 +97,9 @@ struct nvmet_pr_per_ctrl_ref {
 	struct completion	free_done;
 	struct completion	confirm_done;
 	uuid_t			hostid;
+	/* Both are written under the lock of ns->pr_per_ctrl_refs. */
+	struct list_head	abort_entry;
+	bool			ctrl_gone;
 };
 
 struct nvmet_ns {
@@ -167,6 +172,7 @@ struct nvmet_sq {
 	bool			auth_expiry_active;
 	u16			dhchap_tid;
 	u8			sc_c;
+	u8			shash_id;
 	u8			dhchap_status;
 	u8			dhchap_step;
 	u8			*dhchap_c1;
@@ -307,6 +313,8 @@ struct nvmet_ctrl {
 	struct nvme_error_slot	slots[NVMET_ERROR_LOG_SLOTS];
 	bool			pi_support;
 	bool			concat;
+	bool			tls;
+	struct mutex		auth_lock; /* one AUTH command at a time */
 #ifdef CONFIG_NVME_TARGET_AUTH
 	struct nvme_dhchap_key	*host_key;
 	struct nvme_dhchap_key	*ctrl_key;
@@ -438,6 +446,7 @@ struct nvmet_fabrics_ops {
 	int (*add_port)(struct nvmet_port *port);
 	void (*remove_port)(struct nvmet_port *port);
 	void (*delete_ctrl)(struct nvmet_ctrl *ctrl);
+	void (*disconnect_queue)(struct nvmet_sq *sq);
 	void (*disc_traddr)(struct nvmet_req *req,
 			struct nvmet_port *port, char *traddr);
 	ssize_t (*host_traddr)(struct nvmet_ctrl *ctrl,
@@ -508,6 +517,8 @@ struct nvmet_req {
 	struct nvmet_port	*port;
 
 	void (*execute)(struct nvmet_req *req);
+	/* what nvmet_pr_execute_io() calls once it has the pc_ref */
+	void (*pr_execute)(struct nvmet_req *req);
 	const struct nvmet_fabrics_ops *ops;
 
 	struct pci_dev		*p2p_dev;
@@ -523,6 +534,7 @@ extern struct workqueue_struct *buffered_io_wq;
 extern struct workqueue_struct *zbd_wq;
 extern struct workqueue_struct *nvmet_wq;
 extern struct workqueue_struct *nvmet_aen_wq;
+extern struct workqueue_struct *nvmet_pr_wq;
 
 static inline void nvmet_set_result(struct nvmet_req *req, u32 result)
 {
@@ -619,6 +631,8 @@ void nvmet_sq_destroy(struct nvmet_sq *sq);
 int nvmet_sq_init(struct nvmet_sq *sq, struct nvmet_cq *cq);
 
 void nvmet_ctrl_fatal_error(struct nvmet_ctrl *ctrl);
+void __nvmet_sq_fatal_error(struct nvmet_sq *sq);
+void nvmet_sq_fatal_error(struct nvmet_sq *sq);
 
 void nvmet_update_cc(struct nvmet_ctrl *ctrl, u32 new);
 
@@ -959,7 +973,8 @@ static inline void nvmet_req_bio_put(struct nvmet_req *req, struct bio *bio)
 #ifdef CONFIG_NVME_TARGET_TCP_TLS
 static inline key_serial_t nvmet_queue_tls_keyid(struct nvmet_sq *sq)
 {
-	return sq->tls_key ? key_serial(sq->tls_key) : 0;
+	/* A PCI endpoint controller is created without a queue */
+	return sq && sq->tls_key ? key_serial(sq->tls_key) : 0;
 }
 static inline void nvmet_sq_put_tls_key(struct nvmet_sq *sq)
 {
@@ -986,6 +1001,7 @@ void nvmet_destroy_auth(struct nvmet_ctrl *ctrl);
 void nvmet_auth_sq_free(struct nvmet_sq *sq);
 void nvmet_auth_sq_destroy(struct nvmet_sq *sq);
 int nvmet_setup_dhgroup(struct nvmet_ctrl *ctrl, u8 dhgroup_id);
+bool nvmet_sq_auth_status(struct nvmet_sq *sq);
 bool nvmet_check_auth_status(struct nvmet_req *req);
 int nvmet_auth_host_hash(struct nvmet_req *req, u8 *response,
 			 unsigned int hash_len);
@@ -1012,6 +1028,10 @@ static inline void nvmet_auth_sq_init(struct nvmet_sq *sq)
 static inline void nvmet_destroy_auth(struct nvmet_ctrl *ctrl) {};
 static inline void nvmet_auth_sq_free(struct nvmet_sq *sq) {};
 static inline void nvmet_auth_sq_destroy(struct nvmet_sq *sq) {};
+static inline bool nvmet_sq_auth_status(struct nvmet_sq *sq)
+{
+	return true;
+}
 static inline bool nvmet_check_auth_status(struct nvmet_req *req)
 {
 	return true;
@@ -1034,7 +1054,7 @@ void nvmet_pr_exit_ns(struct nvmet_ns *ns);
 void nvmet_execute_get_log_page_resv(struct nvmet_req *req);
 u16 nvmet_set_feat_resv_notif_mask(struct nvmet_req *req, u32 mask);
 u16 nvmet_get_feat_resv_notif_mask(struct nvmet_req *req);
-u16 nvmet_pr_get_ns_pc_ref(struct nvmet_req *req);
+void nvmet_pr_set_execute(struct nvmet_req *req);
 static inline void nvmet_pr_put_ns_pc_ref(struct nvmet_pr_per_ctrl_ref *pc_ref)
 {
 	percpu_ref_put(&pc_ref->ref);

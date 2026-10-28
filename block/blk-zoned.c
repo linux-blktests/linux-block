@@ -1812,7 +1812,18 @@ static void disk_zone_wplug_unplug_bio(struct gendisk *disk,
 	else if (!bio_list_empty(&zwplug->bio_list))
 		disk_zone_wplug_schedule_work(disk, zwplug);
 
-	if (!zwplug->wp_offset || disk_zone_wplug_is_full(disk, zwplug))
+	/*
+	 * The issuer of the write was told about its completion before we got
+	 * here. It may already have reset the zone and started to write it
+	 * again, in which case the zone is empty but has BIOs plugged. The plug
+	 * must stay alive to track them.
+	 *
+	 * If the write failed, the write pointer offset says nothing about the
+	 * zone. Keep the plug until the offset was updated.
+	 */
+	if (!(zwplug->flags & BLK_ZONE_WPLUG_NEED_WP_UPDATE) &&
+	    ((!zwplug->wp_offset && bio_list_empty(&zwplug->bio_list)) ||
+	     disk_zone_wplug_is_full(disk, zwplug)))
 		disk_mark_zone_wplug_dead(zwplug);
 
 	spin_unlock_irqrestore(&zwplug->lock, flags);
@@ -1860,9 +1871,20 @@ void blk_zone_write_plug_bio_endio(struct bio *bio)
 	 * needing a write pointer update.
 	 */
 	if (bio->bi_status != BLK_STS_OK) {
+		unsigned int plugged = 0;
+
 		spin_lock_irqsave(&zwplug->lock, flags);
+		/*
+		 * The abort unplugs the zone. But the flag still belongs to a
+		 * write in flight (this one, until its request is finished) or
+		 * to the BIO work, and they clear it when they are done. The
+		 * zone write plugs worker does not rely on the flag to issue
+		 * one write at a time and forgets the plug with the abort.
+		 */
+		if (!blk_queue_zoned_qd1_writes(disk->queue))
+			plugged = zwplug->flags & BLK_ZONE_WPLUG_PLUGGED;
 		disk_zone_wplug_abort(zwplug);
-		zwplug->flags |= BLK_ZONE_WPLUG_NEED_WP_UPDATE;
+		zwplug->flags |= BLK_ZONE_WPLUG_NEED_WP_UPDATE | plugged;
 		spin_unlock_irqrestore(&zwplug->lock, flags);
 	}
 

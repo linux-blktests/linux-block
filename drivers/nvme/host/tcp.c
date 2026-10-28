@@ -95,6 +95,7 @@ enum nvme_tcp_queue_flags {
 	NVME_TCP_Q_LIVE		= 1,
 	NVME_TCP_Q_POLLING	= 2,
 	NVME_TCP_Q_IO_CPU_SET	= 3,
+	NVME_TCP_Q_TLS_CTRL	= 4,
 };
 
 enum nvme_tcp_recv_state {
@@ -122,6 +123,7 @@ struct nvme_tcp_queue {
 	size_t			data_remaining;
 	size_t			ddgst_remaining;
 	unsigned int		nr_cqe;
+	bool			rcv_parked;
 
 	/* send state */
 	struct nvme_tcp_request *request;
@@ -160,6 +162,7 @@ struct nvme_tcp_queue_setup_ctx {
 struct nvme_tcp_ctrl {
 	/* read only in the hot path */
 	struct nvme_tcp_queue	*queues;
+	int			nr_queues;	/* allocated, see queue_count */
 	struct blk_mq_tag_set	tag_set;
 
 	/* other member variables */
@@ -464,9 +467,27 @@ nvme_tcp_fetch_request(struct nvme_tcp_queue *queue)
 			return NULL;
 	}
 
+	WRITE_ONCE(queue->request, req);
+	/* nvme_tcp_req_busy() must find the request in one place at any time */
+	smp_wmb();
 	list_del_init(&req->entry);
 	init_llist_node(&req->lentry);
 	return req;
+}
+
+/*
+ * Does the send path still hold @req? As long as it does the request must
+ * neither be completed nor be queued once more, whatever the controller says.
+ */
+static bool nvme_tcp_req_busy(struct nvme_tcp_queue *queue,
+			      struct nvme_tcp_request *req)
+{
+	if (llist_on_list(&req->lentry) || !list_empty(&req->entry))
+		return true;
+	/* pairs with the barrier in nvme_tcp_fetch_request() */
+	smp_rmb();
+	/* pairs with the release in nvme_tcp_done_send_req() */
+	return smp_load_acquire(&queue->request) == req;
 }
 
 #define NVME_TCP_CRC_SEED (~0)
@@ -671,6 +692,9 @@ static int nvme_tcp_process_nvme_cqe(struct nvme_tcp_queue *queue,
 	}
 
 	req = blk_mq_rq_to_pdu(rq);
+	if (unlikely(nvme_tcp_req_busy(queue, req)))
+		return -EBUSY;
+
 	if (req->status == cpu_to_le16(NVME_SC_SUCCESS))
 		req->status = cqe->status;
 
@@ -706,6 +730,9 @@ static int nvme_tcp_handle_c2h_data(struct nvme_tcp_queue *queue,
 	}
 
 	req = blk_mq_rq_to_pdu(rq);
+	if (unlikely(nvme_tcp_req_busy(queue, req)))
+		return -EBUSY;
+
 	if (!blk_rq_payload_bytes(rq) || !req->curr_bio || !req->data_len) {
 		dev_err(queue->ctrl->ctrl.device,
 			"queue %d tag %#x unexpected data\n",
@@ -740,11 +767,14 @@ static int nvme_tcp_handle_comp(struct nvme_tcp_queue *queue,
 	 * for them but rather special case them here.
 	 */
 	if (unlikely(nvme_is_aen_req(nvme_tcp_queue_id(queue),
-				     cqe->command_id)))
+				     cqe->command_id))) {
+		if (nvme_tcp_req_busy(queue, &queue->ctrl->async_req))
+			return -EBUSY;
 		nvme_complete_async_event(&queue->ctrl->ctrl, cqe->status,
 				&cqe->result);
-	else
+	} else {
 		ret = nvme_tcp_process_nvme_cqe(queue, cqe);
+	}
 
 	return ret;
 }
@@ -799,6 +829,8 @@ static int nvme_tcp_handle_r2t(struct nvme_tcp_queue *queue,
 		return -ENOENT;
 	}
 	req = blk_mq_rq_to_pdu(rq);
+	if (unlikely(nvme_tcp_req_busy(queue, req)))
+		return -EBUSY;
 
 	if (unlikely(rq_data_dir(rq) != WRITE)) {
 		dev_err(queue->ctrl->ctrl.device,
@@ -825,14 +857,6 @@ static int nvme_tcp_handle_r2t(struct nvme_tcp_queue *queue,
 		dev_err(queue->ctrl->ctrl.device,
 			"req %d unexpected r2t offset %u (expected %zu)\n",
 			rq->tag, r2t_offset, req->data_sent);
-		return -EPROTO;
-	}
-
-	if (llist_on_list(&req->lentry) ||
-	    !list_empty(&req->entry)) {
-		dev_err(queue->ctrl->ctrl.device,
-			"req %d unexpected r2t while processing request\n",
-			rq->tag);
 		return -EPROTO;
 	}
 
@@ -938,16 +962,31 @@ static int nvme_tcp_recv_pdu(struct nvme_tcp_queue *queue, struct sk_buff *skb,
 
 	switch (hdr->type) {
 	case nvme_tcp_c2h_data:
-		return nvme_tcp_handle_c2h_data(queue, (void *)queue->pdu);
+		ret = nvme_tcp_handle_c2h_data(queue, (void *)queue->pdu);
+		break;
 	case nvme_tcp_rsp:
-		nvme_tcp_init_recv_ctx(queue);
-		return nvme_tcp_handle_comp(queue, (void *)queue->pdu);
+		ret = nvme_tcp_handle_comp(queue, (void *)queue->pdu);
+		break;
 	case nvme_tcp_r2t:
-		nvme_tcp_init_recv_ctx(queue);
-		return nvme_tcp_handle_r2t(queue, (void *)queue->pdu);
+		ret = nvme_tcp_handle_r2t(queue, (void *)queue->pdu);
+		break;
 	default:
 		goto unsupported_pdu;
 	}
+
+	if (unlikely(ret == -EBUSY)) {
+		/*
+		 * The command is still being sent. Leave the end of the header
+		 * in the socket and look at it again when that is done.
+		 */
+		queue->pdu_remaining += rcv_len;
+		queue->pdu_offset -= rcv_len;
+		*offset -= rcv_len;
+		*len += rcv_len;
+	} else if (hdr->type != nvme_tcp_c2h_data) {
+		nvme_tcp_init_recv_ctx(queue);
+	}
+	return ret;
 
 unsupported_pdu:
 	dev_err(queue->ctrl->ctrl.device,
@@ -1109,6 +1148,10 @@ static int nvme_tcp_recv_skb(read_descriptor_t *desc, struct sk_buff *skb,
 		default:
 			result = -EFAULT;
 		}
+		if (unlikely(result == -EBUSY)) {
+			queue->rcv_parked = true;
+			return consumed - len;
+		}
 		if (result) {
 			dev_err(queue->ctrl->ctrl.device,
 				"receive failed:  %d\n", result);
@@ -1181,7 +1224,8 @@ done:
 
 static inline void nvme_tcp_done_send_req(struct nvme_tcp_queue *queue)
 {
-	queue->request = NULL;
+	/* pairs with nvme_tcp_req_busy() */
+	smp_store_release(&queue->request, NULL);
 }
 
 static void nvme_tcp_fail_request(struct nvme_tcp_request *req)
@@ -1206,7 +1250,8 @@ static int nvme_tcp_try_send_data(struct nvme_tcp_request *req)
 	while (true) {
 		struct bio_vec bvec;
 		struct msghdr msg = {
-			.msg_flags = MSG_DONTWAIT | MSG_SPLICE_PAGES,
+			.msg_flags = MSG_DONTWAIT | MSG_NOSIGNAL |
+				     MSG_SPLICE_PAGES,
 		};
 		struct page *page = nvme_tcp_req_cur_page(req);
 		size_t offset = nvme_tcp_req_cur_offset(req);
@@ -1265,7 +1310,9 @@ static int nvme_tcp_try_send_cmd_pdu(struct nvme_tcp_request *req)
 	struct nvme_tcp_queue *queue = req->queue;
 	struct nvme_tcp_cmd_pdu *pdu = nvme_tcp_req_cmd_pdu(req);
 	struct bio_vec bvec;
-	struct msghdr msg = { .msg_flags = MSG_DONTWAIT | MSG_SPLICE_PAGES, };
+	struct msghdr msg = {
+		.msg_flags = MSG_DONTWAIT | MSG_NOSIGNAL | MSG_SPLICE_PAGES,
+	};
 	bool inline_data = nvme_tcp_has_inline_data(req);
 	u8 hdgst = nvme_tcp_hdgst_len(queue);
 	int len = sizeof(*pdu) + hdgst - req->offset;
@@ -1306,7 +1353,9 @@ static int nvme_tcp_try_send_data_pdu(struct nvme_tcp_request *req)
 	struct nvme_tcp_queue *queue = req->queue;
 	struct nvme_tcp_data_pdu *pdu = nvme_tcp_req_data_pdu(req);
 	struct bio_vec bvec;
-	struct msghdr msg = { .msg_flags = MSG_DONTWAIT | MSG_MORE, };
+	struct msghdr msg = {
+		.msg_flags = MSG_DONTWAIT | MSG_NOSIGNAL | MSG_MORE,
+	};
 	u8 hdgst = nvme_tcp_hdgst_len(queue);
 	int len = sizeof(*pdu) - req->offset + hdgst;
 	int ret;
@@ -1341,7 +1390,7 @@ static int nvme_tcp_try_send_ddgst(struct nvme_tcp_request *req)
 	size_t offset = req->offset;
 	u32 h2cdata_left = req->h2cdata_left;
 	int ret;
-	struct msghdr msg = { .msg_flags = MSG_DONTWAIT };
+	struct msghdr msg = { .msg_flags = MSG_DONTWAIT | MSG_NOSIGNAL };
 	struct kvec iov = {
 		.iov_base = (u8 *)&req->ddgst + req->offset,
 		.iov_len = NVME_TCP_DIGEST_LENGTH - req->offset
@@ -1412,13 +1461,15 @@ done:
 			"failed to send request %d\n", ret);
 		nvme_tcp_fail_request(queue->request);
 		nvme_tcp_done_send_req(queue);
+		/* The close may have come when nobody could act on it */
+		nvme_tcp_error_recovery(&queue->ctrl->ctrl);
 	}
 out:
 	memalloc_noreclaim_restore(noreclaim_flag);
 	return ret;
 }
 
-static int nvme_tcp_try_recv(struct nvme_tcp_queue *queue)
+static int nvme_tcp_read_sock(struct nvme_tcp_queue *queue)
 {
 	struct socket *sock = queue->sock;
 	struct sock *sk = sock->sk;
@@ -1429,9 +1480,118 @@ static int nvme_tcp_try_recv(struct nvme_tcp_queue *queue)
 	rd_desc.count = 1;
 	lock_sock(sk);
 	queue->nr_cqe = 0;
+	queue->rcv_parked = false;
 	consumed = sock->ops->read_sock(sk, &rd_desc, nvme_tcp_recv_skb);
 	release_sock(sk);
+	return consumed;
+}
+
+/*
+ * read_sock() leaves a TLS record that is no data where it is, in front of
+ * all that follows.  Take it out of the way.
+ */
+static int nvme_tcp_recv_tls_ctrl(struct nvme_tcp_queue *queue)
+{
+	struct nvme_ctrl *ctrl = &queue->ctrl->ctrl;
+	char cbuf[CMSG_LEN(sizeof(char))] = {};
+	struct msghdr msg = {
+		.msg_control = cbuf,
+		.msg_controllen = sizeof(cbuf),
+		.msg_flags = MSG_DONTWAIT,
+	};
+	u8 ctype, level, description, data[2] = {};
+	struct kvec iov = { .iov_base = data, .iov_len = sizeof(data) };
+	int len;
+
+	/*
+	 * io_work and a poller may both have met the record, and recvmsg()
+	 * would take data as well.  Only one of them goes on, and he looks
+	 * again: nobody else removes such a record from now on.
+	 */
+	if (test_and_set_bit_lock(NVME_TCP_Q_TLS_CTRL, &queue->flags))
+		return 0;
+	len = nvme_tcp_read_sock(queue);
+	if (len != -EINVAL || !queue->rd_enabled)
+		goto out;
+
+	len = kernel_recvmsg(queue->sock, &msg, &iov, 1, iov.iov_len,
+			     msg.msg_flags);
+	if (len < 0)
+		goto out;
+
+	ctype = tls_get_record_type(queue->sock->sk, (struct cmsghdr *)cbuf);
+	switch (ctype) {
+	case 0:
+	case TLS_RECORD_TYPE_DATA:
+		goto fail;
+	case TLS_RECORD_TYPE_ALERT:
+		iov_iter_revert(&msg.msg_iter, len);
+		tls_alert_recv(queue->sock->sk, &msg, &level, &description);
+		dev_warn_ratelimited(ctrl->device,
+				     "queue %d: TLS Alert level %u desc %u\n",
+				     nvme_tcp_queue_id(queue), level,
+				     description);
+		if (level == TLS_ALERT_LEVEL_FATAL)
+			goto fail;
+		break;
+	default:
+		dev_warn_ratelimited(ctrl->device,
+				     "queue %d: TLS record %u dropped\n",
+				     nvme_tcp_queue_id(queue), ctype);
+		break;
+	}
+
+	if (!(msg.msg_flags & MSG_EOR)) {
+		msg.msg_control = cbuf;
+		msg.msg_controllen = sizeof(cbuf);
+		iov_iter_discard(&msg.msg_iter, ITER_DEST,
+				 TLS_MAX_PAYLOAD_SIZE);
+		sock_recvmsg(queue->sock, &msg, MSG_DONTWAIT);
+	}
+	len = 1;
+out:
+	clear_bit_unlock(NVME_TCP_Q_TLS_CTRL, &queue->flags);
+	return len;
+
+fail:
+	queue->rd_enabled = false;
+	nvme_tcp_error_recovery(ctrl);
+	len = -ENOTCONN;
+	goto out;
+}
+
+static int nvme_tcp_try_recv(struct nvme_tcp_queue *queue)
+{
+	int consumed = nvme_tcp_read_sock(queue);
+
+	if (consumed == -EINVAL && nvme_tcp_queue_tls(queue) &&
+	    queue->rd_enabled)
+		consumed = nvme_tcp_recv_tls_ctrl(queue);
+	if (consumed == -EKEYEXPIRED && queue->rd_enabled) {
+		/* Nobody is going to install the new key */
+		dev_err(queue->ctrl->ctrl.device,
+			"queue %d: TLS KeyUpdate is not supported\n",
+			nvme_tcp_queue_id(queue));
+		queue->rd_enabled = false;
+		nvme_tcp_error_recovery(&queue->ctrl->ctrl);
+	}
 	return consumed == -EAGAIN ? 0 : consumed;
+}
+
+/*
+ * A PDU has been left in the socket because its command is still being sent.
+ * A sender in another context does not wake us when it is done: wait for it.
+ * If there is something left to send then, either the socket is full and tells
+ * us when it has room, or io_work has been queued.
+ */
+static bool nvme_tcp_recv_again(struct nvme_tcp_queue *queue)
+{
+	bool again;
+
+	mutex_lock(&queue->send_mutex);
+	again = !queue->request && !nvme_tcp_queue_has_pending(queue);
+	mutex_unlock(&queue->send_mutex);
+	return again;
 }
 
 static void nvme_tcp_io_work(struct work_struct *w)
@@ -1458,6 +1618,9 @@ static void nvme_tcp_io_work(struct work_struct *w)
 			pending = true;
 		else if (unlikely(result < 0))
 			return;
+
+		if (unlikely(queue->rcv_parked) && nvme_tcp_recv_again(queue))
+			pending = true;
 
 		/* did we get some space after spending time in recv? */
 		if (nvme_tcp_queue_has_pending(queue) &&
@@ -1494,6 +1657,8 @@ static int nvme_tcp_alloc_async_req(struct nvme_tcp_ctrl *ctrl)
 		return -ENOMEM;
 
 	async->queue = &ctrl->queues[0];
+	init_llist_node(&async->lentry);
+	INIT_LIST_HEAD(&async->entry);
 	return 0;
 }
 
@@ -1505,8 +1670,6 @@ static void nvme_tcp_free_queue(struct nvme_ctrl *nctrl, int qid)
 
 	if (!test_and_clear_bit(NVME_TCP_Q_ALLOCATED, &queue->flags))
 		return;
-
-	page_frag_cache_drain(&queue->pf_cache);
 
 	/**
 	 * Prevent memory reclaim from triggering block I/O during socket
@@ -1530,8 +1693,6 @@ static void nvme_tcp_free_queue(struct nvme_ctrl *nctrl, int qid)
 
 	kfree(queue->pdu);
 	mutex_destroy(&queue->send_mutex);
-	mutex_destroy(&queue->queue_lock);
-	mutex_destroy(&queue->pf_cache_lock);
 }
 
 static int nvme_tcp_init_connection(struct nvme_tcp_queue *queue)
@@ -1540,7 +1701,7 @@ static int nvme_tcp_init_connection(struct nvme_tcp_queue *queue)
 	struct nvme_tcp_icresp_pdu *icresp;
 	char cbuf[CMSG_LEN(sizeof(char))] = {};
 	u8 ctype;
-	struct msghdr msg = {};
+	struct msghdr msg = { .msg_flags = MSG_NOSIGNAL };
 	struct kvec iov;
 	bool ctrl_hdgst, ctrl_ddgst;
 	u32 maxh2cdata;
@@ -1827,7 +1988,12 @@ static int nvme_tcp_start_tls(struct nvme_ctrl *nctrl,
 		dev_err(nctrl->device,
 			"queue %d: TLS handshake failed, error %d\n",
 			qid, ret);
-		tls_handshake_cancel(queue->sock->sk);
+		/*
+		 * If the cancellation lost to handshake_complete(),
+		 * nvme_tcp_tls_done() is in flight and still uses the queue.
+		 */
+		if (!tls_handshake_cancel(queue->sock->sk))
+			wait_for_completion(&queue->tls_complete);
 	} else {
 		if (queue->tls_err) {
 			dev_err(nctrl->device,
@@ -1850,13 +2016,11 @@ static int nvme_tcp_alloc_queue(struct nvme_ctrl *nctrl, int qid,
 	int ret, rcv_pdu_size;
 	struct file *sock_file;
 
-	mutex_init(&queue->queue_lock);
 	queue->ctrl = ctrl;
 	init_llist_head(&queue->req_list);
 	INIT_LIST_HEAD(&queue->send_list);
 	mutex_init(&queue->send_mutex);
 	INIT_WORK(&queue->io_work, nvme_tcp_io_work);
-	mutex_init(&queue->pf_cache_lock);
 
 	if (qid > 0)
 		queue->cmnd_capsule_len = nctrl->ioccsz * 16;
@@ -1988,8 +2152,6 @@ err_sock:
 	queue->sock = NULL;
 err_destroy_mutex:
 	mutex_destroy(&queue->send_mutex);
-	mutex_destroy(&queue->queue_lock);
-	mutex_destroy(&queue->pf_cache_lock);
 	return ret;
 }
 
@@ -2676,6 +2838,10 @@ static void nvme_tcp_stop_ctrl(struct nvme_ctrl *ctrl)
 static void nvme_tcp_free_ctrl(struct nvme_ctrl *nctrl)
 {
 	struct nvme_tcp_ctrl *ctrl = to_tcp_ctrl(nctrl);
+	int i;
+
+	for (i = 0; i < ctrl->nr_queues; i++)
+		page_frag_cache_drain(&ctrl->queues[i].pf_cache);
 
 	if (list_empty_careful(&ctrl->list))
 		goto free_ctrl;
@@ -2730,6 +2896,10 @@ static void nvme_tcp_submit_async_event(struct nvme_ctrl *arg)
 	struct nvme_command *cmd = &pdu->cmd;
 	u8 hdgst = nvme_tcp_hdgst_len(queue);
 
+	/* A controller which completes it twice makes us come here twice */
+	if (nvme_tcp_req_busy(queue, &ctrl->async_req))
+		return;
+
 	memset(pdu, 0, sizeof(*pdu));
 	pdu->hdr.type = nvme_tcp_cmd;
 	if (queue->hdr_digest)
@@ -2746,8 +2916,6 @@ static void nvme_tcp_submit_async_event(struct nvme_ctrl *arg)
 	ctrl->async_req.offset = 0;
 	ctrl->async_req.curr_bio = NULL;
 	ctrl->async_req.data_len = 0;
-	init_llist_node(&ctrl->async_req.lentry);
-	INIT_LIST_HEAD(&ctrl->async_req.entry);
 
 	nvme_tcp_queue_request(&ctrl->async_req, true);
 }
@@ -2917,18 +3085,33 @@ static void nvme_tcp_map_queues(struct blk_mq_tag_set *set)
 static int nvme_tcp_poll(struct blk_mq_hw_ctx *hctx, struct io_comp_batch *iob)
 {
 	struct nvme_tcp_queue *queue = hctx->driver_data;
-	struct sock *sk = queue->sock->sk;
-	int ret;
+	struct sock *sk;
+	int ret = 0;
 
 	if (!test_bit(NVME_TCP_Q_LIVE, &queue->flags))
 		return 0;
 
+	/*
+	 * Nothing in the block layer keeps a poller out while the queue is
+	 * torn down.  The lock keeps the socket until we are through; if
+	 * somebody else has it, he polls, or the queue is being stopped.
+	 */
+	if (!mutex_trylock(&queue->queue_lock))
+		return 0;
+	if (!test_bit(NVME_TCP_Q_LIVE, &queue->flags))
+		goto unlock;
+
+	sk = queue->sock->sk;
 	set_bit(NVME_TCP_Q_POLLING, &queue->flags);
 	if (sk_can_busy_loop(sk) && skb_queue_empty_lockless(&sk->sk_receive_queue))
 		sk_busy_loop(sk, true);
 	ret = nvme_tcp_try_recv(queue);
 	clear_bit(NVME_TCP_Q_POLLING, &queue->flags);
-	return ret < 0 ? ret : queue->nr_cqe;
+	if (ret >= 0)
+		ret = queue->nr_cqe;
+unlock:
+	mutex_unlock(&queue->queue_lock);
+	return ret;
 }
 
 static int nvme_tcp_get_address(struct nvme_ctrl *ctrl, char *buf, int size)
@@ -3015,7 +3198,7 @@ static struct nvme_tcp_ctrl *nvme_tcp_alloc_ctrl(struct device *dev,
 		struct nvmf_ctrl_options *opts)
 {
 	struct nvme_tcp_ctrl *ctrl;
-	int ret;
+	int ret, i;
 
 	ctrl = kzalloc_obj(*ctrl);
 	if (!ctrl)
@@ -3083,6 +3266,15 @@ static struct nvme_tcp_ctrl *nvme_tcp_alloc_ctrl(struct device *dev,
 	if (!ctrl->queues) {
 		ret = -ENOMEM;
 		goto out_free_ctrl;
+	}
+	ctrl->nr_queues = ctrl->ctrl.queue_count;
+	/*
+	 * A poller may try the lock of a queue that has been freed, and a
+	 * request of a new namespace may be set up for one.
+	 */
+	for (i = 0; i < ctrl->nr_queues; i++) {
+		mutex_init(&ctrl->queues[i].queue_lock);
+		mutex_init(&ctrl->queues[i].pf_cache_lock);
 	}
 
 	ctrl->net = get_net(current->nsproxy->net_ns);

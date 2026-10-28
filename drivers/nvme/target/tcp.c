@@ -85,6 +85,7 @@ MODULE_PARM_DESC(tls_handshake_timeout,
 #define NVMET_TCP_RECV_BUDGET		8
 #define NVMET_TCP_SEND_BUDGET		8
 #define NVMET_TCP_IO_WORK_BUDGET	64
+#define NVMET_TCP_ACCEPT_BUDGET		16
 
 enum nvmet_tcp_send_state {
 	NVMET_TCP_SEND_DATA_PDU,
@@ -140,6 +141,7 @@ struct nvmet_tcp_cmd {
 
 enum nvmet_tcp_queue_state {
 	NVMET_TCP_Q_CONNECTING,
+	NVMET_TCP_Q_TLS_PEEK,
 	NVMET_TCP_Q_TLS_HANDSHAKE,
 	NVMET_TCP_Q_LIVE,
 	NVMET_TCP_Q_DISCONNECTING,
@@ -149,6 +151,7 @@ enum nvmet_tcp_queue_state {
 struct nvmet_tcp_queue {
 	struct socket		*sock;
 	struct nvmet_tcp_port	*port;
+	struct nvmet_port	*nport;
 	struct work_struct	io_work;
 	struct nvmet_cq		nvme_cq;
 	struct nvmet_sq		nvme_sq;
@@ -176,6 +179,7 @@ struct nvmet_tcp_queue {
 
 	/* TLS state */
 	key_serial_t		tls_pskid;
+	key_serial_t		tls_keyring;
 	struct delayed_work	tls_handshake_tmo_work;
 
 	unsigned long           poll_end;
@@ -412,7 +416,7 @@ static void nvmet_tcp_socket_error(struct nvmet_tcp_queue *queue, int status)
 	if (status == -EPIPE || status == -ECONNRESET || !queue->nvme_sq.ctrl)
 		kernel_sock_shutdown(queue->sock, SHUT_RDWR);
 	else
-		nvmet_ctrl_fatal_error(queue->nvme_sq.ctrl);
+		nvmet_sq_fatal_error(&queue->nvme_sq);
 }
 
 static int nvmet_tcp_map_data(struct nvmet_tcp_cmd *cmd)
@@ -1173,8 +1177,26 @@ static inline bool nvmet_tcp_pdu_valid(u8 type)
 	return false;
 }
 
+/*
+ * The buffer took as much of the record as the PDU still wants, which may be
+ * one byte.  The rest comes with the type of the record, never with that
+ * which follows: throw it away at once.
+ */
+static void nvmet_tcp_tls_drop_rest(struct nvmet_tcp_queue *queue)
+{
+	char cbuf[CMSG_LEN(sizeof(char))] = {};
+	struct msghdr msg = {
+		.msg_control = cbuf,
+		.msg_controllen = sizeof(cbuf),
+		.msg_flags = MSG_DONTWAIT,
+	};
+
+	iov_iter_discard(&msg.msg_iter, ITER_DEST, TLS_MAX_PAYLOAD_SIZE);
+	sock_recvmsg(queue->sock, &msg, msg.msg_flags);
+}
+
 static int nvmet_tcp_tls_record_ok(struct nvmet_tcp_queue *queue,
-		struct msghdr *msg, char *cbuf)
+		struct msghdr *msg, char *cbuf, int len)
 {
 	struct cmsghdr *cmsg = (struct cmsghdr *)cbuf;
 	u8 ctype, level, description;
@@ -1187,25 +1209,39 @@ static int nvmet_tcp_tls_record_ok(struct nvmet_tcp_queue *queue,
 	case TLS_RECORD_TYPE_DATA:
 		break;
 	case TLS_RECORD_TYPE_ALERT:
+		iov_iter_revert(&msg->msg_iter, len);
 		tls_alert_recv(queue->sock->sk, msg, &level, &description);
 		if (level == TLS_ALERT_LEVEL_FATAL) {
-			pr_err("queue %d: TLS Alert desc %u\n",
-			       queue->idx, description);
+			pr_err_ratelimited("queue %d: TLS Alert desc %u\n",
+					   queue->idx, description);
 			ret = -ENOTCONN;
 		} else {
-			pr_warn("queue %d: TLS Alert desc %u\n",
-			       queue->idx, description);
+			pr_warn_ratelimited("queue %d: TLS Alert desc %u\n",
+					    queue->idx, description);
 			ret = -EAGAIN;
 		}
 		break;
 	default:
 		/* discard this record type */
-		pr_err("queue %d: TLS record %d unhandled\n",
-		       queue->idx, ctype);
+		iov_iter_revert(&msg->msg_iter, len);
+		pr_err_ratelimited("queue %d: TLS record %d unhandled\n",
+				   queue->idx, ctype);
 		ret = -EAGAIN;
 		break;
 	}
+	if (ret == -EAGAIN && !(msg->msg_flags & MSG_EOR))
+		nvmet_tcp_tls_drop_rest(queue);
 	return ret;
+}
+
+/*
+ * A receive from a TLS socket ends with the record, or where the type of the
+ * records changes.  There may be more behind a record that has been dropped,
+ * and nobody will tell: have nvmet_tcp_try_recv() look again.
+ */
+static int nvmet_tcp_tls_again(int ret)
+{
+	return ret == -EAGAIN ? 1 : ret;
 }
 
 static int nvmet_tcp_try_recv_pdu(struct nvmet_tcp_queue *queue)
@@ -1222,21 +1258,22 @@ recv:
 	if (queue->tls_pskid) {
 		msg.msg_control = cbuf;
 		msg.msg_controllen = sizeof(cbuf);
+		msg.msg_flags &= ~MSG_EOR;
 	}
 	len = kernel_recvmsg(queue->sock, &msg, &iov, 1,
 			iov.iov_len, msg.msg_flags);
 	if (unlikely(len < 0))
 		return len;
 	if (queue->tls_pskid) {
-		ret = nvmet_tcp_tls_record_ok(queue, &msg, cbuf);
+		ret = nvmet_tcp_tls_record_ok(queue, &msg, cbuf, len);
 		if (ret < 0)
-			return ret;
+			return nvmet_tcp_tls_again(ret);
 	}
 
 	queue->offset += len;
 	queue->left -= len;
 	if (queue->left)
-		return -EAGAIN;
+		return queue->tls_pskid && len ? 1 : -EAGAIN;
 
 	if (queue->offset == sizeof(struct nvme_tcp_hdr)) {
 		u8 hdgst = nvmet_tcp_hdgst_len(queue);
@@ -1284,15 +1321,21 @@ static int nvmet_tcp_try_recv_data(struct nvmet_tcp_queue *queue)
 	int len, ret;
 
 	while (msg_data_left(&cmd->recv_msg)) {
+		if (queue->tls_pskid) {
+			/* The last receive has used it up */
+			cmd->recv_msg.msg_control = cmd->recv_cbuf;
+			cmd->recv_msg.msg_controllen = sizeof(cmd->recv_cbuf);
+			cmd->recv_msg.msg_flags &= ~MSG_EOR;
+		}
 		len = sock_recvmsg(cmd->queue->sock, &cmd->recv_msg,
 			cmd->recv_msg.msg_flags);
 		if (len <= 0)
 			return len;
 		if (queue->tls_pskid) {
 			ret = nvmet_tcp_tls_record_ok(cmd->queue,
-					&cmd->recv_msg, cmd->recv_cbuf);
+					&cmd->recv_msg, cmd->recv_cbuf, len);
 			if (ret < 0)
-				return ret;
+				return nvmet_tcp_tls_again(ret);
 		}
 
 		cmd->pdu_recv += len;
@@ -1331,15 +1374,15 @@ static int nvmet_tcp_try_recv_ddgst(struct nvmet_tcp_queue *queue)
 	if (unlikely(len < 0))
 		return len;
 	if (queue->tls_pskid) {
-		ret = nvmet_tcp_tls_record_ok(queue, &msg, cbuf);
+		ret = nvmet_tcp_tls_record_ok(queue, &msg, cbuf, len);
 		if (ret < 0)
-			return ret;
+			return nvmet_tcp_tls_again(ret);
 	}
 
 	queue->offset += len;
 	queue->left -= len;
 	if (queue->left)
-		return -EAGAIN;
+		return queue->tls_pskid && len ? 1 : -EAGAIN;
 
 	if (queue->data_digest && cmd->exp_ddgst != cmd->recv_ddgst) {
 		pr_err("queue %d: cmd %d pdu (%d) data digest error: recv %#x expected %#x\n",
@@ -1457,12 +1500,19 @@ static bool nvmet_tcp_check_queue_deadline(struct nvmet_tcp_queue *queue,
 	return !time_after(jiffies, queue->poll_end);
 }
 
+static bool nvmet_tcp_tls_peek(struct nvmet_tcp_queue *queue);
+
 static void nvmet_tcp_io_work(struct work_struct *w)
 {
 	struct nvmet_tcp_queue *queue =
 		container_of(w, struct nvmet_tcp_queue, io_work);
 	bool pending;
 	int ret, ops = 0;
+
+	if ((queue->state == NVMET_TCP_Q_TLS_PEEK ||
+	     queue->state == NVMET_TCP_Q_TLS_HANDSHAKE) &&
+	    !nvmet_tcp_tls_peek(queue))
+		return;
 
 	do {
 		pending = false;
@@ -1495,7 +1545,7 @@ static int nvmet_tcp_alloc_cmd(struct nvmet_tcp_queue *queue,
 	u8 hdgst = nvmet_tcp_hdgst_len(queue);
 
 	c->queue = queue;
-	c->req.port = queue->port->nport;
+	c->req.port = queue->nport;
 
 	c->cmd_pdu = page_frag_alloc(&queue->pf_cache,
 			sizeof(*c->cmd_pdu) + hdgst, GFP_KERNEL | __GFP_ZERO);
@@ -1789,11 +1839,8 @@ static int nvmet_tcp_try_peek_pdu(struct nvmet_tcp_queue *queue)
 	struct msghdr msg = {
 		.msg_control = cbuf,
 		.msg_controllen = sizeof(cbuf),
-		.msg_flags = MSG_PEEK,
+		.msg_flags = MSG_PEEK | MSG_DONTWAIT,
 	};
-
-	if (nvmet_port_secure_channel_required(queue->port->nport))
-		return 0;
 
 	len = kernel_recvmsg(queue->sock, &msg, &iov, 1,
 			iov.iov_len, msg.msg_flags);
@@ -1803,7 +1850,7 @@ static int nvmet_tcp_try_peek_pdu(struct nvmet_tcp_queue *queue)
 		return len;
 	}
 
-	ret = nvmet_tcp_tls_record_ok(queue, &msg, cbuf);
+	ret = nvmet_tcp_tls_record_ok(queue, &msg, cbuf, len);
 	if (ret < 0)
 		return ret;
 
@@ -1910,13 +1957,15 @@ static int nvmet_tcp_tls_handshake(struct nvmet_tcp_queue *queue)
 		return -EINVAL;
 	}
 
+	/* One for the handshake, one to keep the queue until we are through */
+	kref_get(&queue->kref);
 	kref_get(&queue->kref);
 	pr_debug("queue %d: TLS ServerHello\n", queue->idx);
 	memset(&args, 0, sizeof(args));
 	args.ta_sock = queue->sock;
 	args.ta_done = nvmet_tcp_tls_handshake_done;
 	args.ta_data = queue;
-	args.ta_keyring = key_serial(queue->port->nport->keyring);
+	args.ta_keyring = queue->tls_keyring;
 	args.ta_timeout_ms = tls_handshake_timeout * 1000;
 
 	ret = tls_server_hello_psk(&args, GFP_KERNEL);
@@ -1924,13 +1973,62 @@ static int nvmet_tcp_tls_handshake(struct nvmet_tcp_queue *queue)
 		kref_put(&queue->kref, nvmet_tcp_release_queue);
 		pr_err("failed to start TLS, err=%d\n", ret);
 	} else {
-		queue_delayed_work(nvmet_wq, &queue->tls_handshake_tmo_work,
-				   tls_handshake_timeout * HZ);
+		/* The handshake may be over, then nobody cancels the timer */
+		spin_lock_bh(&queue->state_lock);
+		if (queue->state == NVMET_TCP_Q_TLS_HANDSHAKE)
+			queue_delayed_work(nvmet_wq,
+					   &queue->tls_handshake_tmo_work,
+					   tls_handshake_timeout * HZ);
+		spin_unlock_bh(&queue->state_lock);
 	}
+	kref_put(&queue->kref, nvmet_tcp_release_queue);
 	return ret;
+}
+
+/*
+ * TLS is offered, but not required: the first bytes tell what the host wants.
+ * Returns true if the queue goes on without TLS.
+ */
+static bool nvmet_tcp_tls_peek(struct nvmet_tcp_queue *queue)
+{
+	int ret;
+
+	if (queue->state == NVMET_TCP_Q_TLS_HANDSHAKE) {
+		if (nvmet_tcp_tls_handshake(queue))
+			nvmet_tcp_schedule_release_queue(queue);
+		return false;
+	}
+
+	/* ->data_ready() brings us back */
+	ret = nvmet_tcp_try_peek_pdu(queue);
+	if (ret == -EAGAIN)
+		return false;
+
+	/* The upcall wants the default callbacks */
+	if (!ret)
+		nvmet_tcp_restore_socket_callbacks(queue);
+
+	spin_lock_bh(&queue->state_lock);
+	if (queue->state != NVMET_TCP_Q_TLS_PEEK) {
+		spin_unlock_bh(&queue->state_lock);
+		return false;
+	}
+	queue->state = ret ? NVMET_TCP_Q_CONNECTING : NVMET_TCP_Q_TLS_HANDSHAKE;
+	spin_unlock_bh(&queue->state_lock);
+	if (ret)
+		return true;
+
+	/*
+	 * ->data_ready() may have queued the io work meanwhile, nothing does
+	 * from now on. The handshake must not start before that run is over,
+	 * so leave it to that run.
+	 */
+	queue_work_on(queue_cpu(queue), nvmet_tcp_wq, &queue->io_work);
+	return false;
 }
 #else
 static void nvmet_tcp_tls_handshake_timeout(struct work_struct *w) {}
+static bool nvmet_tcp_tls_peek(struct nvmet_tcp_queue *queue) { return true; }
 #endif
 
 static void nvmet_tcp_alloc_queue(struct nvmet_tcp_port *port,
@@ -1951,6 +2049,8 @@ static void nvmet_tcp_alloc_queue(struct nvmet_tcp_port *port,
 	kref_init(&queue->kref);
 	queue->sock = newsock;
 	queue->port = port;
+	/* The port may be gone when the commands are allocated */
+	queue->nport = port->nport;
 	queue->nr_cmds = 0;
 	spin_lock_init(&queue->state_lock);
 	if (queue->port->nport->disc_addr.tsas.tcp.sectype ==
@@ -2000,14 +2100,16 @@ static void nvmet_tcp_alloc_queue(struct nvmet_tcp_port *port,
 		sk->sk_user_data = NULL;
 		sk->sk_data_ready = port->data_ready;
 		write_unlock_bh(&sk->sk_callback_lock);
-		if (!nvmet_tcp_try_peek_pdu(queue)) {
+		/* The port may be gone when the upcall is made */
+		queue->tls_keyring = key_serial(port->nport->keyring);
+		if (nvmet_port_secure_channel_required(port->nport)) {
 			if (!nvmet_tcp_tls_handshake(queue))
 				return;
 			/* TLS handshake failed, terminate the connection */
 			goto out_destroy_sq;
 		}
-		/* Not a TLS connection, continue with normal processing */
-		queue->state = NVMET_TCP_Q_CONNECTING;
+		/* Don't wait for the host here: others want to connect, too */
+		queue->state = NVMET_TCP_Q_TLS_PEEK;
 	}
 #endif
 
@@ -2047,9 +2149,9 @@ static void nvmet_tcp_accept_work(struct work_struct *w)
 	struct nvmet_tcp_port *port =
 		container_of(w, struct nvmet_tcp_port, accept_work);
 	struct socket *newsock;
-	int ret;
+	int ret, i;
 
-	while (true) {
+	for (i = 0; i < NVMET_TCP_ACCEPT_BUDGET; i++) {
 		ret = kernel_accept(port->sock, &newsock, O_NONBLOCK);
 		if (ret < 0) {
 			if (ret != -EAGAIN)
@@ -2058,6 +2160,9 @@ static void nvmet_tcp_accept_work(struct work_struct *w)
 		}
 		nvmet_tcp_alloc_queue(port, newsock);
 	}
+
+	/* There may be more. Come to an end for those who flush nvmet_wq. */
+	queue_work(nvmet_wq, &port->accept_work);
 }
 
 static void nvmet_tcp_listen_data_ready(struct sock *sk)
@@ -2173,6 +2278,8 @@ static void nvmet_tcp_remove_port(struct nvmet_port *nport)
 	port->sock->sk->sk_data_ready = port->data_ready;
 	port->sock->sk->sk_user_data = NULL;
 	write_unlock_bh(&port->sock->sk->sk_callback_lock);
+	/* The accept work goes on for as long as there is something to accept */
+	kernel_sock_shutdown(port->sock, SHUT_RDWR);
 	cancel_work_sync(&port->accept_work);
 	/*
 	 * Destroy the remaining queues, which are not belong to any
@@ -2182,6 +2289,14 @@ static void nvmet_tcp_remove_port(struct nvmet_port *nport)
 
 	sock_release(port->sock);
 	kfree(port);
+}
+
+static void nvmet_tcp_disconnect_queue(struct nvmet_sq *sq)
+{
+	struct nvmet_tcp_queue *queue =
+		container_of(sq, struct nvmet_tcp_queue, nvme_sq);
+
+	kernel_sock_shutdown(queue->sock, SHUT_RDWR);
 }
 
 static void nvmet_tcp_delete_ctrl(struct nvmet_ctrl *ctrl)
@@ -2261,6 +2376,7 @@ static const struct nvmet_fabrics_ops nvmet_tcp_ops = {
 	.remove_port		= nvmet_tcp_remove_port,
 	.queue_response		= nvmet_tcp_queue_response,
 	.delete_ctrl		= nvmet_tcp_delete_ctrl,
+	.disconnect_queue	= nvmet_tcp_disconnect_queue,
 	.install_queue		= nvmet_tcp_install_queue,
 	.disc_traddr		= nvmet_tcp_disc_port_addr,
 	.host_traddr		= nvmet_tcp_host_port_addr,

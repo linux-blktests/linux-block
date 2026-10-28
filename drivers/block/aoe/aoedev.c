@@ -286,6 +286,8 @@ freedev(struct aoedev *d)
 		return;
 
 	timer_delete_sync(&d->timer);
+	/* With DEVFL_TKILL set only the work itself still queues it */
+	cancel_work_sync(&d->work);
 	if (d->gd) {
 		aoedisk_rm_debugfs(d);
 		del_gendisk(d->gd);
@@ -356,7 +358,9 @@ restart1:
 		spin_unlock(&d->lock);
 		spin_unlock_irqrestore(&devlist_lock, flags);
 		aoedev_downdev(d);
+		spin_lock_irqsave(&d->lock, flags);
 		d->flags |= DEVFL_TKILL;
+		spin_unlock_irqrestore(&d->lock, flags);
 		goto restart1;
 cont:
 		spin_unlock(&d->lock);

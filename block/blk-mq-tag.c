@@ -139,6 +139,18 @@ unsigned long blk_mq_get_tags(struct blk_mq_alloc_data *data, int nr_tags,
 		return 0;
 	ret = __sbitmap_queue_get_batch(bt, nr_tags, offset);
 	*offset += tags->nr_reserved_tags;
+
+	/*
+	 * Give up this allocation if the hctx is inactive, like blk_mq_get_tag()
+	 * does. The caller falls back to it and will retry on an active hctx.
+	 */
+	if (ret && unlikely(test_bit(BLK_MQ_S_INACTIVE, &data->hctx->state))) {
+		unsigned int i;
+
+		for_each_set_bit(i, &ret, BITS_PER_LONG)
+			blk_mq_put_tag(tags, data->ctx, *offset + i);
+		return 0;
+	}
 	return ret;
 }
 
@@ -611,17 +623,17 @@ static void blk_mq_free_tags_callback(struct rcu_head *head)
 		kmemleak_free(page_address(page));
 		__free_pages(page, page->private);
 	}
+	/* An iterator may walk the bitmaps for as long as it may see the tags */
+	sbitmap_queue_free(&tags->bitmap_tags);
+	sbitmap_queue_free(&tags->breserved_tags);
 	kfree(tags);
 }
 
 void blk_mq_free_tags(struct blk_mq_tags *tags)
 {
-	sbitmap_queue_free(&tags->bitmap_tags);
-	sbitmap_queue_free(&tags->breserved_tags);
-
 	/* if tags pages is not allocated yet, free tags directly */
 	if (list_empty(&tags->page_list)) {
-		kfree(tags);
+		blk_mq_free_tags_callback(&tags->rcu_head);
 		return;
 	}
 

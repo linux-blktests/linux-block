@@ -29,6 +29,7 @@ struct workqueue_struct *nvmet_wq;
 EXPORT_SYMBOL_GPL(nvmet_wq);
 struct workqueue_struct *nvmet_aen_wq;
 EXPORT_SYMBOL_GPL(nvmet_aen_wq);
+struct workqueue_struct *nvmet_pr_wq;
 
 /*
  * This read/write semaphore is used to synchronize access to configuration
@@ -1170,7 +1171,7 @@ static u16 nvmet_parse_io_cmd(struct nvmet_req *req)
 		if (ret)
 			return ret;
 
-		ret = nvmet_pr_get_ns_pc_ref(req);
+		nvmet_pr_set_execute(req);
 	}
 	return ret;
 }
@@ -1507,6 +1508,11 @@ struct nvmet_ctrl *nvmet_ctrl_find_get(const char *subsysnqn,
 				pr_warn("hostnqn mismatch.\n");
 				continue;
 			}
+			/* All queues of a controller come in by its port. */
+			if (ctrl->port != req->port || ctrl->ops != req->ops) {
+				pr_warn("port mismatch.\n");
+				continue;
+			}
 			if (!kref_get_unless_zero(&ctrl->ref))
 				continue;
 
@@ -1642,9 +1648,11 @@ struct nvmet_ctrl *nvmet_alloc_ctrl(struct nvmet_alloc_ctrl_args *args)
 	if (!ctrl)
 		goto out_put_subsystem;
 	mutex_init(&ctrl->lock);
+	mutex_init(&ctrl->auth_lock);
 
 	ctrl->port = args->port;
 	ctrl->ops = args->ops;
+	ctrl->tls = args->sq && nvmet_queue_tls_keyid(args->sq);
 
 #ifdef CONFIG_NVME_TARGET_PASSTHRU
 	/* By default, set loop targets to clear IDS by default */
@@ -1728,7 +1736,10 @@ struct nvmet_ctrl *nvmet_alloc_ctrl(struct nvmet_alloc_ctrl_args *args)
 
 	nvmet_start_keep_alive_timer(ctrl);
 
+	/* An I/O queue may connect as soon as the controller is on the list. */
+	mutex_lock(&ctrl->auth_lock);
 	dhchap_status = nvmet_setup_auth(ctrl, args->sq, false);
+	mutex_unlock(&ctrl->auth_lock);
 	if (dhchap_status) {
 		pr_err("Failed to setup authentication, dhchap status %u\n",
 		       dhchap_status);
@@ -1818,11 +1829,49 @@ void nvmet_ctrl_fatal_error(struct nvmet_ctrl *ctrl)
 }
 EXPORT_SYMBOL_GPL(nvmet_ctrl_fatal_error);
 
+/*
+ * A fatal error on one queue.  The Connect command of an I/O queue needs no
+ * secret, so until the queue has authenticated it may be anybody's: do not
+ * let it take down the controller of the host whose NQN it has named.
+ *
+ * The caller holds sq->ref, as a command that is being executed does: until it
+ * is put, nvmet_sq_destroy() waits, and does not clear sq->ctrl.
+ */
+void __nvmet_sq_fatal_error(struct nvmet_sq *sq)
+{
+	struct nvmet_ctrl *ctrl = sq->ctrl;
+
+	if (sq->qid && ctrl->ops->disconnect_queue && !nvmet_sq_auth_status(sq))
+		ctrl->ops->disconnect_queue(sq);
+	else
+		nvmet_ctrl_fatal_error(ctrl);
+}
+
+/*
+ * A transport calls this with no reference of its own, concurrently with
+ * nvmet_sq_destroy(), which puts the controller and clears sq->ctrl.  As in
+ * nvmet_req_init(), the call can come after percpu_ref_exit():
+ * percpu_ref_tryget_live() then sees that the ref is dead and touches nothing
+ * that is freed.
+ */
+void nvmet_sq_fatal_error(struct nvmet_sq *sq)
+{
+	if (!percpu_ref_tryget_live(&sq->ref))
+		return;
+
+	__nvmet_sq_fatal_error(sq);
+	percpu_ref_put(&sq->ref);
+}
+EXPORT_SYMBOL_GPL(nvmet_sq_fatal_error);
+
 ssize_t nvmet_ctrl_host_traddr(struct nvmet_ctrl *ctrl,
 		char *traddr, size_t traddr_len)
 {
 	if (!ctrl->ops->host_traddr)
 		return -EOPNOTSUPP;
+	/* They all take the address from the admin queue */
+	if (!ctrl->sqs[0])
+		return -ENOTCONN;
 	return ctrl->ops->host_traddr(ctrl, traddr, traddr_len);
 }
 
@@ -2005,9 +2054,14 @@ static int __init nvmet_init(void)
 	if (!nvmet_aen_wq)
 		goto out_free_nvmet_work_queue;
 
+	nvmet_pr_wq = alloc_workqueue("nvmet-pr-wq",
+				      WQ_MEM_RECLAIM | WQ_UNBOUND, 0);
+	if (!nvmet_pr_wq)
+		goto out_free_nvmet_aen_work_queue;
+
 	error = nvmet_init_debugfs();
 	if (error)
-		goto out_free_nvmet_aen_work_queue;
+		goto out_free_nvmet_pr_work_queue;
 
 	error = nvmet_init_discovery();
 	if (error)
@@ -2023,6 +2077,8 @@ out_exit_discovery:
 	nvmet_exit_discovery();
 out_exit_debugfs:
 	nvmet_exit_debugfs();
+out_free_nvmet_pr_work_queue:
+	destroy_workqueue(nvmet_pr_wq);
 out_free_nvmet_aen_work_queue:
 	destroy_workqueue(nvmet_aen_wq);
 out_free_nvmet_work_queue:
@@ -2042,6 +2098,7 @@ static void __exit nvmet_exit(void)
 	nvmet_exit_discovery();
 	nvmet_exit_debugfs();
 	ida_destroy(&cntlid_ida);
+	destroy_workqueue(nvmet_pr_wq);
 	destroy_workqueue(nvmet_aen_wq);
 	destroy_workqueue(nvmet_wq);
 	destroy_workqueue(buffered_io_wq);
