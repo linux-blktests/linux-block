@@ -95,6 +95,7 @@ enum nvme_tcp_queue_flags {
 	NVME_TCP_Q_LIVE		= 1,
 	NVME_TCP_Q_POLLING	= 2,
 	NVME_TCP_Q_IO_CPU_SET	= 3,
+	NVME_TCP_Q_TLS_CTRL	= 4,
 };
 
 enum nvme_tcp_recv_state {
@@ -1418,7 +1419,7 @@ out:
 	return ret;
 }
 
-static int nvme_tcp_try_recv(struct nvme_tcp_queue *queue)
+static int nvme_tcp_read_sock(struct nvme_tcp_queue *queue)
 {
 	struct socket *sock = queue->sock;
 	struct sock *sk = sock->sk;
@@ -1431,6 +1432,90 @@ static int nvme_tcp_try_recv(struct nvme_tcp_queue *queue)
 	queue->nr_cqe = 0;
 	consumed = sock->ops->read_sock(sk, &rd_desc, nvme_tcp_recv_skb);
 	release_sock(sk);
+	return consumed;
+}
+
+/*
+ * read_sock() leaves a TLS record that is no data where it is, in front of
+ * all that follows.  Take it out of the way.
+ */
+static int nvme_tcp_recv_tls_ctrl(struct nvme_tcp_queue *queue)
+{
+	struct nvme_ctrl *ctrl = &queue->ctrl->ctrl;
+	char cbuf[CMSG_LEN(sizeof(char))] = {};
+	struct msghdr msg = {
+		.msg_control = cbuf,
+		.msg_controllen = sizeof(cbuf),
+		.msg_flags = MSG_DONTWAIT,
+	};
+	u8 ctype, level, description, data[2] = {};
+	struct kvec iov = { .iov_base = data, .iov_len = sizeof(data) };
+	int len;
+
+	/*
+	 * io_work and a poller may both have met the record, and recvmsg()
+	 * would take data as well.  Only one of them goes on, and he looks
+	 * again: nobody else removes such a record from now on.
+	 */
+	if (test_and_set_bit_lock(NVME_TCP_Q_TLS_CTRL, &queue->flags))
+		return 0;
+	len = nvme_tcp_read_sock(queue);
+	if (len != -EINVAL || !queue->rd_enabled)
+		goto out;
+
+	len = kernel_recvmsg(queue->sock, &msg, &iov, 1, iov.iov_len,
+			     msg.msg_flags);
+	if (len < 0)
+		goto out;
+
+	ctype = tls_get_record_type(queue->sock->sk, (struct cmsghdr *)cbuf);
+	switch (ctype) {
+	case 0:
+	case TLS_RECORD_TYPE_DATA:
+		goto fail;
+	case TLS_RECORD_TYPE_ALERT:
+		iov_iter_revert(&msg.msg_iter, len);
+		tls_alert_recv(queue->sock->sk, &msg, &level, &description);
+		dev_warn_ratelimited(ctrl->device,
+				     "queue %d: TLS Alert level %u desc %u\n",
+				     nvme_tcp_queue_id(queue), level,
+				     description);
+		if (level == TLS_ALERT_LEVEL_FATAL)
+			goto fail;
+		break;
+	default:
+		dev_warn_ratelimited(ctrl->device,
+				     "queue %d: TLS record %u dropped\n",
+				     nvme_tcp_queue_id(queue), ctype);
+		break;
+	}
+
+	if (!(msg.msg_flags & MSG_EOR)) {
+		msg.msg_control = cbuf;
+		msg.msg_controllen = sizeof(cbuf);
+		iov_iter_discard(&msg.msg_iter, ITER_DEST,
+				 TLS_MAX_PAYLOAD_SIZE);
+		sock_recvmsg(queue->sock, &msg, MSG_DONTWAIT);
+	}
+	len = 1;
+out:
+	clear_bit_unlock(NVME_TCP_Q_TLS_CTRL, &queue->flags);
+	return len;
+
+fail:
+	queue->rd_enabled = false;
+	nvme_tcp_error_recovery(ctrl);
+	len = -ENOTCONN;
+	goto out;
+}
+
+static int nvme_tcp_try_recv(struct nvme_tcp_queue *queue)
+{
+	int consumed = nvme_tcp_read_sock(queue);
+
+	if (consumed == -EINVAL && nvme_tcp_queue_tls(queue) &&
+	    queue->rd_enabled)
+		consumed = nvme_tcp_recv_tls_ctrl(queue);
 	return consumed == -EAGAIN ? 0 : consumed;
 }
 
