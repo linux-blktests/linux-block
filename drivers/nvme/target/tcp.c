@@ -1174,7 +1174,7 @@ static inline bool nvmet_tcp_pdu_valid(u8 type)
 }
 
 static int nvmet_tcp_tls_record_ok(struct nvmet_tcp_queue *queue,
-		struct msghdr *msg, char *cbuf)
+		struct msghdr *msg, char *cbuf, int len)
 {
 	struct cmsghdr *cmsg = (struct cmsghdr *)cbuf;
 	u8 ctype, level, description;
@@ -1187,6 +1187,7 @@ static int nvmet_tcp_tls_record_ok(struct nvmet_tcp_queue *queue,
 	case TLS_RECORD_TYPE_DATA:
 		break;
 	case TLS_RECORD_TYPE_ALERT:
+		iov_iter_revert(&msg->msg_iter, len);
 		tls_alert_recv(queue->sock->sk, msg, &level, &description);
 		if (level == TLS_ALERT_LEVEL_FATAL) {
 			pr_err("queue %d: TLS Alert desc %u\n",
@@ -1200,6 +1201,7 @@ static int nvmet_tcp_tls_record_ok(struct nvmet_tcp_queue *queue,
 		break;
 	default:
 		/* discard this record type */
+		iov_iter_revert(&msg->msg_iter, len);
 		pr_err("queue %d: TLS record %d unhandled\n",
 		       queue->idx, ctype);
 		ret = -EAGAIN;
@@ -1228,7 +1230,7 @@ recv:
 	if (unlikely(len < 0))
 		return len;
 	if (queue->tls_pskid) {
-		ret = nvmet_tcp_tls_record_ok(queue, &msg, cbuf);
+		ret = nvmet_tcp_tls_record_ok(queue, &msg, cbuf, len);
 		if (ret < 0)
 			return ret;
 	}
@@ -1290,7 +1292,7 @@ static int nvmet_tcp_try_recv_data(struct nvmet_tcp_queue *queue)
 			return len;
 		if (queue->tls_pskid) {
 			ret = nvmet_tcp_tls_record_ok(cmd->queue,
-					&cmd->recv_msg, cmd->recv_cbuf);
+					&cmd->recv_msg, cmd->recv_cbuf, len);
 			if (ret < 0)
 				return ret;
 		}
@@ -1331,7 +1333,7 @@ static int nvmet_tcp_try_recv_ddgst(struct nvmet_tcp_queue *queue)
 	if (unlikely(len < 0))
 		return len;
 	if (queue->tls_pskid) {
-		ret = nvmet_tcp_tls_record_ok(queue, &msg, cbuf);
+		ret = nvmet_tcp_tls_record_ok(queue, &msg, cbuf, len);
 		if (ret < 0)
 			return ret;
 	}
@@ -1803,7 +1805,7 @@ static int nvmet_tcp_try_peek_pdu(struct nvmet_tcp_queue *queue)
 		return len;
 	}
 
-	ret = nvmet_tcp_tls_record_ok(queue, &msg, cbuf);
+	ret = nvmet_tcp_tls_record_ok(queue, &msg, cbuf, len);
 	if (ret < 0)
 		return ret;
 
