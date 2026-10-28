@@ -532,6 +532,7 @@ extern struct workqueue_struct *buffered_io_wq;
 extern struct workqueue_struct *zbd_wq;
 extern struct workqueue_struct *nvmet_wq;
 extern struct workqueue_struct *nvmet_aen_wq;
+extern struct workqueue_struct *nvmet_pr_wq;
 
 static inline void nvmet_set_result(struct nvmet_req *req, u32 result)
 {

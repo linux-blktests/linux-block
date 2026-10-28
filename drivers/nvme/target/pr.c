@@ -756,7 +756,11 @@ static void nvmet_execute_pr_acquire(struct nvmet_req *req)
 	if (!status && acquire_act == NVME_PR_ACQUIRE_ACT_PREEMPT_AND_ABORT) {
 		kfree(d);
 		INIT_WORK(&req->r.abort_work, nvmet_pr_do_abort);
-		queue_work(nvmet_wq, &req->r.abort_work);
+		/*
+		 * Not nvmet_wq: works on it can wait for pr_sem, which this
+		 * work releases.
+		 */
+		queue_work(nvmet_pr_wq, &req->r.abort_work);
 		return;
 	}
 

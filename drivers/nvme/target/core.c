@@ -29,6 +29,7 @@ struct workqueue_struct *nvmet_wq;
 EXPORT_SYMBOL_GPL(nvmet_wq);
 struct workqueue_struct *nvmet_aen_wq;
 EXPORT_SYMBOL_GPL(nvmet_aen_wq);
+struct workqueue_struct *nvmet_pr_wq;
 
 /*
  * This read/write semaphore is used to synchronize access to configuration
@@ -2034,9 +2035,14 @@ static int __init nvmet_init(void)
 	if (!nvmet_aen_wq)
 		goto out_free_nvmet_work_queue;
 
+	nvmet_pr_wq = alloc_workqueue("nvmet-pr-wq",
+				      WQ_MEM_RECLAIM | WQ_UNBOUND, 0);
+	if (!nvmet_pr_wq)
+		goto out_free_nvmet_aen_work_queue;
+
 	error = nvmet_init_debugfs();
 	if (error)
-		goto out_free_nvmet_aen_work_queue;
+		goto out_free_nvmet_pr_work_queue;
 
 	error = nvmet_init_discovery();
 	if (error)
@@ -2052,6 +2058,8 @@ out_exit_discovery:
 	nvmet_exit_discovery();
 out_exit_debugfs:
 	nvmet_exit_debugfs();
+out_free_nvmet_pr_work_queue:
+	destroy_workqueue(nvmet_pr_wq);
 out_free_nvmet_aen_work_queue:
 	destroy_workqueue(nvmet_aen_wq);
 out_free_nvmet_work_queue:
@@ -2071,6 +2079,7 @@ static void __exit nvmet_exit(void)
 	nvmet_exit_discovery();
 	nvmet_exit_debugfs();
 	ida_destroy(&cntlid_ida);
+	destroy_workqueue(nvmet_pr_wq);
 	destroy_workqueue(nvmet_aen_wq);
 	destroy_workqueue(nvmet_wq);
 	destroy_workqueue(buffered_io_wq);
