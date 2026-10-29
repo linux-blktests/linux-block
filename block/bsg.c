@@ -11,6 +11,7 @@
 #include <linux/percpu.h>
 #include <linux/idr.h>
 #include <linux/bsg.h>
+#include <linux/bsg-lib.h>
 #include <linux/slab.h>
 #include <linux/io_uring/cmd.h>
 
@@ -66,6 +67,14 @@ static int bsg_sg_io(struct bsg_device *bd, bool open_for_write,
 		return -EFAULT;
 	if (hdr.guard != 'Q')
 		return -EINVAL;
+
+	if (hdr.subprotocol != BSG_SUB_PROTOCOL_SCSI_TMF) {
+		if (hdr.request_len < SCSI_MIN_CDB_SIZE)
+			return -EINVAL;
+		if (!access_ok(uptr64(hdr.request), hdr.request_len))
+			return -EFAULT;
+	}
+
 	ret = bd->sg_io_fn(bd->queue, &hdr, open_for_write,
 			   bsg_timeout(bd, &hdr));
 	if (!ret && copy_to_user(uarg, &hdr, sizeof(hdr)))

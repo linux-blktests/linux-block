@@ -17,6 +17,8 @@ struct device;
 struct scatterlist;
 struct request_queue;
 
+#define uptr64(val) ((void __user *)(uintptr_t)(val))
+
 typedef int (bsg_job_fn) (struct bsg_job *);
 typedef enum blk_eh_timer_return (bsg_timeout_fn)(struct request *);
 
