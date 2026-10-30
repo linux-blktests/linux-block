@@ -19285,6 +19285,7 @@ F:	Documentation/admin-guide/blockdev/nbd.rst
 F:	drivers/block/nbd.c
 F:	include/trace/events/nbd.h
 F:	include/uapi/linux/nbd.h
+F:	tools/testing/selftests/nbd/
 
 NETWORK DROP MONITOR
 M:	Neil Horman <nhorman@tuxdriver.com>
