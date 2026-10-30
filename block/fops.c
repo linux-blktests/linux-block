@@ -731,6 +731,9 @@ static ssize_t blkdev_buffered_write(struct kiocb *iocb, struct iov_iter *from)
 	if (iocb->ki_flags & IOCB_NOWAIT)
 		return -EAGAIN;
 
+	if (unlikely(iov_iter_is_dmabuf_map(from)))
+		return -EOPNOTSUPP;
+
 	/*
 	 * Take i_rwsem to avoid racing with set_blocksize() changing
 	 * i_blkbits/folio order and truncating the page cache.
