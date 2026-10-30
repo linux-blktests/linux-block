@@ -99,6 +99,7 @@ struct deadline_data {
 	int writes_starved;
 	int front_merges;
 	int prio_aging_expire;
+	bool dispatch_direct;
 
 	spinlock_t lock;
 };
@@ -310,8 +311,11 @@ static struct request *dd_start_request(struct deadline_data *dd,
 	enum dd_prio prio = ioprio_class_to_prio[ioprio_class];
 
 	dd->per_prio[prio].latest_pos[data_dir] = blk_rq_pos(rq);
-	dd->per_prio[prio].stats.dispatched++;
-	rq->rq_flags |= RQF_STARTED;
+	/* Count each request once, including direct dispatch followed by requeue. */
+	if (!(rq->rq_flags & RQF_STARTED)) {
+		dd->per_prio[prio].stats.dispatched++;
+		rq->rq_flags |= RQF_STARTED;
+	}
 	return rq;
 }
 
@@ -550,6 +554,7 @@ static int dd_init_sched(struct request_queue *q, struct elevator_queue *eq)
 	dd->last_dir = DD_WRITE;
 	dd->fifo_batch = fifo_batch;
 	dd->prio_aging_expire = prio_aging_expire;
+	dd->dispatch_direct = true;
 	spin_lock_init(&dd->lock);
 
 	/* We dispatch from request queue wide instead of hw queue */
@@ -729,6 +734,29 @@ static bool dd_has_work(struct blk_mq_hw_ctx *hctx)
 }
 
 /*
+ * When blk-mq finds the hctx uncongested, let new requests skip the sort tree,
+ * FIFO and merge hash
+ */
+static bool dd_skip_request(struct request *rq)
+{
+	struct deadline_data *dd = rq->q->elevator->elevator_data;
+	const enum dd_data_dir data_dir = rq_data_dir(rq);
+	const enum dd_prio prio = ioprio_class_to_prio[dd_rq_ioclass(rq)];
+	struct dd_per_prio *per_prio = &dd->per_prio[prio];
+
+	if (!READ_ONCE(dd->dispatch_direct) || rq->elv.priv[0] ||
+	    READ_ONCE(rq->mq_hctx->dispatch_busy))
+		return false;
+
+	spin_lock(&dd->lock);
+	per_prio->stats.inserted++;
+	rq->elv.priv[0] = per_prio;
+	dd_start_request(dd, data_dir, rq);
+	spin_unlock(&dd->lock);
+	return true;
+}
+
+/*
  * sysfs parts below
  */
 #define SHOW_INT(__FUNC, __VAR)						\
@@ -745,6 +773,7 @@ SHOW_JIFFIES(deadline_prio_aging_expire_show, dd->prio_aging_expire);
 SHOW_INT(deadline_writes_starved_show, dd->writes_starved);
 SHOW_INT(deadline_front_merges_show, dd->front_merges);
 SHOW_INT(deadline_fifo_batch_show, dd->fifo_batch);
+SHOW_INT(deadline_dispatch_direct_show, READ_ONCE(dd->dispatch_direct));
 #undef SHOW_INT
 #undef SHOW_JIFFIES
 
@@ -778,6 +807,21 @@ STORE_INT(deadline_fifo_batch_store, &dd->fifo_batch, 0, INT_MAX);
 #undef STORE_INT
 #undef STORE_JIFFIES
 
+static ssize_t deadline_dispatch_direct_store(struct elevator_queue *e,
+					     const char *page, size_t count)
+{
+	struct deadline_data *dd = e->elevator_data;
+	bool enabled;
+	int ret;
+
+	ret = kstrtobool(page, &enabled);
+	if (ret)
+		return ret;
+
+	WRITE_ONCE(dd->dispatch_direct, enabled);
+	return count;
+}
+
 #define DD_ATTR(name) \
 	__ATTR(name, 0644, deadline_##name##_show, deadline_##name##_store)
 
@@ -788,6 +832,7 @@ static const struct elv_fs_entry deadline_attrs[] = {
 	DD_ATTR(front_merges),
 	DD_ATTR(fifo_batch),
 	DD_ATTR(prio_aging_expire),
+	DD_ATTR(dispatch_direct),
 	__ATTR_NULL
 };
 
@@ -989,6 +1034,7 @@ static struct elevator_type mq_deadline = {
 		.limit_depth		= dd_limit_depth,
 		.insert_requests	= dd_insert_requests,
 		.dispatch_request	= dd_dispatch_request,
+		.skip_request		= dd_skip_request,
 		.prepare_request	= dd_prepare_request,
 		.finish_request		= dd_finish_request,
 		.next_request		= elv_rb_latter_request,
