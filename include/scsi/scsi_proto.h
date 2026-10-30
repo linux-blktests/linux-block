@@ -187,6 +187,7 @@
  *	SCSI command lengths
  */
 
+#define SCSI_MIN_CDB_SIZE 6
 #define SCSI_MAX_VARLEN_CDB_SIZE 260
 
 /* defined in T10 SCSI Primary Commands-2 (SPC2) */
