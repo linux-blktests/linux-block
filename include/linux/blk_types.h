@@ -328,6 +328,12 @@ enum {
 	BIO_ZONE_WRITE_PLUGGING, /* bio handled through zone write plugging */
 	BIO_EMULATES_ZONE_APPEND, /* bio emulates a zone append operation */
 	BIO_COMPLETE_IN_TASK, /* complete bi_end_io() in task context */
+	/*
+	 * Marking the bio in a chained bio, except for the first bio header,
+	 * is mainly used to update the QoS statistics of the bio headers
+	 * after the first one.
+	 */
+	BIO_QOS_CHAIN_CHILD,
 	BIO_FLAG_LAST
 };
 
