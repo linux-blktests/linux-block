@@ -288,13 +288,14 @@ aoechr_init(void)
 {
 	int n, i;
 
+	init_completion(&emsgs_comp);
+	spin_lock_init(&emsgs_lock);
+
 	n = register_chrdev(AOE_MAJOR, "aoechr", &aoe_fops);
 	if (n < 0) {
 		printk(KERN_ERR "aoe: can't register char device\n");
 		return n;
 	}
-	init_completion(&emsgs_comp);
-	spin_lock_init(&emsgs_lock);
 	n = class_register(&aoe_class);
 	if (n) {
 		unregister_chrdev(AOE_MAJOR, "aoechr");
@@ -319,4 +320,3 @@ aoechr_exit(void)
 	class_unregister(&aoe_class);
 	unregister_chrdev(AOE_MAJOR, "aoechr");
 }
-
