@@ -41,7 +41,14 @@ void blk_set_stacking_limits(struct queue_limits *lim)
 	lim->physical_block_size = SECTOR_SIZE;
 	lim->io_min = SECTOR_SIZE;
 	lim->discard_granularity = SECTOR_SIZE;
-	lim->dma_alignment = SECTOR_SIZE - 1;
+	/*
+	 * No dma_alignment of its own: blk_stack_limits() keeps the strictest
+	 * of the devices stacked under it, and blk_validate_limits() gives the
+	 * sector-size default to a device left with none.  A driver that looks
+	 * at the data and needs it laid out by logical block says so in its
+	 * own limits, as dm-crypt, dm-integrity, dm-verity and dm-log-writes
+	 * do.
+	 */
 	lim->seg_boundary_mask = BLK_SEG_BOUNDARY_MASK;
 
 	/* Inherit limits from component devices */
