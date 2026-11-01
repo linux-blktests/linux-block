@@ -1244,6 +1244,18 @@ static const struct blk_mq_ops virtio_mq_ops = {
 static unsigned int virtblk_queue_depth;
 module_param_named(queue_depth, virtblk_queue_depth, uint, 0444);
 
+/* The size of the smallest virtqueue, which every request has to fit. */
+static unsigned int virtblk_min_vring_size(struct virtio_blk *vblk)
+{
+	unsigned int vring_size = UINT_MAX;
+	int i;
+
+	for (i = 0; i < vblk->num_vqs; i++)
+		vring_size = min(vring_size,
+				 virtqueue_get_vring_size(vblk->vqs[i].vq));
+	return vring_size;
+}
+
 static int virtblk_read_limits(struct virtio_blk *vblk,
 		struct queue_limits *lim)
 {
@@ -1473,6 +1485,21 @@ static int virtblk_probe(struct virtio_device *vdev)
 	err = init_vq(vblk);
 	if (err)
 		goto out_free_vblk;
+
+	/*
+	 * Without indirect descriptors the smallest request, a header, one
+	 * segment and the status, takes three descriptors. Check before the
+	 * queue depth is derived from the ring, which would come out as 0
+	 * for a ring of one and fail without saying why.
+	 */
+	if (!virtio_has_feature(vdev, VIRTIO_RING_F_INDIRECT_DESC) &&
+	    virtblk_min_vring_size(vblk) < 3) {
+		dev_err(&vdev->dev,
+			"virtqueue size %u is too small for a request\n",
+			virtblk_min_vring_size(vblk));
+		err = -EINVAL;
+		goto out_free_vq;
+	}
 
 	/* Default queue sizing is to fill the ring. */
 	if (!virtblk_queue_depth) {
