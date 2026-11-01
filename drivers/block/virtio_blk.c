@@ -1280,6 +1280,16 @@ static int virtblk_read_limits(struct virtio_blk *vblk,
 	/* Prevent integer overflows and honor max vq size */
 	sg_elems = min_t(u32, sg_elems, VIRTIO_BLK_MAX_SG_ELEMS - 2);
 
+	/*
+	 * Without indirect descriptors a request takes one ring descriptor
+	 * per segment, plus one for the header and one for the status, so
+	 * it has to fit in the smallest of the virtqueues. A larger request
+	 * would never fit and would wait for ring space forever.
+	 * virtblk_probe() made sure every virtqueue holds at least three.
+	 */
+	if (!virtio_has_feature(vdev, VIRTIO_RING_F_INDIRECT_DESC))
+		sg_elems = min(sg_elems, virtblk_min_vring_size(vblk) - 2);
+
 	/* We can handle whatever the host told us to handle. */
 	lim->max_segments = sg_elems;
 
