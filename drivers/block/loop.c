@@ -534,6 +534,9 @@ static int loop_check_backing_file(struct file *file)
 	if ((file->f_mode & FMODE_WRITE) && !file->f_op->write_iter)
 		return -EINVAL;
 
+	if (file_inode(file)->i_sb->s_magic == SYSFS_MAGIC)
+		return -EINVAL;
+
 	return 0;
 }
 
