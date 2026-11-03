@@ -1697,6 +1697,8 @@ struct blk_holder_ops {
 
 struct file *bdev_file_open_by_dev(dev_t dev, blk_mode_t mode, void *holder,
 		const struct blk_holder_ops *hops);
+struct file *bdev_file_open_by_dev_autoload(dev_t dev, blk_mode_t mode,
+		void *holder, const struct blk_holder_ops *hops, bool autoload);
 struct file *bdev_file_open_by_path(const char *path, blk_mode_t mode,
 		void *holder, const struct blk_holder_ops *hops);
 int bd_prepare_to_claim(struct block_device *bdev, void *holder,
