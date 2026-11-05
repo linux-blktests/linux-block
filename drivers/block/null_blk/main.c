@@ -1977,6 +1977,7 @@ static int null_add_dev(struct nullb_device *dev)
 	if (rv)
 		return rv;
 	clear_bit(NULLB_DEV_FL_CACHE, &dev->flags);
+	clear_bit(NULLB_DEV_FL_THROTTLED, &dev->flags);
 
 	nullb = kzalloc_node(sizeof(*nullb), GFP_KERNEL, dev->home_node);
 	if (!nullb) {
