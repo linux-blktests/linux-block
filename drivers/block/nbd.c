@@ -2542,6 +2542,7 @@ static struct genl_family nbd_genl_family __ro_after_init = {
 	.hdrsize	= 0,
 	.name		= NBD_GENL_FAMILY_NAME,
 	.version	= NBD_GENL_VERSION,
+	.parallel_ops	= 1,
 	.module		= THIS_MODULE,
 	.small_ops	= nbd_connect_genl_ops,
 	.n_small_ops	= ARRAY_SIZE(nbd_connect_genl_ops),
