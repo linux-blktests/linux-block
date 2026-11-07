@@ -1510,6 +1510,31 @@ static void nbd_config_put(struct nbd_device *nbd)
 	}
 }
 
+/*
+ * nbd_start_device() calls blk_mq_update_nr_hw_queues() with config_lock
+ * held.  del_gendisk() takes the tag set's update_nr_hwq_lock and then
+ * disk->open_mutex, while ->open()/->release() run with disk->open_mutex
+ * held and take config_lock (nbd_open(), and nbd_release() through
+ * nbd_disconnect_and_put() or nbd_config_put()), so lockdep reports the
+ * class-level cycle
+ *
+ *   config_lock -> update_nr_hwq_lock -> open_mutex -> config_lock
+ *
+ * as a possible deadlock.  It cannot happen: nbd_start_device() is called
+ * with an nbd reference held, and the open/release side takes config_lock
+ * while the open file still holds one, so nbd->refs cannot reach zero and
+ * nbd_dev_remove_work() -> del_gendisk() cannot run concurrently.  In
+ * addition, nbd_config_put() drops config_lock before nbd_put(), so the
+ * teardown path never calls del_gendisk() with config_lock held.
+ *
+ * Only the acquisitions that can reach nbd_start_device() are annotated:
+ * nbd_genl_connect(), and nbd_ioctl() for NBD_DO_IT (which ends up in
+ * nbd_start_device_ioctl()).  No other ioctl reaches it, so they keep the
+ * default subclass and stay fully checked.  This only changes the lockdep
+ * annotation, not the locking itself.
+ */
+#define NBD_CONFIG_LOCK_SETUP	1
+
 static int nbd_start_device(struct nbd_device *nbd)
 {
 	struct nbd_config *config = nbd->config;
@@ -1526,17 +1551,7 @@ static int nbd_start_device(struct nbd_device *nbd)
 		return -EINVAL;
 	}
 
-retry:
-	mutex_unlock(&nbd->config_lock);
-	blk_mq_update_nr_hw_queues(&nbd->tag_set, num_connections);
-	mutex_lock(&nbd->config_lock);
-
-	/* if another code path updated nr_hw_queues, retry until succeed */
-	if (num_connections != config->num_connections) {
-		num_connections = config->num_connections;
-		goto retry;
-	}
-
+	blk_mq_update_nr_hw_queues(&nbd->tag_set, config->num_connections);
 	nbd->pid = task_pid_nr(current);
 
 	nbd_parse_flags(nbd);
@@ -1695,7 +1710,10 @@ static int nbd_ioctl(struct block_device *bdev, blk_mode_t mode,
 	if (_IOC_TYPE(cmd) != 0xab)
 		return -EINVAL;
 
-	mutex_lock(&nbd->config_lock);
+	if (cmd == NBD_DO_IT)
+		mutex_lock_nested(&nbd->config_lock, NBD_CONFIG_LOCK_SETUP);
+	else
+		mutex_lock(&nbd->config_lock);
 
 	/* Don't allow ioctl operations on a nbd device that was created with
 	 * netlink, unless it's DISCONNECT or CLEAR_SOCK, which are fine.
@@ -2233,7 +2251,7 @@ again:
 		}
 	}
 
-	mutex_lock(&nbd->config_lock);
+	mutex_lock_nested(&nbd->config_lock, NBD_CONFIG_LOCK_SETUP);
 	if (refcount_read(&nbd->config_refs)) {
 		mutex_unlock(&nbd->config_lock);
 		nbd_put(nbd);
