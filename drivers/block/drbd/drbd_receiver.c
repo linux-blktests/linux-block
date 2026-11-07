@@ -1810,8 +1810,9 @@ static int recv_dless_read(struct drbd_peer_device *peer_device, struct drbd_req
 		data_size -= digest_size;
 	}
 
-	if (data_size < 0) {
-		drbd_err(peer_device, "Invalid data reply size\n");
+	if (data_size < 0 || data_size != req->i.size) {
+		drbd_err(peer_device, "Invalid data reply size %d, expected %u\n",
+			 data_size, req->i.size);
 		return -EIO;
 	}
 
@@ -2628,6 +2629,7 @@ static int receive_DataRequest(struct drbd_connection *connection, struct packet
 	sector_t capacity;
 	struct drbd_peer_request *peer_req;
 	struct digest_info *di = NULL;
+	struct crypto_shash *tfm;
 	int size, verb;
 	struct p_block_req *p =	pi->data;
 
@@ -2712,6 +2714,14 @@ static int receive_DataRequest(struct drbd_connection *connection, struct packet
 
 	case P_OV_REPLY:
 	case P_CSUM_RS_REQUEST:
+		tfm = pi->cmd == P_OV_REPLY ? connection->verify_tfm :
+					      connection->csums_tfm;
+		if (!tfm || pi->size != crypto_shash_digestsize(tfm)) {
+			drbd_err(device, "%s: unexpected digest size %u\n",
+				 cmdname(pi->cmd), pi->size);
+			goto out_free_e;
+		}
+
 		di = kmalloc(sizeof(*di) + pi->size, GFP_NOIO);
 		if (!di)
 			goto out_free_e;
