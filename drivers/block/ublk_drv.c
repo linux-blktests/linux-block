@@ -11,6 +11,7 @@
  */
 #include <linux/module.h>
 #include <linux/moduleparam.h>
+#include <linux/pid.h>
 #include <linux/sched.h>
 #include <linux/fs.h>
 #include <linux/pagemap.h>
@@ -345,6 +346,7 @@ struct ublk_device {
 	 */
 	bool canceling;
 	pid_t 	ublksrv_tgid;
+	struct pid	*ublksrv_pid;
 	struct delayed_work	exit_work;
 	struct work_struct	partition_scan_work;
 
@@ -2130,18 +2132,16 @@ static void ublk_queue_cmd_list(struct ublk_io *io, struct rq_list *l)
 static enum blk_eh_timer_return ublk_timeout(struct request *rq)
 {
 	struct ublk_queue *ubq = rq->mq_hctx->driver_data;
-	pid_t tgid = ubq->dev->ublksrv_tgid;
+	struct pid *pid = ubq->dev->ublksrv_pid;
 	struct task_struct *p;
-	struct pid *pid;
 
 	if (!(ubq->flags & UBLK_F_UNPRIVILEGED_DEV))
 		return BLK_EH_RESET_TIMER;
 
-	if (unlikely(!tgid))
+	if (unlikely(!pid))
 		return BLK_EH_RESET_TIMER;
 
 	rcu_read_lock();
-	pid = find_vpid(tgid);
 	p = pid_task(pid, PIDTYPE_PID);
 	if (p)
 		send_sig(SIGKILL, p, 0);
@@ -2410,6 +2410,7 @@ static int ublk_ch_open(struct inode *inode, struct file *filp)
 		return -EBUSY;
 	filp->private_data = ub;
 	ub->ublksrv_tgid = current->tgid;
+	ub->ublksrv_pid = get_pid(task_tgid(current));
 	mutex_lock(&ub->cancel_mutex);
 	ub->ch_file = filp;
 	mutex_unlock(&ub->cancel_mutex);
@@ -2633,6 +2634,7 @@ reset:
 	ublk_reset_ch_dev(ub);
 	mutex_unlock(&ub->mutex);
 	ublk_put_disk(disk);
+	put_pid(xchg(&ub->ublksrv_pid, NULL));
 	clear_bit(UB_STATE_OPEN, &ub->state);
 
 	/* put the reference grabbed in ublk_ch_release() */
@@ -4530,11 +4532,13 @@ static struct ublk_device *ublk_get_device_from_id(int idx)
 
 static bool ublk_validate_user_pid(struct ublk_device *ub, pid_t ublksrv_pid)
 {
+	bool valid;
+
 	rcu_read_lock();
-	ublksrv_pid = pid_nr(find_vpid(ublksrv_pid));
+	valid = find_vpid(ublksrv_pid) == ub->ublksrv_pid;
 	rcu_read_unlock();
 
-	return ub->ublksrv_tgid == ublksrv_pid;
+	return valid;
 }
 
 static bool ublk_dev_ready_or_stopping(const struct ublk_device *ub)
