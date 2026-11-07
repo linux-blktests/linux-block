@@ -275,6 +275,7 @@ static void nbd_dev_remove(struct nbd_device *nbd)
 	 */
 	mutex_lock(&nbd_index_mutex);
 	idr_remove(&nbd_index_idr, nbd->index);
+	nbd_total_devices--;
 	mutex_unlock(&nbd_index_mutex);
 	destroy_workqueue(nbd->recv_workq);
 	put_disk(disk);
