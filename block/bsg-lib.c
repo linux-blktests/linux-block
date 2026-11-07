@@ -16,8 +16,6 @@
 #include <scsi/scsi_cmnd.h>
 #include <scsi/sg.h>
 
-#define uptr64(val) ((void __user *)(uintptr_t)(val))
-
 struct bsg_set {
 	struct blk_mq_tag_set	tag_set;
 	struct bsg_device	*bd;
