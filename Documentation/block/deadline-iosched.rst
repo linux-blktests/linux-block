@@ -69,4 +69,18 @@ that comes at basically 0 cost we leave that on. We simply disable the
 rbtree front sector lookup when the io scheduler merge function is called.
 
 
+dispatch_direct (bool)
+----------------------
+
+Enabled by default. Allows new requests to bypass the scheduler's sort tree,
+FIFO and merge hash when the hardware context is not congested, stopped or
+quiesced. On fast devices such as NVMe SSDs with spare capacity, sorting and
+merging may offer little benefit while adding CPU overhead and limiting
+bandwidth. Direct dispatch can reduce this overhead and submission latency.
+
+Direct dispatch reduces opportunities for merging and sorting, and may bypass
+queued requests, including higher priority or expired requests. Set
+dispatch_direct to 0 to restore normal scheduler insertion.
+
+
 Nov 11 2002, Jens Axboe <jens.axboe@oracle.com>
