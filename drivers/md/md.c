@@ -3858,9 +3858,13 @@ static struct md_rdev *md_import_device(dev_t newdev, int super_format, int supe
 	if (err)
 		goto out_clear_rdev;
 
-	rdev->bdev_file = bdev_file_open_by_dev(newdev,
+	/*
+	 * md_ioctl() holds reconfig_mutex; legacy autoload in bdev open takes
+	 * major_names_lock via blk_probe_dev() and can deadlock with md_probe().
+	 */
+	rdev->bdev_file = bdev_file_open_by_dev_autoload(newdev,
 			BLK_OPEN_READ | BLK_OPEN_WRITE,
-			super_format == -2 ? &claim_rdev : rdev, NULL);
+			super_format == -2 ? &claim_rdev : rdev, NULL, false);
 	if (IS_ERR(rdev->bdev_file)) {
 		pr_warn("md: could not open device unknown-block(%u,%u).\n",
 			MAJOR(newdev), MINOR(newdev));
