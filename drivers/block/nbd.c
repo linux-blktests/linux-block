@@ -2029,10 +2029,15 @@ static struct nbd_device *nbd_dev_add(int index, unsigned int refs,
 		goto out_free_work;
 
 	/*
-	 * Now publish the device.
+	 * Now publish the device.  nbd->refs and nbd_total_devices are
+	 * updated together under nbd_index_mutex, so a concurrent idr
+	 * lookup either sees a fully initialised device or one that it has
+	 * to skip because its refcount is still zero.
 	 */
+	mutex_lock(&nbd_index_mutex);
 	refcount_set(&nbd->refs, refs);
 	nbd_total_devices++;
+	mutex_unlock(&nbd_index_mutex);
 	return nbd;
 
 out_free_work:
@@ -2536,6 +2541,16 @@ static int populate_nbd_status(struct nbd_device *nbd, struct sk_buff *reply)
 	struct nlattr *dev_opt;
 	u8 connected = 0;
 	int ret;
+
+	/*
+	 * nbd_dev_add() inserts the device into the idr before it is fully
+	 * initialised and only publishes it (sets nbd->refs) after
+	 * add_disk(); skip a device that is not published yet or is already
+	 * going away, so that the walk never reports a device that
+	 * nbd_total_devices does not account for.
+	 */
+	if (!refcount_read(&nbd->refs))
+		return 0;
 
 	/* This is a little racey, but for status it's ok.  The
 	 * reason we don't take a ref here is because we can't
