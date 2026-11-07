@@ -2401,22 +2401,6 @@ static int nbd_genl_reconfigure(struct sk_buff *skb, struct genl_info *info)
 		pr_err("couldn't find a device at index %d\n", index);
 		return -EINVAL;
 	}
-	if (nbd->backend) {
-		if (info->attrs[NBD_ATTR_BACKEND_IDENTIFIER]) {
-			if (nla_strcmp(info->attrs[NBD_ATTR_BACKEND_IDENTIFIER],
-				       nbd->backend)) {
-				mutex_unlock(&nbd_index_mutex);
-				dev_err(nbd_to_dev(nbd),
-					"backend image doesn't match with %s\n",
-					nbd->backend);
-				return -EINVAL;
-			}
-		} else {
-			mutex_unlock(&nbd_index_mutex);
-			dev_err(nbd_to_dev(nbd), "must specify backend\n");
-			return -EINVAL;
-		}
-	}
 	if (!refcount_inc_not_zero(&nbd->refs)) {
 		mutex_unlock(&nbd_index_mutex);
 		pr_err("device at index %d is going down\n", index);
@@ -2439,6 +2423,22 @@ static int nbd_genl_reconfigure(struct sk_buff *skb, struct genl_info *info)
 			"not configured, cannot reconfigure\n");
 		ret = -EINVAL;
 		goto out;
+	}
+
+	if (nbd->backend) {
+		if (!info->attrs[NBD_ATTR_BACKEND_IDENTIFIER]) {
+			dev_err(nbd_to_dev(nbd), "must specify backend\n");
+			ret = -EINVAL;
+			goto out;
+		}
+		if (nla_strcmp(info->attrs[NBD_ATTR_BACKEND_IDENTIFIER],
+			       nbd->backend)) {
+			dev_err(nbd_to_dev(nbd),
+				"backend image doesn't match with %s\n",
+				nbd->backend);
+			ret = -EINVAL;
+			goto out;
+		}
 	}
 
 	ret = nbd_genl_size_set(info, nbd);
