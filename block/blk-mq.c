@@ -208,11 +208,10 @@ void blk_mq_freeze_queue_nomemsave(struct request_queue *q)
 }
 EXPORT_SYMBOL_GPL(blk_mq_freeze_queue_nomemsave);
 
-bool __blk_mq_unfreeze_queue(struct request_queue *q, bool force_atomic)
+/* caller has to hold q->mq_freeze_lock */
+static bool __blk_mq_unfreeze_queue_locked(struct request_queue *q,
+					   bool force_atomic)
 {
-	bool unfreeze;
-
-	mutex_lock(&q->mq_freeze_lock);
 	if (force_atomic)
 		q->q_usage_counter.data->force_atomic = true;
 	q->mq_freeze_depth--;
@@ -221,7 +220,15 @@ bool __blk_mq_unfreeze_queue(struct request_queue *q, bool force_atomic)
 		percpu_ref_resurrect(&q->q_usage_counter);
 		wake_up_all(&q->mq_freeze_wq);
 	}
-	unfreeze = blk_unfreeze_check_owner(q);
+	return blk_unfreeze_check_owner(q);
+}
+
+bool __blk_mq_unfreeze_queue(struct request_queue *q, bool force_atomic)
+{
+	bool unfreeze;
+
+	mutex_lock(&q->mq_freeze_lock);
+	unfreeze = __blk_mq_unfreeze_queue_locked(q, force_atomic);
 	mutex_unlock(&q->mq_freeze_lock);
 
 	return unfreeze;
@@ -229,8 +236,19 @@ bool __blk_mq_unfreeze_queue(struct request_queue *q, bool force_atomic)
 
 void blk_mq_unfreeze_queue_nomemrestore(struct request_queue *q)
 {
-	if (__blk_mq_unfreeze_queue(q, false))
+	mutex_lock(&q->mq_freeze_lock);
+	/*
+	 * Release the lockdep freeze locks while still holding
+	 * mq_freeze_lock.  blk_freeze_set_owner() re-samples
+	 * mq_freeze_disk_dead/mq_freeze_queue_dying once the freeze depth
+	 * reaches zero, and reading the flags after dropping the lock races
+	 * with that re-sampling: if the disk died in between, the flags flip
+	 * and the release is skipped even though the matching acquire
+	 * grabbed the locks, leaking them.
+	 */
+	if (__blk_mq_unfreeze_queue_locked(q, false))
 		blk_unfreeze_release_lock(q);
+	mutex_unlock(&q->mq_freeze_lock);
 }
 EXPORT_SYMBOL_GPL(blk_mq_unfreeze_queue_nomemrestore);
 
