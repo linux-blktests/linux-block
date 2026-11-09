@@ -7,6 +7,7 @@
 #include <linux/jiffies.h>
 #include <linux/list.h>
 #include <linux/llist.h>
+#include <linux/mem_encrypt.h>
 #include <linux/nodemask.h>
 #include <linux/spinlock.h>
 #include <linux/topology.h>
@@ -62,7 +63,7 @@ enum {
 
 /**
  * struct pisa_meta - Metadata for a single PISA page in @pisa_meta_array
- * @flags:	PISA_ACTIVE / PISA_QUARANTINED
+ * @flags:	PISA_ACTIVE / PISA_QUARANTINED / PISA_DECRYPTED
  * @prot:	Owning allocator's IOMMU_READ/WRITE protection bits
  * @nr_clean:	Zeroed available blocks in @clean_bitmap
  * @nr_dirty:	Dirty available blocks in @dirty_bitmap
@@ -100,6 +101,14 @@ struct pisa_meta {
 
 static_assert(offsetof(struct pisa_meta, flags) == 0);
 static_assert(sizeof(struct pisa_meta) == PISA_META_SIZE);
+
+/* Physical address for IOMMU PTE of @meta at @phys (shared alias if decrypted). */
+static inline phys_addr_t pisa_pte_phys(const struct pisa_meta *meta, phys_addr_t phys)
+{
+	if (meta->flags & PISA_DECRYPTED)
+		return dma_addr_unencrypted(phys);
+	return phys;
+}
 
 static inline unsigned int pisa_meta_avail(const struct pisa_meta *meta)
 {
@@ -227,6 +236,9 @@ static inline void pisa_alloc_backoff(int nid, bool can_block)
 	if (!can_block)
 		WRITE_ONCE(pisa_nodes[nid].next_alloc, jiffies + DIV_ROUND_UP(HZ, 100));
 }
+bool pisa_want_decrypt(void);
+int pisa_page_prepare(struct page *page, struct pisa_meta *meta);
+int pisa_page_unprepare(struct pisa_meta *meta);
 
 /* pisa-alloc.c, also used by the per-node code in pisa-node.c */
 struct pisa_alloc *pisa_create(int nid, unsigned int order, enum dma_data_direction dir);
@@ -256,7 +268,7 @@ unsigned long pisa_shrink_list(spinlock_t *lock, struct list_head *list,
 extern unsigned int pisa_reservoir_max;
 void pisa_node_init(void);
 void pisa_schedule_reservoir(void);
-struct pisa_meta *pisa_reservoir_pop(int nid, gfp_t gfp, bool *clean);
+struct pisa_meta *pisa_reservoir_pop(int nid, gfp_t gfp, bool decrypt, bool *clean);
 unsigned long pisa_reservoir_count(void);
 unsigned long pisa_reservoir_shrink(struct list_head *release_list, unsigned long nr_to_scan);
 

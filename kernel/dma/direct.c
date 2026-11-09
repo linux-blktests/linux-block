@@ -707,8 +707,9 @@ dma_addr_t dma_direct_map_phys(struct device *dev, phys_addr_t phys,
 	if (is_swiotlb_force_bounce(dev)) {
 		if (attrs & (DMA_ATTR_MMIO | DMA_ATTR_REQUIRE_COHERENT))
 			return DMA_MAPPING_ERROR;
-
-		return swiotlb_map(dev, phys, size, dir, attrs);
+		if (!is_pisa_direct(phys, size))
+			return swiotlb_map(dev, phys, size, dir, attrs);
+		attrs |= DMA_ATTR_CC_SHARED;
 	}
 
 	if (attrs & DMA_ATTR_CC_SHARED)

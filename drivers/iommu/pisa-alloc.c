@@ -9,6 +9,7 @@
 #include <linux/bitmap.h>
 #include <linux/bitops.h>
 #include <linux/cache.h>
+#include <linux/cc_platform.h>
 #include <linux/cpuhotplug.h>
 #include <linux/device.h>
 #include <linux/dma-direct.h>
@@ -29,6 +30,7 @@
 #include <linux/pgalloc_tag.h>
 #include <linux/rcupdate.h>
 #include <linux/sched/mm.h>
+#include <linux/set_memory.h>
 #include <linux/shrinker.h>
 #include <linux/skbuff.h>
 #include <linux/slab.h>
@@ -48,6 +50,10 @@ static LLIST_HEAD(pisa_free_list);
 
 /* Dedicated WQ_MEM_RECLAIM workqueue, can run without allocations. */
 static struct workqueue_struct *pisa_wq __ro_after_init;
+
+/* Mark active PISA pages decrypted for DMA (auto-enabled on CoCo guests). */
+static bool pisa_decrypt __read_mostly;
+module_param_named(decrypt, pisa_decrypt, bool, 0444);
 
 /* Global count and ceiling on PISA pages across all allocators and reservoirs (0 = 1/8 RAM). */
 atomic_long_t pisa_nr_pages __cacheline_aligned_in_smp;
@@ -80,6 +86,51 @@ struct pisa_node pisa_nodes[MAX_NUMNODES] = {
 
 static void pisa_schedule_reclaim(void);
 
+/* Return true if a new PISA page should be decrypted. */
+bool pisa_want_decrypt(void)
+{
+	if (!pisa_decrypt)
+		return false;
+
+	/* Explicit page decryption is for CoCo guests, not bare-metal SME hosts. */
+	return !WARN_ON_ONCE(cc_platform_has(CC_ATTR_HOST_MEM_ENCRYPT));
+}
+
+/* Decrypt and zero a new PISA page. Must be called from sleepable context. */
+int pisa_page_prepare(struct page *page, struct pisa_meta *meta)
+{
+	void *vaddr = page_address(page);
+	int ret;
+
+	ret = set_memory_decrypted((unsigned long)vaddr, 1 << PISA_ORDER);
+	if (ret) {
+		/* Leak partially shared page rather than returning it to the buddy allocator. */
+		pr_warn_ratelimited("pisa: leaking PISA page that could not be decrypted\n");
+		return ret;
+	}
+	/* Initialize cleartext cachelines after flipping encryption state. */
+	memset(vaddr, 0, PISA_SIZE);
+	meta->flags |= PISA_DECRYPTED;
+	return 0;
+}
+
+/* Undo pisa_page_prepare(). */
+int pisa_page_unprepare(struct pisa_meta *meta)
+{
+	struct page *page;
+
+	if (!(meta->flags & PISA_DECRYPTED))
+		return 0;
+	page = pfn_to_page(pisa_meta_to_pfn(meta));
+	if (set_memory_encrypted((unsigned long)page_address(page), 1 << PISA_ORDER)) {
+		pr_warn_ratelimited("pisa: leaking PISA page that could not be re-encrypted\n");
+		return -EIO;
+	}
+	WRITE_ONCE(meta->flags, meta->flags & ~PISA_DECRYPTED);
+	return 0;
+}
+
+
 /*
  * Idle PISA page release proceeds in three stages:
  * 1. Detach onto lockless pisa_free_list and schedule pisa_reclaim_work.
@@ -103,12 +154,13 @@ static void pisa_release_page_rcu(struct rcu_head *head)
 	spin_unlock_irqrestore(&meta->pa->lock, flags);
 	WRITE_ONCE(meta->pa, NULL);
 
-	/* Possibly still mapped by a device: leak it, still charged. */
-	if (meta->flags & PISA_QUARANTINED)
-		return;
-
 	/* The page has been unmapped from every domain by pisa_release_page() */
-	pisa_slot_free(slot);
+	if (!(meta->flags & PISA_QUARANTINED))
+		pisa_slot_free(slot);
+
+	/* Still shared with the host, or possibly still mapped by a device. */
+	if (meta->flags & (PISA_DECRYPTED | PISA_QUARANTINED))
+		return;
 	atomic_long_dec(&pisa_nr_pages);
 	for (i = 0; i < PISA_BLOCKS(order); i++) {
 		block = page + (i << order);
@@ -120,7 +172,12 @@ static void pisa_release_page_rcu(struct rcu_head *head)
 /* Unmap a retired PISA page, clear PISA_ACTIVE, and queue RCU release. */
 void pisa_release_page(struct pisa_meta *meta)
 {
+	u8 flags;
+
 	if (!meta->pa) {
+		/* Unbound (reservoir) page: leaked if re-encryption fails. */
+		if (pisa_page_unprepare(meta))
+			return;
 		__free_pages(pfn_to_page(pisa_meta_to_pfn(meta)), PISA_ORDER);
 		atomic_long_dec(&pisa_nr_pages);
 		return;
@@ -128,9 +185,15 @@ void pisa_release_page(struct pisa_meta *meta)
 
 	/* Quarantined on unmap failure and leaked in pisa_release_page_rcu(). */
 	pisa_unmap_all(meta);
+	flags = meta->flags & ~PISA_ACTIVE;
 
 	/* Clear PISA_ACTIVE before the RCU grace period so new readers stop entering. */
-	WRITE_ONCE(meta->flags, meta->flags & ~PISA_ACTIVE);
+	WRITE_ONCE(meta->flags, flags);
+	if ((flags & (PISA_DECRYPTED | PISA_QUARANTINED)) == PISA_DECRYPTED) {
+		synchronize_rcu();
+		pisa_page_unprepare(meta);
+	}
+
 	call_rcu(&meta->rcu, pisa_release_page_rcu);
 }
 
@@ -741,15 +804,16 @@ static struct pisa_meta *pisa_alloc_split_page(unsigned int order, gfp_t gfp, in
 	unsigned int bpp = PISA_BLOCKS(order);
 	struct pisa_meta *meta;
 	struct page *page;
+	int ret;
 
 	/* __GFP_DMA/__GFP_DMA32 were already declined by pisa_alloc_bulk(). */
-	meta = pisa_reservoir_pop(nid, gfp & ~__GFP_ZERO, &clean);
+	meta = pisa_reservoir_pop(nid, gfp & ~__GFP_ZERO, pisa_want_decrypt(), &clean);
 	if (IS_ERR(meta))
 		return meta;
 
 	if (unlikely(pisa_slot_alloc(meta))) {
-		pisa_release_page(meta);
-		return ERR_PTR(-ENOSPC);
+		ret = -ENOSPC;
+		goto err_free;
 	}
 
 	page = pfn_to_page(pisa_meta_to_pfn(meta));
@@ -757,9 +821,9 @@ static struct pisa_meta *pisa_alloc_split_page(unsigned int order, gfp_t gfp, in
 	/* Fails with -EBUSY if a concurrent PFN walker holds a speculative ref. */
 	if (split_page_compound(page, PISA_ORDER, order)) {
 		pisa_slot_free(meta->slot);
-		pisa_release_page(meta);
 		pisa_alloc_backoff(nid, can_block);
-		return ERR_PTR(-EBUSY);
+		ret = -EBUSY;
+		goto err_free;
 	}
 
 	INIT_LIST_HEAD(&meta->list);
@@ -773,6 +837,16 @@ static struct pisa_meta *pisa_alloc_split_page(unsigned int order, gfp_t gfp, in
 	}
 
 	return meta;
+
+err_free:
+	if (!can_block && (meta->flags & PISA_DECRYPTED)) {
+		/* set_memory_encrypted() may sleep; defer to reclaim worker. */
+		llist_add(&meta->llnode, &pisa_free_list);
+		pisa_schedule_reclaim();
+	} else {
+		pisa_release_page(meta);
+	}
+	return ERR_PTR(ret);
 }
 
 /* Reset fields normally cleared by prep_new_page()/post_alloc_hook(). */
@@ -1135,7 +1209,7 @@ void *pisa_alloc_coherent(struct page **pagep, struct device *dev,
 		if (!win || pisa_window_declined(win) || !(domain->pgsize_bitmap & PISA_SIZE))
 			return NULL;
 	} else if (is_swiotlb_for_alloc(dev) ||
-		   force_dma_unencrypted(dev) ||
+		   (force_dma_unencrypted(dev) && !pisa_want_decrypt()) ||
 		   !dma_coherent_ok(dev, PFN_PHYS(max_pfn) - 1, 1)) {
 		return NULL;
 	}
@@ -1294,10 +1368,15 @@ VISIBLE_IF_KUNIT unsigned long pisa_shrink_scan(struct shrinker *shrink, struct 
 		read_unlock(&pisa_allocs_lock);
 	}
 
-	/* Retiring must not run under @pa->lock. */
+	/* Unmap outside locks; defer decrypted pages to workqueue outside fs_reclaim. */
 	list_for_each_entry_safe(meta, tmp, &release_list, list) {
 		list_del_init(&meta->list);
-		pisa_release_page(meta);
+		if (meta->flags & PISA_DECRYPTED) {
+			llist_add(&meta->llnode, &pisa_free_list);
+			pisa_schedule_reclaim();
+		} else {
+			pisa_release_page(meta);
+		}
 	}
 
 	/* Charge do_shrink_slab() for the full PISA pages reclaimed. */
@@ -1341,6 +1420,16 @@ static int __init pisa_init(void)
 		pisa_max_pages = max(totalram_pages() >> (PISA_ORDER + 3), 16UL);
 
 	pisa_slots_init();
+
+	/*
+	 * CoCo guests require decrypted pages and cannot decrypt in atomic
+	 * context, so ensure the per-node reservoir is enabled to serve them.
+	 */
+	if (cc_platform_has(CC_ATTR_GUEST_MEM_ENCRYPT)) {
+		pisa_decrypt = true;
+		if (!pisa_reservoir_max)
+			pisa_reservoir_max = 16;
+	}
 
 	/* Preallocate the supported per-node allocators. */
 	for_each_node_state(nid, N_MEMORY) {

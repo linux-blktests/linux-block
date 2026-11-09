@@ -62,7 +62,7 @@ static unsigned int pisa_memalloc_save(gfp_t gfp)
 
 /* Allocate a PISA page from the buddy allocator and initialize its metadata. */
 static struct pisa_meta *__pisa_page_alloc(gfp_t gfp, int nid, bool can_block,
-					   bool *clean)
+					   bool decrypt, bool *clean)
 {
 	struct pisa_meta *meta;
 	unsigned int memflags;
@@ -83,6 +83,8 @@ static struct pisa_meta *__pisa_page_alloc(gfp_t gfp, int nid, bool can_block,
 	 * must not dip into emergency reserves or trigger OOM/warnings.
 	 */
 	gfp &= ~(__GFP_COMP | __GFP_HIGHMEM | __GFP_MOVABLE);
+	if (decrypt)
+		gfp &= ~__GFP_ZERO;
 	gfp |= __GFP_NOWARN | __GFP_NOMEMALLOC | (can_block ? __GFP_RETRY_MAYFAIL : __GFP_NORETRY);
 
 	if (can_block)
@@ -101,14 +103,21 @@ static struct pisa_meta *__pisa_page_alloc(gfp_t gfp, int nid, bool can_block,
 		__free_pages(page, PISA_ORDER);
 		return ERR_PTR(-ERANGE);
 	}
-	if (can_block)
-		memalloc_flags_restore(memflags);
 
 	meta = pisa_meta_of_pfn(page_to_pfn(page));
 	memset(meta, 0, sizeof(*meta));
 
 	atomic_long_inc(&pisa_nr_pages);
-	*clean = (gfp & __GFP_ZERO) || want_init_on_alloc(0) || want_init_on_free();
+	/* On decrypt failure the page is leaked and stays charged to budget. */
+	if (decrypt && pisa_page_prepare(page, meta)) {
+		if (can_block)
+			memalloc_flags_restore(memflags);
+		return ERR_PTR(-EIO);
+	}
+	if (can_block)
+		memalloc_flags_restore(memflags);
+	*clean = (gfp & __GFP_ZERO) || (meta->flags & PISA_DECRYPTED) ||
+		 want_init_on_alloc(0) || want_init_on_free();
 
 	return meta;
 }
@@ -124,11 +133,12 @@ static void pisa_reservoir_refill_node(int nid)
 		unsigned long flags;
 		bool clean;
 
-		meta = __pisa_page_alloc(GFP_KERNEL | __GFP_THISNODE, nid, true, &clean);
+		meta = __pisa_page_alloc(GFP_KERNEL | __GFP_THISNODE, nid, true,
+					 pisa_want_decrypt(), &clean);
 		if (IS_ERR(meta))
 			break;
 
-		/* init_on_alloc/init_on_free pages are already zeroed. */
+		/* Decrypted and init_on_alloc/init_on_free pages are already zeroed. */
 		if (!clean)
 			memset(page_address(pfn_to_page(pisa_meta_to_pfn(meta))), 0, PISA_SIZE);
 
@@ -145,47 +155,48 @@ static void pisa_reservoir_refill_node(int nid)
 static void pisa_reservoir_trim_node(int nid, unsigned int max)
 {
 	struct pisa_node *res = &pisa_nodes[nid];
-	struct pisa_meta *meta, *tmp;
-	LIST_HEAD(free_list);
-	unsigned long flags;
 
-	spin_lock_irqsave(&res->lock, flags);
-	while (res->nr_pages > max && !list_empty(&res->pages)) {
-		list_move(res->pages.prev, &free_list);
-		res->nr_pages--;
-	}
-	spin_unlock_irqrestore(&res->lock, flags);
+	while (res->nr_pages > max && res->nr_pages > READ_ONCE(pisa_reservoir_max)) {
+		struct pisa_meta *meta;
+		unsigned long flags;
 
-	list_for_each_entry_safe(meta, tmp, &free_list, list) {
-		list_del_init(&meta->list);
+		spin_lock_irqsave(&res->lock, flags);
+		meta = list_first_entry_or_null(&res->pages, struct pisa_meta, list);
+		if (meta) {
+			list_del_init(&meta->list);
+			res->nr_pages--;
+		}
+		spin_unlock_irqrestore(&res->lock, flags);
+		if (!meta)
+			break;
+
 		pisa_release_page(meta);
 		cond_resched();
 	}
 }
 
+/* Per-node worker: trim/refill the reservoir, then scrub allocators homed on @nid. */
 static void pisa_node_work_fn(struct work_struct *work)
 {
-	struct pisa_node *res = container_of(work, struct pisa_node, work);
-	int nid = res - pisa_nodes;
-	unsigned int max = READ_ONCE(pisa_reservoir_max);
+	struct pisa_node *node = container_of(work, struct pisa_node, work);
+	int nid = node - pisa_nodes;
 
-	if (unlikely(pisa_meta_init()))
-		return;
-
-	if (READ_ONCE(res->nr_pages) < max)
+	pisa_reservoir_trim_node(nid, READ_ONCE(pisa_reservoir_max));
+	if (READ_ONCE(pisa_reservoir_max) && static_branch_unlikely(&pisa_key))
 		pisa_reservoir_refill_node(nid);
-	else if (READ_ONCE(res->nr_pages) > max)
-		pisa_reservoir_trim_node(nid, max);
 }
 
-/* Queue @nid's reservoir worker on a CPU belonging to @nid. */
+/* Queue node @nid's work if its reservoir is below or above the target. */
 static void pisa_schedule_reservoir_node(int nid)
 {
-	if (nid >= 0 && nid < MAX_NUMNODES && node_state(nid, N_MEMORY))
-		queue_work_node(nid, system_dfl_wq, &pisa_nodes[nid].work);
+	struct pisa_node *res = &pisa_nodes[nid];
+
+	if (node_state(nid, N_MEMORY) &&
+	    READ_ONCE(res->nr_pages) != READ_ONCE(pisa_reservoir_max) &&
+	    !work_pending(&res->work))
+		queue_work_node(nid, system_dfl_wq, &res->work);
 }
 
-/* Queue reservoir refill/trim workers on all memory nodes. */
 void pisa_schedule_reservoir(void)
 {
 	int nid;
@@ -195,7 +206,7 @@ void pisa_schedule_reservoir(void)
 }
 
 /* Pop one pre-prepared PISA page from node @nid's reservoir under @res->lock. */
-static struct pisa_meta *pisa_reservoir_pop_node(int nid, unsigned int max)
+static struct pisa_meta *pisa_reservoir_pop_node(int nid, unsigned int max, bool decrypt)
 {
 	struct pisa_node *res = &pisa_nodes[nid];
 	struct pisa_meta *meta;
@@ -207,10 +218,12 @@ static struct pisa_meta *pisa_reservoir_pop_node(int nid, unsigned int max)
 
 	spin_lock_irqsave(&res->lock, flags);
 	meta = list_first_entry_or_null(&res->pages, struct pisa_meta, list);
-	if (meta) {
+	if (meta && !!(meta->flags & PISA_DECRYPTED) == decrypt) {
 		list_del_init(&meta->list);
 		res->nr_pages--;
 		refill = res->nr_pages <= max / 2;
+	} else {
+		meta = NULL;
 	}
 	spin_unlock_irqrestore(&res->lock, flags);
 
@@ -224,7 +237,7 @@ static struct pisa_meta *pisa_reservoir_pop_node(int nid, unsigned int max)
  * Pop a pre-prepared PISA page from @nid's reservoir (scheduling an async
  * refill when <= half full or empty), or allocate one inline on miss.
  */
-struct pisa_meta *pisa_reservoir_pop(int nid, gfp_t gfp, bool *clean)
+struct pisa_meta *pisa_reservoir_pop(int nid, gfp_t gfp, bool decrypt, bool *clean)
 {
 	bool can_block = gfpflags_allow_blocking(gfp);
 	unsigned int max = READ_ONCE(pisa_reservoir_max);
@@ -232,7 +245,7 @@ struct pisa_meta *pisa_reservoir_pop(int nid, gfp_t gfp, bool *clean)
 
 	nid = pisa_sanitize_nid(nid);
 	if (max) {
-		meta = pisa_reservoir_pop_node(nid, max);
+		meta = pisa_reservoir_pop_node(nid, max, decrypt);
 		if (meta) {
 			*clean = true;
 			return meta;
@@ -244,8 +257,11 @@ struct pisa_meta *pisa_reservoir_pop(int nid, gfp_t gfp, bool *clean)
 	/* Back off briefly on GFP_ATOMIC if previous allocation on @nid failed. */
 	if (!can_block && time_before(jiffies, READ_ONCE(pisa_nodes[nid].next_alloc)))
 		return ERR_PTR(-EAGAIN);
+	/* Page decryption may sleep; atomic callers must rely on the reservoir. */
+	if (decrypt && !can_block)
+		return ERR_PTR(-EAGAIN);
 
-	meta = __pisa_page_alloc(gfp, nid, can_block, clean);
+	meta = __pisa_page_alloc(gfp, nid, can_block, decrypt, clean);
 	if (IS_ERR(meta))
 		pisa_alloc_backoff(nid, can_block);
 	return meta;

@@ -33,6 +33,7 @@ struct iommu_domain;
 enum {
 	PISA_ACTIVE		= BIT(0), /* page is owned by a pisa_alloc */
 	PISA_QUARANTINED	= BIT(1), /* IOMMU unmap failed: never reuse */
+	PISA_DECRYPTED		= BIT(2), /* page was set_memory_decrypted() */
 };
 
 /* Enabled on first pisa_meta_init() to activate fast-path hooks. */
@@ -44,6 +45,8 @@ extern unsigned long pisa_meta_nframes;
 extern unsigned long *pisa_chunk_bitmap;
 
 int pisa_meta_init(void);
+
+bool __is_pisa_direct(phys_addr_t phys, size_t size);
 
 /* fast membership check for pisa pfn/pages */
 static inline bool is_pisa_pfn(unsigned long pfn)
@@ -59,6 +62,14 @@ static inline bool is_pisa_pfn(unsigned long pfn)
 
 	flags = (const u8 *)pisa_meta_array + (frame << PISA_META_SHIFT);
 	return READ_ONCE(*flags) & PISA_ACTIVE;
+}
+
+static inline bool is_pisa_direct(phys_addr_t phys, size_t size)
+{
+	if (!static_branch_unlikely(&pisa_key))
+		return false;
+
+	return __is_pisa_direct(phys, size);
 }
 
 static inline bool is_pisa_page(const struct page *page);
@@ -129,6 +140,11 @@ static inline int pisa_meta_init(void)
 bool free_page_prepare_pisa(struct page *page, unsigned int order);
 
 static inline bool is_pisa_pfn(unsigned long pfn)
+{
+	return false;
+}
+
+static inline bool is_pisa_direct(phys_addr_t phys, size_t size)
 {
 	return false;
 }

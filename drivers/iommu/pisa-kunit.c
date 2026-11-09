@@ -63,6 +63,7 @@ static void test_meta_active_toggle(struct kunit *test)
 	unsigned long pfn, base_pfn;
 	struct pisa_meta *meta;
 	struct page *page;
+	phys_addr_t pa;
 
 	KUNIT_ASSERT_EQ(test, pisa_meta_init(), 0);
 
@@ -80,16 +81,26 @@ static void test_meta_active_toggle(struct kunit *test)
 	}
 	KUNIT_EXPECT_EQ(test, pisa_meta_ensure_pfn(pfn, false), 0);
 	meta = pisa_meta_of_pfn(pfn);
+	pa = page_to_phys(page);
 
 	KUNIT_EXPECT_FALSE(test, is_pisa_pfn(pfn));
+	KUNIT_EXPECT_FALSE(test, is_pisa_direct(pa, PAGE_SIZE));
 
 	pisa_meta_set_active(meta, true);
 	KUNIT_EXPECT_TRUE(test, is_pisa_pfn(base_pfn));
 	KUNIT_EXPECT_TRUE(test, is_pisa_pfn(pfn));
 	KUNIT_EXPECT_TRUE(test, is_pisa_pfn(base_pfn + (1UL << PISA_ORDER) - 1));
+	KUNIT_EXPECT_FALSE(test, is_pisa_direct(pa, PAGE_SIZE));
+	KUNIT_EXPECT_EQ(test, pisa_pte_phys(meta, pa), pa);
+
+	WRITE_ONCE(meta->flags, PISA_ACTIVE | PISA_DECRYPTED);
+	KUNIT_EXPECT_TRUE(test, is_pisa_direct(pa, PAGE_SIZE));
+	KUNIT_EXPECT_FALSE(test, is_pisa_direct(pa, PISA_SIZE + PAGE_SIZE));
+	KUNIT_EXPECT_EQ(test, pisa_pte_phys(meta, pa), dma_addr_unencrypted(pa));
 
 	pisa_meta_set_active(meta, false);
 	KUNIT_EXPECT_FALSE(test, is_pisa_pfn(pfn));
+	KUNIT_EXPECT_FALSE(test, is_pisa_direct(pa, PAGE_SIZE));
 
 	__free_pages(page, PISA_ORDER);
 }

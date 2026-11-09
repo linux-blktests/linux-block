@@ -78,6 +78,19 @@ struct pisa_meta *pisa_meta_of_pfn(unsigned long pfn)
 	return &pisa_meta_array[frame];
 }
 
+bool __is_pisa_direct(phys_addr_t phys, size_t size)
+{
+	u8 flags = READ_ONCE(pisa_meta_of_pfn(PHYS_PFN(phys))->flags);
+
+	/*
+	 * Only decrypted active pages can bypass swiotlb bouncing, and the
+	 * transfer must not straddle the end of the PISA frame.
+	 */
+	return (flags & (PISA_ACTIVE | PISA_DECRYPTED)) ==
+	       (PISA_ACTIVE | PISA_DECRYPTED) &&
+	       (phys & (PISA_SIZE - 1)) + size <= PISA_SIZE;
+}
+
 /* Base PFN of @meta's PISA frame, or ULONG_MAX if out-of-range/sink. */
 unsigned long pisa_meta_to_pfn(const struct pisa_meta *meta)
 {

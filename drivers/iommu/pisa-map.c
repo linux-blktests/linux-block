@@ -470,7 +470,7 @@ int __pisa_map_phys(dma_addr_t *iova, struct device *dev,
 		phys_addr_t pisa_phys = phys & PISA_MASK;
 
 		ret = iommu_map(domain, pisa_phys_to_iova(win, meta, pisa_phys),
-				pisa_phys, PISA_SIZE, block_prot, GFP_ATOMIC);
+				pisa_pte_phys(meta, pisa_phys), PISA_SIZE, block_prot, GFP_ATOMIC);
 		if (likely(!ret)) {
 			/* Ensure leaf PTE is visible before setting the domain bit. */
 			smp_mb__before_atomic();
