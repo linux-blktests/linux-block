@@ -17,6 +17,7 @@
 #include <linux/stddef.h>
 #include <linux/mm.h>
 #include <linux/highmem.h>
+#include <linux/pisa.h>
 #include <linux/interrupt.h>
 #include <linux/jiffies.h>
 #include <linux/compiler.h>
@@ -1298,6 +1299,23 @@ static inline void pgalloc_tag_sub_pages(struct alloc_tag *tag, unsigned int nr)
 
 #endif /* CONFIG_MEM_ALLOC_PROFILING */
 
+/*
+ * pisa_free_page() in __free_pages_prepare() recycles a PISA block into
+ * its allocator before the rest of that function runs. __pisa_free_page() calls
+ * this to apply the buddy allocator's checks.
+ *
+ * Return: false if the block is in a bad state (already reported): leak it.
+ */
+bool free_page_prepare_pisa(struct page *page, unsigned int order)
+{
+	if (!IS_ENABLED(CONFIG_PISA))
+		return true;
+	if (is_check_pages_enabled() && free_page_is_bad(page))
+		return false;
+	page_table_check_free(page, order);
+	return true;
+}
+
 static __always_inline bool __free_pages_prepare(struct page *page,
 		unsigned int order, fpi_t fpi_flags)
 {
@@ -1311,6 +1329,9 @@ static __always_inline bool __free_pages_prepare(struct page *page,
 		return true;
 
 	VM_BUG_ON_PAGE(PageTail(page), page);
+
+	if (unlikely(pisa_free_page(page)))
+		return false;
 
 	trace_mm_page_free(page, order);
 	kmsan_free_page(page, order);

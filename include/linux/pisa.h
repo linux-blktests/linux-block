@@ -3,10 +3,11 @@
 #ifndef _LINUX_PISA_H
 #define _LINUX_PISA_H
 
+#include <linux/types.h>
 #include <linux/bitops.h>
 #include <linux/jump_label.h>
 #include <linux/mm.h>
-#include <linux/types.h>
+#include <linux/rcupdate.h>
 
 #ifdef CONFIG_PISA
 
@@ -53,6 +54,24 @@ static inline bool is_pisa_pfn(unsigned long pfn)
 	return READ_ONCE(*flags) & PISA_ACTIVE;
 }
 
+static inline bool is_pisa_page(const struct page *page);
+
+bool __pisa_free_page(struct page *page);
+bool free_page_prepare_pisa(struct page *page, unsigned int order);
+
+static inline bool pisa_free_page(struct page *page)
+{
+	bool ret;
+
+	if (!static_branch_unlikely(&pisa_key))
+		return false;
+	rcu_read_lock();
+	ret = is_pisa_page(page) && __pisa_free_page(page);
+	rcu_read_unlock();
+
+	return ret;
+}
+
 #else /* !CONFIG_PISA */
 
 static inline int pisa_meta_init(void)
@@ -60,7 +79,14 @@ static inline int pisa_meta_init(void)
 	return -EOPNOTSUPP;
 }
 
+bool free_page_prepare_pisa(struct page *page, unsigned int order);
+
 static inline bool is_pisa_pfn(unsigned long pfn)
+{
+	return false;
+}
+
+static inline bool pisa_free_page(struct page *page)
 {
 	return false;
 }

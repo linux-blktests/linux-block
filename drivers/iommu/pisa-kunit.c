@@ -85,10 +85,18 @@ static void test_meta_active_toggle(struct kunit *test)
 	__free_pages(page, PISA_ORDER);
 }
 
+static void test_alloc_and_recycle(struct kunit *test)
+{
+	KUNIT_EXPECT_NULL(test, pisa_create(NUMA_NO_NODE, 0, DMA_NONE));
+	KUNIT_EXPECT_NULL(test, pisa_create(NUMA_NO_NODE, PISA_ORDER + 1, DMA_BIDIRECTIONAL));
+	pisa_set_name(NULL, "ignored");
+}
+
 static struct kunit_case pisa_meta_test_cases[] = {
 	KUNIT_CASE(test_meta_init_and_roundtrip),
 	KUNIT_CASE(test_meta_invalid_phys),
 	KUNIT_CASE(test_meta_active_toggle),
+	KUNIT_CASE(test_alloc_and_recycle),
 	{}
 };
 
@@ -98,5 +106,5 @@ static struct kunit_suite pisa_meta_test_suite = {
 };
 
 kunit_test_suite(pisa_meta_test_suite);
-MODULE_DESCRIPTION("KUnit tests for struct pisa_meta table");
+MODULE_DESCRIPTION("KUnit tests for struct pisa_meta table and PISA allocator");
 MODULE_LICENSE("Dual BSD/GPL");
