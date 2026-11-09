@@ -816,8 +816,14 @@ struct device {
 
 #if defined(CONFIG_NET) && defined(CONFIG_PISA)
 int net_pisa_tx_bufs_set(struct device *dev, bool val);
+int net_pisa_tx_skb_heads_set(struct device *dev, bool val);
 #else
 static inline int net_pisa_tx_bufs_set(struct device *dev, bool val)
+{
+	return -EOPNOTSUPP;
+}
+
+static inline int net_pisa_tx_skb_heads_set(struct device *dev, bool val)
 {
 	return -EOPNOTSUPP;
 }

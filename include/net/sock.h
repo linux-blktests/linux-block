@@ -1900,6 +1900,10 @@ int sk_getsockopt(struct sock *sk, int level, int optname,
 		  sockptr_t optval, sockptr_t optlen);
 int sock_gettstamp(struct socket *sock, void __user *userstamp,
 		   bool timeval, bool time32);
+struct sk_buff *__sock_alloc_send_pskb(struct sock *sk, unsigned long header_len,
+				       unsigned long data_len, int noblock,
+				       int *errcode, int max_page_order,
+				       gfp_t gfp);
 struct sk_buff *sock_alloc_send_pskb(struct sock *sk, unsigned long header_len,
 				     unsigned long data_len, int noblock,
 				     int *errcode, int max_page_order);
@@ -2671,20 +2675,27 @@ static inline struct page_frag *sk_page_frag(struct sock *sk)
 }
 
 /* 256-jiffy cache in dev->pisa_tx_stamp; see netdev_tx_pisa_refresh(). */
-#define PISA_TX_STAMP_OK	BIT(0)
+#define PISA_TX_STAMP_BUFS	BIT(0)
+#define PISA_TX_STAMP_HEADS	BIT(1)
 #define PISA_TX_STAMP_MASK	(~0xffU)
 
 #ifdef CONFIG_PISA
 DECLARE_STATIC_KEY_FALSE(net_pisa_tx_bufs_key);
+DECLARE_STATIC_KEY_FALSE(net_pisa_tx_skb_heads_key);
 
 static inline bool net_pisa_tx_bufs_enabled(void)
 {
 	return static_branch_unlikely(&net_pisa_tx_bufs_key);
 }
 
-bool netdev_tx_pisa_refresh(struct net_device *dev, u32 now);
+static inline bool net_pisa_tx_skb_heads_enabled(void)
+{
+	return static_branch_unlikely(&net_pisa_tx_skb_heads_key);
+}
 
-static inline bool __netdev_tx_pisa_ok(const struct net_device *dev)
+u32 netdev_tx_pisa_refresh(struct net_device *dev, u32 now);
+
+static inline bool __netdev_tx_pisa_ok(const struct net_device *dev, u32 flag)
 {
 	u32 stamp, now;
 
@@ -2692,9 +2703,9 @@ static inline bool __netdev_tx_pisa_ok(const struct net_device *dev)
 		return false;
 	stamp = READ_ONCE(dev->pisa_tx_stamp);
 	now = (u32)jiffies & PISA_TX_STAMP_MASK;
-	if (likely((stamp & PISA_TX_STAMP_MASK) == now))
-		return stamp & PISA_TX_STAMP_OK;
-	return netdev_tx_pisa_refresh((struct net_device *)dev, now);
+	if (unlikely((stamp & PISA_TX_STAMP_MASK) != now))
+		stamp = netdev_tx_pisa_refresh((struct net_device *)dev, now);
+	return stamp & flag;
 }
 #else
 static inline bool net_pisa_tx_bufs_enabled(void)
@@ -2702,7 +2713,12 @@ static inline bool net_pisa_tx_bufs_enabled(void)
 	return false;
 }
 
-static inline bool __netdev_tx_pisa_ok(const struct net_device *dev)
+static inline bool net_pisa_tx_skb_heads_enabled(void)
+{
+	return false;
+}
+
+static inline bool __netdev_tx_pisa_ok(const struct net_device *dev, u32 flag)
 {
 	return false;
 }
@@ -2714,18 +2730,56 @@ static inline bool __netdev_tx_pisa_ok(const struct net_device *dev)
  * active, so only data that leaves the host in clear qualifies: IPsec payload
  * is still plaintext here.
  */
-static inline bool dst_tx_pisa_ok(const struct dst_entry *dst)
+static inline bool __dst_tx_pisa_ok(const struct dst_entry *dst, u32 flag)
 {
 	bool ok = false;
 
-	if (!net_pisa_tx_bufs_enabled() || !dst)
+	if (!dst)
 		return false;
 
 	rcu_read_lock();
 	if (!dst_xfrm(dst))
-		ok = __netdev_tx_pisa_ok(dst_dev_rcu(dst));
+		ok = __netdev_tx_pisa_ok(dst_dev_rcu(dst), flag);
 	rcu_read_unlock();
 	return ok;
+}
+
+static inline bool dst_tx_pisa_ok(const struct dst_entry *dst)
+{
+	return net_pisa_tx_bufs_enabled() &&
+	       __dst_tx_pisa_ok(dst, PISA_TX_STAMP_BUFS);
+}
+
+static inline gfp_t pisa_tx_gfp_dst(const struct dst_entry *dst)
+{
+	if (net_pisa_tx_skb_heads_enabled() &&
+	    __dst_tx_pisa_ok(dst, PISA_TX_STAMP_HEADS))
+		return __GFP_PISA_RO;
+	return 0;
+}
+
+static inline gfp_t pisa_tx_gfp_sk(const struct sock *sk)
+{
+	if (net_pisa_tx_skb_heads_enabled() && sk) {
+		bool ok;
+
+		rcu_read_lock();
+		ok = __dst_tx_pisa_ok(rcu_dereference(sk->sk_dst_cache),
+				      PISA_TX_STAMP_HEADS);
+		rcu_read_unlock();
+		if (ok)
+			return __GFP_PISA_RO;
+	}
+	return 0;
+}
+
+static inline struct sk_buff *sock_alloc_send_skb_dst(struct sock *sk,
+						      unsigned long size,
+						      int noblock, int *errcode,
+						      const struct dst_entry *dst)
+{
+	return __sock_alloc_send_pskb(sk, size, 0, noblock, errcode, 0,
+				      pisa_tx_gfp_dst(dst));
 }
 
 /* Is @pfrag the task's frag reserved for PISA-eligible data? */

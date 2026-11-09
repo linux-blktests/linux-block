@@ -113,6 +113,7 @@ unsigned long pisa_alloc_pages_bulk(gfp_t gfp, unsigned int order,
 struct folio *pisa_alloc_folio(gfp_t gfp, unsigned int order, int nid);
 bool pisa_has_free_blocks_rx(const struct device *dev, unsigned int order, int nid);
 bool pisa_page_can_recycle(const struct page *page);
+void *pisa_skb_head_alloc_node(gfp_t flags, int node);
 
 static inline gfp_t pisa_rx_gfp(const struct device *dev)
 {
@@ -167,6 +168,11 @@ static inline void *pisa_alloc_coherent(struct page **pagep,
 static inline bool pisa_free_coherent(struct page *page, size_t size)
 {
 	return false;
+}
+
+static inline void *pisa_skb_head_alloc_node(gfp_t flags, int node)
+{
+	return NULL;
 }
 
 static inline bool pisa_page_can_recycle(const struct page *page)

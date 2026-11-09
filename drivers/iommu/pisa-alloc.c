@@ -37,6 +37,7 @@
 #include <linux/slab.h>
 #include <linux/spinlock.h>
 #include <linux/workqueue.h>
+#include <net/hotdata.h>
 #include <net/sock.h>
 
 #include "dma-iommu.h"
@@ -922,37 +923,133 @@ int net_pisa_tx_bufs_set(struct device *dev, bool val)
 }
 
 /*
- * The sysfs attribute pisa_tx_bufs lives on the physical DMA parent
- * (dev->dev.parent), whereas a socket route (dst->dev) may point to an upper
- * virtual net_device (bond, VLAN, ipvlan, etc.). Walking lower devices via
- * netdev_walk_all_lower_dev_rcu() on every TX allocation would be too
- * expensive, so dev->pisa_tx_stamp caches the walk result on the net_device
- * and refreshes it at most once every 256 jiffies:
- *   bit 0 (PISA_TX_STAMP_OK):         pisa_tx_bufs enabled on lower device(s)
+ * dev->pisa_tx_skb_heads: when set on an egress device, small TX skb heads
+ * (__GFP_PISA_RO) come from a copy of skbuff_small_head whose slab pages are
+ * PISA blocks. The linear part of most transmitted skbs is then mapped
+ * through the PISA window without per-driver bounce buffers. Several heads
+ * share a slab page and each one ends with its skb_shared_info, so:
+ * - the allocators are TX-only (DMA_TO_DEVICE): their PISA pages are mapped device
+ *   read-only, and a DMA mapping that wants device writes gets a per-buffer
+ *   IOMMU mapping, as for any kmalloc() buffer;
+ * - slab pages are zeroed when taken from the allocator, so the device can read
+ *   skb heads (live or freed) but never older contents of the page.
+ * Heads are freed with kfree() whichever cache they came from, so the key
+ * can be toggled at any time. The cache and allocators are created on the first
+ * write and never destroyed.
+ */
+DEFINE_STATIC_KEY_FALSE(net_pisa_tx_skb_heads_key);
+EXPORT_SYMBOL(net_pisa_tx_skb_heads_key);
+
+static struct kmem_cache *pisa_skb_small_head_cache __read_mostly;
+
+/* Lazily initialize skbuff_small_head_pisa on first enable. */
+static int pisa_skb_head_init(void)
+{
+	unsigned int size = kmem_cache_size(net_hotdata.skb_small_head_cache);
+	struct kmem_cache_args args = {
+		/* As skbuff_small_head, see skb_init(). */
+		.useroffset	= 0,
+		.usersize	= SKB_WITH_OVERHEAD(size),
+		.sheaf_capacity	= 32,
+	};
+	static DEFINE_MUTEX(mutex);
+	struct kmem_cache *s;
+	int ret = 0;
+
+	mutex_lock(&mutex);
+	if (pisa_skb_small_head_cache)
+		goto out;
+
+	/* No slab is allocated before the cache is published below. */
+	s = kmem_cache_create("skbuff_small_head_pisa", size, &args,
+			      SLAB_HWCACHE_ALIGN | SLAB_NO_MERGE | SLAB_CACHE_PISA_RO);
+	if (!s) {
+		ret = -ENOMEM;
+		goto out;
+	}
+	WRITE_ONCE(pisa_skb_small_head_cache, s);
+out:
+	mutex_unlock(&mutex);
+	return ret;
+}
+
+int net_pisa_tx_skb_heads_set(struct device *dev, bool val)
+{
+	static DEFINE_MUTEX(lock);
+
+	if (val) {
+		int ret = pisa_skb_head_init();
+
+		if (ret)
+			return ret;
+	}
+
+	mutex_lock(&lock);
+	if (dev->pisa_tx_skb_heads != val) {
+		WRITE_ONCE(dev->pisa_tx_skb_heads, val);
+		if (val)
+			static_branch_inc(&net_pisa_tx_skb_heads_key);
+		else
+			static_branch_dec(&net_pisa_tx_skb_heads_key);
+	}
+	mutex_unlock(&lock);
+	return 0;
+}
+
+void *pisa_skb_head_alloc_node(gfp_t flags, int node)
+{
+	if (!static_branch_unlikely(&net_pisa_tx_skb_heads_key))
+		return NULL;
+	return kmem_cache_alloc_node(pisa_skb_small_head_cache,
+				     flags | __GFP_NOMEMALLOC | __GFP_NOWARN, node);
+}
+
+/*
+ * The sysfs attributes pisa_tx_bufs and pisa_tx_skb_heads live on the
+ * physical DMA parent (dev->dev.parent), whereas a socket route (dst->dev)
+ * may point to an upper virtual net_device (bond, VLAN, ipvlan, etc.).
+ * Walking lower devices via netdev_walk_all_lower_dev_rcu() on every TX
+ * allocation would be too expensive, so dev->pisa_tx_stamp caches the walk
+ * result on the net_device and refreshes it at most once every 256 jiffies:
+ *   bit 0 (PISA_TX_STAMP_BUFS):       pisa_tx_bufs enabled on lower device(s)
+ *   bit 1 (PISA_TX_STAMP_HEADS):      pisa_tx_skb_heads enabled on lower device(s)
  *   bits 31..8 (PISA_TX_STAMP_MASK):  upper 24 bits of (u32)jiffies
  */
-static int netdev_pisa_tx_bufs_walk(struct net_device *dev, struct netdev_nested_priv *priv)
+static u32 netdev_pisa_tx_flags(const struct net_device *dev)
 {
-	return dev->dev.parent && READ_ONCE(dev->dev.parent->pisa_tx_bufs);
+	struct device *parent = dev->dev.parent;
+	u32 flags = 0;
+
+	if (parent) {
+		if (READ_ONCE(parent->pisa_tx_bufs))
+			flags |= PISA_TX_STAMP_BUFS;
+		if (READ_ONCE(parent->pisa_tx_skb_heads))
+			flags |= PISA_TX_STAMP_HEADS;
+	}
+	return flags;
+}
+
+static int netdev_pisa_tx_walk(struct net_device *dev, struct netdev_nested_priv *priv)
+{
+	priv->data = (void *)((uintptr_t)priv->data | netdev_pisa_tx_flags(dev));
+	return 0;
 }
 
 /* Slow path of __netdev_tx_pisa_ok(): refresh dev->pisa_tx_stamp. */
-bool netdev_tx_pisa_refresh(struct net_device *dev, u32 now)
+u32 netdev_tx_pisa_refresh(struct net_device *dev, u32 now)
 {
-	bool ok;
-
 	if (dev->dev.parent) {
-		ok = READ_ONCE(dev->dev.parent->pisa_tx_bufs);
+		now |= netdev_pisa_tx_flags(dev);
 	} else {
+		struct netdev_nested_priv priv = {};
+
 		rcu_read_lock();
-		ok = netdev_walk_all_lower_dev_rcu(dev,
-						   netdev_pisa_tx_bufs_walk,
-						   NULL) != 0;
+		netdev_walk_all_lower_dev_rcu(dev, netdev_pisa_tx_walk, &priv);
 		rcu_read_unlock();
+		now |= (uintptr_t)priv.data;
 	}
-	now |= ok ? PISA_TX_STAMP_OK : 0;
 	WRITE_ONCE(dev->pisa_tx_stamp, now);
-	return now & PISA_TX_STAMP_OK;
+	return now;
 }
 EXPORT_SYMBOL(netdev_tx_pisa_refresh);
 #endif /* CONFIG_NET */

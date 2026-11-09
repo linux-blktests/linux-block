@@ -2951,7 +2951,7 @@ static DEVICE_ATTR_RW(name)
 PISA_BOOL_ATTR(pisa_coherent);
 PISA_BOOL_ATTR(pisa_rx_bufs);
 PISA_SET_ATTR(pisa_tx_bufs, net_pisa_tx_bufs_set);
-PISA_BOOL_ATTR(pisa_tx_skb_heads);
+PISA_SET_ATTR(pisa_tx_skb_heads, net_pisa_tx_skb_heads_set);
 
 static struct attribute *dev_attr_pisa[] = {
 	&dev_attr_pisa_coherent.attr,
@@ -3113,6 +3113,8 @@ static void device_remove_attrs(struct device *dev)
 		device_remove_group(dev, &dev_attr_pisa_group);
 		if (dev->pisa_tx_bufs)
 			net_pisa_tx_bufs_set(dev, false);
+		if (dev->pisa_tx_skb_heads)
+			net_pisa_tx_skb_heads_set(dev, false);
 	}
 
 	if (dev->physical_location) {
