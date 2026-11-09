@@ -133,7 +133,6 @@ struct pisa_alloc {
 	unsigned int		num_idle_pages;
 	unsigned int		max_idle_pages;
 	unsigned long		idle_jiffies;
-
 	/* Cold. */
 	int			nid;
 	struct list_head	node;

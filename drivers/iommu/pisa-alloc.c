@@ -9,6 +9,7 @@
 #include <linux/bitmap.h>
 #include <linux/bitops.h>
 #include <linux/cache.h>
+#include <linux/device.h>
 #include <linux/dma-mapping.h>
 #include <linux/pisa.h>
 #include <linux/export.h>
@@ -391,6 +392,29 @@ unsigned long pisa_alloc_pages_bulk(gfp_t gfp, unsigned int order, int preferred
 		pa = pisa_node_pa(preferred_nid, order, !(gfp & __GFP_WRITE));
 	return pisa_alloc_bulk(pa, gfp & ~__GFP_PISA_RW, nr_pages, page_array, frozen);
 }
+
+/**
+ * pisa_has_free_blocks_rx - Check if @dev has free PISA RX blocks of @order on @nid
+ * @dev: Device to check
+ * @order: Block order
+ * @nid: Target NUMA node (or NUMA_NO_NODE)
+ *
+ * Return: true if @dev->pisa_rx_bufs is enabled and the per-node allocator
+ * has a free block available.
+ */
+bool pisa_has_free_blocks_rx(const struct device *dev, unsigned int order, int nid)
+{
+	struct pisa_alloc *pa;
+
+	if (!dev || !READ_ONCE(dev->pisa_rx_bufs))
+		return false;
+	pa = pisa_node_pa(nid, order, false);
+	return pa &&
+	       (!list_empty_careful(&pa->partial) ||
+		!list_empty_careful(&pa->partial_dirty) ||
+		!list_empty_careful(&pa->idle));
+}
+EXPORT_SYMBOL(pisa_has_free_blocks_rx);
 
 /*
  * Split a non-compound page of @old_order into 1 << (@old_order - @new_order)
