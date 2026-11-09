@@ -849,6 +849,33 @@ unsigned long pisa_alloc_pages_bulk(gfp_t gfp, unsigned int order, int preferred
 }
 
 /**
+ * pisa_alloc_folio - Allocate a frozen folio for SLUB (SLAB_CACHE_PISA_RO)
+ * @gfp: GFP flags (must have __GFP_PISA_RW or __GFP_PISA_RO set)
+ * @order: Folio order
+ * @nid: Target NUMA node (or NUMA_NO_NODE)
+ *
+ * Drops __GFP_THISNODE before calling the per-node allocator and verifies
+ * node placement afterwards.
+ *
+ * Return: Frozen folio of @order, or NULL.
+ */
+struct folio *pisa_alloc_folio(gfp_t gfp, unsigned int order, int nid)
+{
+	struct page *page;
+
+	page = pisa_alloc_pages(gfp & ~__GFP_THISNODE, order, nid, NULL);
+	if (!page)
+		return NULL;
+	if (unlikely((gfp & __GFP_THISNODE) && nid != NUMA_NO_NODE &&
+		     page_to_nid(page) != nid)) {
+		page_ref_unfreeze(page, 1);
+		__free_pages(page, order);
+		return NULL;
+	}
+	return page_folio(page);
+}
+
+/**
  * pisa_has_free_blocks_rx - Check if @dev has free PISA RX blocks of @order on @nid
  * @dev: Device to check
  * @order: Block order
