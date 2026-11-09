@@ -37,6 +37,7 @@
 #include <linux/generic_pt/iommu.h>
 
 #include "dma-iommu.h"
+#include "pisa-priv.h"
 #include "iommu-priv.h"
 
 static struct kset *iommu_group_kset;
@@ -3362,6 +3363,10 @@ void iommu_device_unuse_default_domain(struct device *dev)
 	mutex_lock(&group->mutex);
 	if (!WARN_ON(!group->owner_cnt || !xa_empty(&group->pasid_array)))
 		group->owner_cnt--;
+
+	/* Unmap persistent PISA windows when the last driver detaches. */
+	if (!group->owner_cnt)
+		pisa_domain_quiesce(group->default_domain);
 
 	mutex_unlock(&group->mutex);
 }

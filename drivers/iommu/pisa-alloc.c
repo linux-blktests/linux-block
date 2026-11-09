@@ -13,6 +13,7 @@
 #include <linux/pisa.h>
 #include <linux/export.h>
 #include <linux/gfp.h>
+#include <linux/iommu.h>
 #include <linux/list.h>
 #include <linux/llist.h>
 #include <linux/memcontrol.h>
@@ -30,6 +31,7 @@
 #include <linux/workqueue.h>
 #include <net/sock.h>
 
+#include "dma-iommu.h"
 #include "pisa-priv.h"
 
 /* Parameters are pisa.<name> at boot and in /sys/module/pisa/parameters/. */
@@ -88,6 +90,10 @@ static void pisa_release_page_rcu(struct rcu_head *head)
 
 	WRITE_ONCE(meta->pa, NULL);
 
+	/* Possibly still mapped by a device: leak it, still charged. */
+	if (meta->flags & PISA_QUARANTINED)
+		return;
+
 	/* The page has been unmapped from every domain by pisa_release_page() */
 	pisa_slot_free(slot);
 	atomic_long_dec(&pisa_nr_pages);
@@ -107,7 +113,8 @@ void pisa_release_page(struct pisa_meta *meta)
 		return;
 	}
 
-	/* pisa_unmap_all(meta) will be called here once IOMMU mappings are added. */
+	/* Quarantined on unmap failure and leaked in pisa_release_page_rcu(). */
+	pisa_unmap_all(meta);
 
 	/* Clear PISA_ACTIVE before the RCU grace period so new readers stop entering. */
 	WRITE_ONCE(meta->flags, meta->flags & ~PISA_ACTIVE);
@@ -194,7 +201,8 @@ static bool pisa_place_meta(struct pisa_meta *meta)
 	lockdep_assert_held(&pa->lock);
 
 	if (avail == bpp) {
-		if (pa->num_idle_pages >= pa->max_idle_pages && !READ_ONCE(pisa_idle_ms)) {
+		if ((meta->flags & PISA_QUARANTINED) ||
+		    (pa->num_idle_pages >= pa->max_idle_pages && !READ_ONCE(pisa_idle_ms))) {
 			list_del_init(&meta->list);
 			WRITE_ONCE(meta->on_list, PISA_LIST_NONE);
 			llist_add(&meta->llnode, &pisa_free_list);
@@ -204,7 +212,7 @@ static bool pisa_place_meta(struct pisa_meta *meta)
 			WRITE_ONCE(pa->idle_jiffies, jiffies);
 		pa->num_idle_pages++;
 		on_list = meta->nr_dirty ? PISA_LIST_IDLE_DIRTY : PISA_LIST_IDLE_CLEAN;
-	} else if (!avail) {
+	} else if (!avail || unlikely(meta->flags & PISA_QUARANTINED)) {
 		on_list = PISA_LIST_FULL;
 	} else {
 		bool sparse;

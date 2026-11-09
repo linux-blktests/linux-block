@@ -27,6 +27,7 @@
 
 enum {
 	PISA_ACTIVE		= BIT(0), /* page is owned by a pisa_alloc */
+	PISA_QUARANTINED	= BIT(1), /* IOMMU unmap failed: never reuse */
 };
 
 /* Enabled on first pisa_meta_init() to activate fast-path hooks. */

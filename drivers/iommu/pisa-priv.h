@@ -13,6 +13,9 @@
 #include <linux/types.h>
 #include <linux/workqueue.h>
 
+struct iommu_domain;
+struct iommu_iotlb_gather;
+
 /**
  * struct pisa_window - A domain's IOVA window reserved for PISA pages
  * @base: Window base IOVA (PISA_SIZE aligned), or 0 if unassigned
@@ -33,6 +36,9 @@ struct pisa_window {
 
 #define PISA_BLOCKS(order)	(1U << (PISA_ORDER - (order)))
 
+/* Max simultaneous PISA IOMMU domains (bit index in pisa_meta.domains_mapped). */
+#define PISA_MAX_DOMAINS		128
+
 /* Sentinel values of pisa_window.domain_idx below PISA_IDX_FIRST. */
 enum {
 	PISA_IDX_NONE,	/* not attempted yet */
@@ -47,15 +53,18 @@ enum {
  * - pisa_allocs_lock (rwlock): outermost; protects pisa_allocs list.
  * - pisa_meta_mutex (mutex): serializes pisa_meta_init() and page-table alloc.
  * - pa->lock (spinlock, irqsave): per-allocator lists, bitmaps, and stats.
+ * - pisa_domains_lock (spinlock, irqsave): leaf lock over pisa_domains[]/windows.
+ * - pisa_srcu: protects pisa_domains[] readers against pisa_domain_release().
  */
 
 /**
  * struct pisa_meta - Metadata for a single PISA page in @pisa_meta_array
- * @flags:	PISA_ACTIVE while this page is owned by a pisa_alloc
+ * @flags:	PISA_ACTIVE / PISA_QUARANTINED
  * @nr_clean:	Zeroed available blocks in @clean_bitmap
  * @nr_dirty:	Dirty available blocks in @dirty_bitmap
  * @on_list:	Current placement in @pa (enum pisa_meta_list)
  * @slot:	Dense IOVA slot index in every domain's window
+ * @domains_mapped: Bitmap of domain indices holding this page's leaf PTE
  * @pa:		Owning pisa_alloc (NULL for reservoir pages)
  * @list:	Node in @pa lists or per-node reservoir (pisa_node.pages)
  * @llnode:	Node in lockless pisa_free_list for async release to the buddy allocator
@@ -69,6 +78,9 @@ struct pisa_meta {
 	u16 nr_dirty;
 	u8 on_list;
 	u32 slot;
+
+	DECLARE_BITMAP(domains_mapped, PISA_MAX_DOMAINS);
+
 	struct pisa_alloc *pa;
 	struct list_head list;
 
@@ -136,6 +148,12 @@ struct pisa_node {
 /* Per-NUMA-node PISA state (ring/TX/user allocators, reservoir). */
 extern struct pisa_node pisa_nodes[MAX_NUMNODES];
 
+/* Offset of @meta from the start of a domain's window. */
+static inline dma_addr_t pisa_meta_win_offset(const struct pisa_meta *meta)
+{
+	return (dma_addr_t)meta->slot << PISA_SHIFT;
+}
+
 int pisa_meta_ensure_pfn(unsigned long pfn, bool can_block);
 struct pisa_meta *pisa_meta_of_pfn(unsigned long pfn);
 unsigned long pisa_meta_to_pfn(const struct pisa_meta *meta);
@@ -202,11 +220,30 @@ unsigned long pisa_reservoir_shrink(struct list_head *release_list, unsigned lon
 
 /* Size in bytes of every domain's PISA IOVA window, fixed at boot. */
 extern u64 pisa_window_size;
+/* Bumped under pisa_domains_lock whenever a domain index is released. */
+extern unsigned int pisa_idx_gen;
 extern unsigned int pisa_nr_slots;
 
 void pisa_slots_init(void);
 int pisa_slot_alloc(struct pisa_meta *meta);
 void pisa_slot_free(unsigned int slot);
+int pisa_unmap_all(struct pisa_meta *meta);
+
+/* Return negative errno if @win's domain was permanently/currently declined, or 0. */
+static inline int pisa_window_declined(const struct pisa_window *win)
+{
+	switch (READ_ONCE(win->domain_idx)) {
+	case PISA_IDX_NOHUGE:
+		return -EOPNOTSUPP;
+	case PISA_IDX_NOWINDOW:
+		return -ENOSPC;
+	case PISA_IDX_NOIDX:
+		return READ_ONCE(win->idx_gen) == READ_ONCE(pisa_idx_gen) ?
+		       -EBUSY : 0;
+	default:
+		return 0;
+	}
+}
 
 /* Return true if @dma falls within @win's reserved PISA IOVA window. */
 static inline bool is_pisa_iova(const struct pisa_window *win, dma_addr_t dma)
@@ -217,16 +254,33 @@ static inline bool is_pisa_iova(const struct pisa_window *win, dma_addr_t dma)
 	return base && dma - base < pisa_window_size;
 }
 
+void pisa_domain_release(struct iommu_domain *domain);
+void pisa_domain_quiesce(struct iommu_domain *domain);
+
 #else /* !CONFIG_PISA || !CONFIG_IOMMU_DMA */
 
 #define pisa_nr_slots 0U
 static inline void pisa_slots_init(void) {}
 static inline int pisa_slot_alloc(struct pisa_meta *meta) { return 0; }
 static inline void pisa_slot_free(unsigned int slot) {}
+static inline int pisa_unmap_all(struct pisa_meta *meta) { return 0; }
+
+static inline int pisa_window_declined(const struct pisa_window *win)
+{
+	return -EOPNOTSUPP;
+}
 
 static inline bool is_pisa_iova(const struct pisa_window *win, dma_addr_t dma)
 {
 	return false;
+}
+
+static inline void pisa_domain_release(struct iommu_domain *domain)
+{
+}
+
+static inline void pisa_domain_quiesce(struct iommu_domain *domain)
+{
 }
 
 #endif /* CONFIG_PISA && CONFIG_IOMMU_DMA */

@@ -5,6 +5,7 @@
 #include <kunit/test.h>
 #include <linux/gfp.h>
 #include <linux/pisa.h>
+#include <linux/iommu.h>
 #include <linux/mm.h>
 #include <linux/shrinker.h>
 #include <linux/skbuff.h>
@@ -183,6 +184,7 @@ static void test_alloc_and_recycle(struct kunit *test)
 #ifdef CONFIG_IOMMU_DMA
 static void test_window_helpers(struct kunit *test)
 {
+	struct iommu_domain dummy_domain = {};
 	struct pisa_window win = {};
 
 	KUNIT_ASSERT_EQ(test, pisa_meta_init(), 0);
@@ -196,6 +198,22 @@ static void test_window_helpers(struct kunit *test)
 	KUNIT_EXPECT_TRUE(test, is_pisa_iova(&win, SZ_4G));
 	KUNIT_EXPECT_TRUE(test, is_pisa_iova(&win, SZ_4G + pisa_window_size - 1));
 	KUNIT_EXPECT_FALSE(test, is_pisa_iova(&win, SZ_4G + pisa_window_size));
+
+	/* Sentinel values in pisa_window_declined(). */
+	win.domain_idx = PISA_IDX_NONE;
+	KUNIT_EXPECT_EQ(test, pisa_window_declined(&win), 0);
+	win.domain_idx = PISA_IDX_NOHUGE;
+	KUNIT_EXPECT_EQ(test, pisa_window_declined(&win), -EOPNOTSUPP);
+	win.domain_idx = PISA_IDX_NOWINDOW;
+	KUNIT_EXPECT_EQ(test, pisa_window_declined(&win), -ENOSPC);
+	win.domain_idx = PISA_IDX_NOIDX;
+	win.idx_gen = READ_ONCE(pisa_idx_gen);
+	KUNIT_EXPECT_EQ(test, pisa_window_declined(&win), -EBUSY);
+	win.idx_gen--;
+	KUNIT_EXPECT_EQ(test, pisa_window_declined(&win), 0);
+
+	/* Releasing an unregistered domain with an active allocator is a safe no-op. */
+	pisa_domain_release(&dummy_domain);
 }
 
 #endif /* CONFIG_IOMMU_DMA */

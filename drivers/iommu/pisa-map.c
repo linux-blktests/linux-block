@@ -4,13 +4,19 @@
  * See Documentation/core-api/pisa.rst for the architecture overview.
  */
 
+#include <linux/atomic.h>
 #include <linux/bitops.h>
 #include <linux/cache.h>
+#include <linux/dma-map-ops.h>
+#include <linux/dma-mapping.h>
+#include <linux/pisa.h>
+#include <linux/export.h>
+#include <linux/iommu.h>
 #include <linux/mm.h>
 #include <linux/moduleparam.h>
-#include <linux/pisa.h>
 #include <linux/slab.h>
 #include <linux/spinlock.h>
+#include <linux/srcu.h>
 
 #include "dma-iommu.h"
 #include "pisa-priv.h"
@@ -87,4 +93,210 @@ void __init pisa_slots_init(void)
 	}
 	/* Size of every domain's window: one 2MB page per slot. */
 	pisa_window_size = (u64)pisa_nr_slots << PISA_SHIFT;
+}
+
+/*
+ * Registry of PISA IOMMU domains (0 .. PISA_MAX_DOMAINS - 1). Each slot is
+ * FREE (!domain && !base), ACTIVE (domain), or DRAINING (!domain && base) while
+ * pisa_domain_release() clears @meta->domains_mapped bits.
+ */
+static struct {
+	struct iommu_domain *domain;
+	dma_addr_t base;
+} pisa_domains[PISA_MAX_DOMAINS] __read_mostly;
+static DEFINE_SPINLOCK(pisa_domains_lock);
+
+/* Protects pisa_unmap_all() readers against concurrent pisa_domain_release(). */
+DEFINE_STATIC_SRCU(pisa_srcu);
+
+/* Bumped under pisa_domains_lock whenever a domain index is released. */
+unsigned int pisa_idx_gen __read_mostly;
+
+/* Report a short IOMMU unmap and mark @meta quarantined so it is never reused. */
+static void pisa_quarantine_meta(struct pisa_meta *meta, struct iommu_domain *domain,
+				 int idx, dma_addr_t iova, size_t unmapped)
+{
+	pr_err_ratelimited("pisa: unmap of IOVA %pad in domain %p (index %d) returned %zu, quarantining PISA page\n",
+			   &iova, domain, idx, unmapped);
+	WRITE_ONCE(meta->flags, meta->flags | PISA_QUARANTINED);
+}
+
+/*
+ * Unmap @meta's leaf PTE from every active domain holding it. Returns 0 on
+ * success, or -EIO if any unmap failed (@meta is then quarantined).
+ */
+int pisa_unmap_all(struct pisa_meta *meta)
+{
+	dma_addr_t offset = pisa_meta_win_offset(meta);
+	int idx, srcu_idx;
+
+	srcu_idx = srcu_read_lock(&pisa_srcu);
+	for_each_set_bit(idx, meta->domains_mapped, PISA_MAX_DOMAINS) {
+		struct iommu_domain *domain;
+		unsigned long flags;
+		size_t unmapped;
+		dma_addr_t base;
+
+		if (!test_and_clear_bit(idx, meta->domains_mapped))
+			continue;
+
+		spin_lock_irqsave(&pisa_domains_lock, flags);
+		domain = pisa_domains[idx].domain;
+		base = pisa_domains[idx].base;
+		spin_unlock_irqrestore(&pisa_domains_lock, flags);
+
+		/* Free, or draining: pisa_domain_release() handles the bit. */
+		if (!domain)
+			continue;
+
+		unmapped = iommu_unmap(domain, base + offset, PISA_SIZE);
+		if (unlikely(unmapped != PISA_SIZE))
+			pisa_quarantine_meta(meta, domain, idx, base + offset, unmapped);
+	}
+	srcu_read_unlock(&pisa_srcu, srcu_idx);
+
+	return (meta->flags & PISA_QUARANTINED) ? -EIO : 0;
+}
+
+/* Clear domain @idx from all populated slots. */
+static unsigned int pisa_forget_domain(int idx)
+{
+	unsigned int slot, dropped = 0;
+
+	rcu_read_lock();
+	for_each_set_bit(slot, pisa_slot_bitmap, pisa_nr_slots) {
+		struct pisa_meta *meta = READ_ONCE(pisa_slot2meta[slot]);
+
+		if (meta && test_bit(idx, meta->domains_mapped) &&
+		    test_and_clear_bit(idx, meta->domains_mapped))
+			dropped++;
+	}
+	rcu_read_unlock();
+	return dropped;
+}
+
+/*
+ * Release @domain's registry index and clear its bit in all active
+ * PISA pages, waiting out concurrent unmappers on @pisa_srcu before freeing
+ * the slot.
+ */
+void pisa_domain_release(struct iommu_domain *domain)
+{
+	struct pisa_window *win;
+	unsigned int dropped;
+	unsigned long flags;
+	int idx;
+
+	/* Nothing has ever been active, so nothing can reference @domain. */
+	if (!static_branch_unlikely(&pisa_key))
+		return;
+
+	win = pisa_dma_window(domain);
+	/* @domain never active, so no PISA page can be holding a bit for it. */
+	if (!win || !smp_load_acquire(&win->base))
+		return;
+
+	idx = win->domain_idx - PISA_IDX_FIRST;
+	spin_lock_irqsave(&pisa_domains_lock, flags);
+	if (pisa_domains[idx].domain != domain) {
+		spin_unlock_irqrestore(&pisa_domains_lock, flags);
+		return;
+	}
+	/* Leaving @base set moves the slot to DRAINING state */
+	pisa_domains[idx].domain = NULL;
+	spin_unlock_irqrestore(&pisa_domains_lock, flags);
+
+	dropped = pisa_forget_domain(idx);
+
+	/* Wait out in-flight pisa_unmap_all() readers before reusing @idx. */
+	synchronize_srcu(&pisa_srcu);
+
+	/* Mark slot FREE and bump @pisa_idx_gen so NOIDX domains retry. */
+	spin_lock_irqsave(&pisa_domains_lock, flags);
+	pisa_domains[idx].base = 0;
+	WRITE_ONCE(pisa_idx_gen, pisa_idx_gen + 1);
+	spin_unlock_irqrestore(&pisa_domains_lock, flags);
+
+	if (dropped)
+		pr_debug("pisa: released %u PISA page mappings for domain %p (index %d)\n",
+			 dropped, domain, idx);
+}
+
+/*
+ * Remove @meta's leaf PTE from live @domain (registered at @idx with @base),
+ * batching the IOTLB flush into @gather. Returns 1 if unmapped, 0 otherwise.
+ */
+static unsigned int pisa_unmap_domain_locked(struct pisa_meta *meta,
+					     struct iommu_domain *domain,
+					     int idx, dma_addr_t base,
+					     struct iommu_iotlb_gather *gather)
+{
+	dma_addr_t iova = base + pisa_meta_win_offset(meta);
+	size_t unmapped;
+
+	if (!test_and_clear_bit(idx, meta->domains_mapped))
+		return 0;
+
+	unmapped = iommu_unmap_fast(domain, iova, PISA_SIZE, gather);
+	if (unlikely(unmapped != PISA_SIZE))
+		pisa_quarantine_meta(meta, domain, idx, iova, unmapped);
+	return 1;
+}
+
+/*
+ * Unmap all PISA leaf PTEs from a domain whose last DMA API user detached,
+ * keeping its window and domain index so mappings are re-installed on demand.
+ */
+void pisa_domain_quiesce(struct iommu_domain *domain)
+{
+	struct iommu_iotlb_gather gather;
+	struct pisa_window *win;
+	unsigned int slot, done = 0;
+	bool release = false;
+	dma_addr_t base;
+	int idx;
+
+	if (!static_branch_unlikely(&pisa_key))
+		return;
+	win = pisa_dma_window(domain);
+	/* Pairs with smp_store_release() in pisa_window_assign(). */
+	base = win ? smp_load_acquire(&win->base) : 0;
+	if (!base)
+		return;
+	idx = win->domain_idx - PISA_IDX_FIRST;
+
+	iommu_iotlb_gather_init(&gather);
+	/* Keep call_rcu()-freed pages from reaching the buddy allocator before IOTLB sync. */
+	rcu_read_lock();
+	for_each_set_bit(slot, pisa_slot_bitmap, pisa_nr_slots) {
+		struct pisa_meta *meta = READ_ONCE(pisa_slot2meta[slot]);
+		struct pisa_alloc *pa;
+		unsigned long flags;
+
+		if (!meta || !test_bit(idx, meta->domains_mapped))
+			continue;
+		done += pisa_unmap_domain_locked(meta, domain, idx, base, &gather);
+		if (likely(!(meta->flags & PISA_QUARANTINED)))
+			continue;
+		pa = READ_ONCE(meta->pa);
+		if (!pa)
+			continue;
+		spin_lock_irqsave(&pa->lock, flags);
+		if (meta->pa == pa) {
+			if (meta->on_list == PISA_LIST_IDLE_CLEAN ||
+			    meta->on_list == PISA_LIST_IDLE_DIRTY)
+				pa->num_idle_pages--;
+			release |= pisa_place_meta(meta);
+		}
+		spin_unlock_irqrestore(&pa->lock, flags);
+	}
+
+	if (done)
+		iommu_iotlb_sync(domain, &gather);
+	rcu_read_unlock();
+	if (release)
+		pisa_schedule_reclaim();
+	if (done)
+		pr_debug("pisa: unmapped %u PISA pages from idle domain %p (index %d)\n",
+			 done, domain, idx);
 }
