@@ -1299,6 +1299,12 @@ void blk_finish_plug(struct blk_plug *plug)
 {
 	if (plug == current->plug) {
 		__blk_flush_plug(plug, false);
+		/*
+		 * A preempted task invalidates its cached timestamp when it is
+		 * scheduled back in. Keep the PF_BLOCK_TS clear above ordered
+		 * before detaching the plug, including when the flush is inlined.
+		 */
+		barrier();
 		current->plug = NULL;
 	}
 }
