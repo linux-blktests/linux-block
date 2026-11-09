@@ -8,9 +8,7 @@
 #include <linux/list.h>
 #include <linux/llist.h>
 #include <linux/mem_encrypt.h>
-#include <linux/nodemask.h>
 #include <linux/spinlock.h>
-#include <linux/topology.h>
 #include <linux/types.h>
 #include <linux/workqueue.h>
 
@@ -136,13 +134,78 @@ static inline unsigned int pisa_meta_avail(const struct pisa_meta *meta)
 struct pisa_pcp {
 	spinlock_t	lock;	/* by this CPU, or by a drain from any CPU */
 	unsigned int	count;
+	u64		alloc_cnt;
+	u64		miss_cnt;
+	u64		free_cnt;
+	u64		alloc_ks;
+	u64		alloc_as;
 	struct page	*blocks[PISA_PCP_HIGH];
 };
 
-/* Per-allocator statistics, see pisa_allocs_show(). */
+#define pisa_stat_add(var, val)		((var) += (val))
+#define pisa_stat_inc(var)		pisa_stat_add(var, 1)
+#define pisa_stat_dec(var)		pisa_stat_add(var, -1)
+#define pisa_stat_read(var)		READ_ONCE(var)
+
+#define pisa_stat_atomic_add(var, val)	atomic64_add(val, &(var))
+#define pisa_stat_atomic_inc(var)	atomic64_inc(&(var))
+#define pisa_stat_atomic_read(var)	atomic64_read(&(var))
+
+/**
+ * struct pisa_alloc_stats - Per-allocator statistics, see pisa_allocs_show()
+ * @page_alloc_cnt:	PISA pages allocated for this allocator
+ * @page_free_cnt:	PISA pages released back to the buddy allocator
+ * @block_alloc_cnt:	Block allocations satisfied
+ * @block_free_cnt:	Block frees recycled into allocator
+ * @block_scrub_cnt:	Dirty blocks zeroed by background scrubber
+ * @numa_mismatch_cnt:	Block allocations satisfied from a non-target NUMA node
+ * @alloc_kd:		Sleepable non-zeroing block allocations
+ * @alloc_kc:		Sleepable zeroing block allocations served from clean_bitmap
+ * @alloc_ks:		Sleepable zeroing block allocations zeroed inline
+ * @alloc_ad:		Atomic non-zeroing block allocations
+ * @alloc_ac:		Atomic zeroing block allocations served from clean_bitmap
+ * @alloc_as:		Atomic zeroing block allocations zeroed inline
+ * @fail_backoff:	PISA page acquisitions skipped due to atomic backoff
+ * @fail_budget:	PISA page acquisitions refused by global pisa_max_pages
+ * @fail_nomem:		PISA page acquisitions that ran out of memory
+ * @fail_split:		split_page_compound() rejections
+ * @block_alloc_fail:	PISA page acquisitions that failed on empty allocator
+ * @fail_gfp:		pisa_alloc() calls declined due to unsupported GFP
+ * @page_map_cnt:	PISA page mappings established across all domains
+ * @fallback_nowindow:	Buffers mapped individually due to no usable IOVA window
+ * @fallback_noidx:	Buffers mapped individually due to exhausted domain indices
+ * @fallback_nohuge:	Buffers mapped individually because domain cannot use PISA
+ * @fallback_maperr:	Buffers mapped individually because PISA mapping failed
+ * @fallback_prot:	Buffers mapped individually due to protection mismatch
+ */
 struct pisa_alloc_stats {
+	/* Updated under @pa->lock. */
 	u64		page_alloc_cnt;
 	u64		page_free_cnt;
+	u64		block_alloc_cnt;
+	u64		block_free_cnt;
+	u64		block_scrub_cnt;
+	u64		numa_mismatch_cnt;
+	u64		alloc_kd;
+	u64		alloc_kc;
+	u64		alloc_ks;
+	u64		alloc_ad;
+	u64		alloc_ac;
+	u64		alloc_as;
+
+	/* Updated without @pa->lock (e.g. pisa_alloc_split_page() and map path). */
+	atomic64_t	fail_backoff;
+	atomic64_t	fail_budget;
+	atomic64_t	fail_nomem;
+	atomic64_t	fail_split;
+	atomic64_t	block_alloc_fail;
+	atomic64_t	fail_gfp;
+	atomic64_t	page_map_cnt;
+	atomic64_t	fallback_nowindow;
+	atomic64_t	fallback_noidx;
+	atomic64_t	fallback_nohuge;
+	atomic64_t	fallback_maperr;
+	atomic64_t	fallback_prot;
 };
 
 /**
@@ -195,6 +258,18 @@ static inline long pisa_alloc_held_pages(const struct pisa_alloc *pa)
 	       READ_ONCE(pa->num_idle_pages);
 }
 
+/* Reservoir statistics, in PISA pages, see pisa_reservoir_show(). */
+struct pisa_reservoir_stats {
+	/* Updated under @res->lock or by the per-node singleton @res->work. */
+	u64		hit;		/* requests for this node it served */
+	u64		refill;		/* PISA pages added by the refill */
+	u64		refill_err;	/* refill allocations that failed */
+	u64		trim;		/* PISA pages released by the trim */
+
+	/* Updated without @res->lock when the reservoir is empty. */
+	atomic64_t	miss;		/* requests for this node found it empty */
+};
+
 /* Per-NUMA-node PISA state. */
 struct pisa_node {
 	unsigned long		next_alloc;	/* atomic alloc backoff jiffies */
@@ -206,7 +281,27 @@ struct pisa_node {
 	unsigned int		nr_pages;
 	unsigned long		flags;		/* PISA_NODE_* requests */
 	struct work_struct	work;		/* refill/trim/scrub, on this node */
+	struct pisa_reservoir_stats stats;
 } ____cacheline_aligned_in_smp;
+
+/* Global reclaim and shrinker statistics, see pisa_allocs_show(). */
+struct pisa_reclaim_stats {
+	/* Updated by singleton pisa_reclaim_work. */
+	u64		reclaim_run;	/* pisa_reclaim_work_fn() runs */
+	u64		reclaim_pages;	/* PISA pages it released */
+
+	/* Updated locklessly. */
+	atomic64_t	shrink_scan;	/* pisa_shrink_scan() calls */
+	atomic64_t	pte_pages_res;	/* 4KB pages taken from the reservoirs */
+	atomic64_t	pte_pages_idle;	/* 4KB pages taken from idle allocators */
+	atomic64_t	unmap_fail;	/* PISA page unmaps that failed */
+};
+
+extern struct pisa_reclaim_stats pisa_reclaim_stats;
+
+extern char pisa_pages_2m[16];
+extern char pisa_pages_4k[16];
+extern char pisa_no_pages_2m[16];
 
 /* Per-NUMA-node PISA state (ring/TX/user allocators, reservoir). */
 extern struct pisa_node pisa_nodes[MAX_NUMNODES];
@@ -255,8 +350,6 @@ static inline void pisa_alloc_backoff(int nid, bool can_block)
 		WRITE_ONCE(pisa_nodes[nid].next_alloc, jiffies + DIV_ROUND_UP(HZ, 100));
 }
 bool pisa_want_decrypt(void);
-bool pisa_place_meta(struct pisa_meta *meta);
-void pisa_schedule_reclaim(void);
 int pisa_page_prepare(struct page *page, struct pisa_meta *meta);
 int pisa_page_unprepare(struct pisa_meta *meta);
 
@@ -267,6 +360,8 @@ __printf(2, 3)
 void pisa_set_name(struct pisa_alloc *pa, const char *fmt, ...);
 int pisa_enable_pcp(struct pisa_alloc *pa);
 void pisa_pcp_drain(struct pisa_alloc *pa);
+bool pisa_place_meta(struct pisa_meta *meta);
+void pisa_schedule_reclaim(void);
 void pisa_release_page(struct pisa_meta *meta);
 unsigned long pisa_alloc_bulk(struct pisa_alloc *pa, gfp_t gfp,
 			      unsigned long nr_pages, struct page **page_array, bool frozen);
@@ -300,7 +395,27 @@ void pisa_schedule_scrub_all(void);
 struct pisa_meta *pisa_reservoir_pop(int nid, gfp_t gfp, bool decrypt, bool *clean);
 unsigned long pisa_reservoir_count(void);
 unsigned long pisa_reservoir_shrink(struct list_head *release_list, unsigned long nr_to_scan);
+
+struct seq_file;
+void pisa_reservoir_show(struct seq_file *s);
+void pisa_user_show(struct seq_file *s);
 void pisa_user_boot_enable(void);
+
+/* One name/value pair of a debugfs statistics line. */
+struct pisa_kv {
+	const char *name;
+	s64 val;
+};
+
+void __pisa_seq_kv(struct seq_file *s, const char *title, const struct pisa_kv *st, unsigned int n);
+
+/* Print @title and fixed-width name/value pairs to debugfs seq_file @s. */
+#define pisa_seq_kv(s, title, ...)				\
+do {									\
+	const struct pisa_kv __st[] = { __VA_ARGS__ };		\
+									\
+	__pisa_seq_kv(s, title, __st, ARRAY_SIZE(__st));		\
+} while (0)
 
 #endif /* CONFIG_PISA */
 
@@ -316,6 +431,7 @@ void pisa_slots_init(void);
 int pisa_slot_alloc(struct pisa_meta *meta);
 void pisa_slot_free(unsigned int slot);
 int pisa_unmap_all(struct pisa_meta *meta);
+void pisa_domains_show(struct seq_file *s);
 int pisa_window_assign(struct device *dev, struct iommu_domain *domain, struct pisa_window *win);
 int __pisa_map_phys(dma_addr_t *iova, struct device *dev,
 		    struct iommu_domain *domain, phys_addr_t phys,
@@ -364,6 +480,7 @@ static inline void pisa_slots_init(void) {}
 static inline int pisa_slot_alloc(struct pisa_meta *meta) { return 0; }
 static inline void pisa_slot_free(unsigned int slot) {}
 static inline int pisa_unmap_all(struct pisa_meta *meta) { return 0; }
+static inline void pisa_domains_show(struct seq_file *s) {}
 
 static inline int pisa_map_phys(dma_addr_t *iova, struct device *dev,
 				struct iommu_domain *domain, phys_addr_t phys,

@@ -10,12 +10,11 @@
 #include <linux/dma-map-ops.h>
 #include <linux/dma-mapping.h>
 #include <linux/pisa.h>
-#include <linux/export.h>
 #include <linux/iommu.h>
 #include <linux/iova.h>
-#include <linux/memblock.h>
 #include <linux/mm.h>
 #include <linux/moduleparam.h>
+#include <linux/seq_file.h>
 #include <linux/slab.h>
 #include <linux/spinlock.h>
 #include <linux/srcu.h>
@@ -106,6 +105,8 @@ static struct {
 	struct iommu_domain *domain;
 	dma_addr_t base;
 	spinlock_t map_lock;	/* serialises iommu_map() in __pisa_map_phys() */
+	atomic_t slots;
+	char name[32];
 } pisa_domains[PISA_MAX_DOMAINS] __read_mostly;
 static DEFINE_SPINLOCK(pisa_domains_lock);
 
@@ -115,12 +116,56 @@ DEFINE_STATIC_SRCU(pisa_srcu);
 /* Bumped under pisa_domains_lock whenever a domain index is released. */
 unsigned int pisa_idx_gen __read_mostly;
 
+void pisa_domains_show(struct seq_file *s)
+{
+	unsigned int active = 0, draining = 0;
+	char bmap[PISA_MAX_DOMAINS];
+	unsigned long flags;
+	int idx;
+
+	spin_lock_irqsave(&pisa_domains_lock, flags);
+	for (idx = 0; idx < PISA_MAX_DOMAINS; idx++) {
+		if (pisa_domains[idx].domain) {
+			active++;
+			bmap[idx] = '1';
+		} else if (pisa_domains[idx].base) {
+			draining++;
+			bmap[idx] = 'd';
+		} else {
+			bmap[idx] = '.';
+		}
+	}
+	spin_unlock_irqrestore(&pisa_domains_lock, flags);
+
+	pisa_seq_kv(s, "domains", { "active", active }, { "draining", draining },
+		    { "max", PISA_MAX_DOMAINS });
+	for (idx = 0; idx < PISA_MAX_DOMAINS; idx++) {
+		if ((idx & 63) == 0)
+			seq_printf(s, "  %-12s", idx ? "" : "domains_map");
+		if ((idx & 7) == 0)
+			seq_putc(s, ' ');
+		seq_putc(s, bmap[idx]);
+		if ((idx & 63) == 63 || idx == PISA_MAX_DOMAINS - 1)
+			seq_putc(s, '\n');
+	}
+
+	spin_lock_irqsave(&pisa_domains_lock, flags);
+	for (idx = 0; idx < PISA_MAX_DOMAINS; idx++) {
+		if (!pisa_domains[idx].domain)
+			continue;
+		seq_printf(s, "  domain_%-5d base %pad size %lluM slots %d name %s\n",
+			   idx, &pisa_domains[idx].base, pisa_window_size >> 20,
+			   atomic_read(&pisa_domains[idx].slots), pisa_domains[idx].name);
+	}
+	spin_unlock_irqrestore(&pisa_domains_lock, flags);
+}
 /* Report a short IOMMU unmap and mark @meta quarantined so it is never reused. */
 static void pisa_quarantine_meta(struct pisa_meta *meta, struct iommu_domain *domain,
 				 int idx, dma_addr_t iova, size_t unmapped)
 {
 	pr_err_ratelimited("pisa: unmap of IOVA %pad in domain %p (index %d) returned %zu, quarantining PISA page\n",
 			   &iova, domain, idx, unmapped);
+	pisa_stat_atomic_inc(pisa_reclaim_stats.unmap_fail);
 	WRITE_ONCE(meta->flags, meta->flags | PISA_QUARANTINED);
 }
 
@@ -142,6 +187,7 @@ int pisa_unmap_all(struct pisa_meta *meta)
 
 		if (!test_and_clear_bit(idx, meta->domains_mapped))
 			continue;
+		atomic_dec(&pisa_domains[idx].slots);
 
 		spin_lock_irqsave(&pisa_domains_lock, flags);
 		domain = pisa_domains[idx].domain;
@@ -217,6 +263,8 @@ void pisa_domain_release(struct iommu_domain *domain)
 	/* Mark slot FREE and bump @pisa_idx_gen so NOIDX domains retry. */
 	spin_lock_irqsave(&pisa_domains_lock, flags);
 	pisa_domains[idx].base = 0;
+	atomic_set(&pisa_domains[idx].slots, 0);
+	pisa_domains[idx].name[0] = '\0';
 	WRITE_ONCE(pisa_idx_gen, pisa_idx_gen + 1);
 	spin_unlock_irqrestore(&pisa_domains_lock, flags);
 
@@ -239,6 +287,7 @@ static unsigned int pisa_unmap_domain_locked(struct pisa_meta *meta,
 
 	if (!test_and_clear_bit(idx, meta->domains_mapped))
 		return 0;
+	atomic_dec(&pisa_domains[idx].slots);
 
 	unmapped = iommu_unmap_fast(domain, iova, PISA_SIZE, gather);
 	if (unlikely(unmapped != PISA_SIZE))
@@ -388,6 +437,9 @@ int pisa_window_assign(struct device *dev, struct iommu_domain *domain, struct p
 			pisa_domains[idx].domain = domain;
 			pisa_domains[idx].base = base;
 			spin_lock_init(&pisa_domains[idx].map_lock);
+			atomic_set(&pisa_domains[idx].slots, 0);
+			strscpy(pisa_domains[idx].name, dev_name(dev),
+				sizeof(pisa_domains[idx].name));
 			WRITE_ONCE(win->domain_idx, idx + PISA_IDX_FIRST);
 			/* Publish .domain_idx before .base (paired with is_pisa_iova()). */
 			smp_store_release(&win->base, base);
@@ -435,8 +487,10 @@ int __pisa_map_phys(dma_addr_t *iova, struct device *dev,
 
 	/* Every leaf PTE of the page carries IOMMU_CACHE | @meta->prot. */
 	block_prot = IOMMU_CACHE | meta->prot;
-	if (unlikely(prot & ~block_prot))
+	if (unlikely(prot & ~block_prot)) {
+		pisa_stat_atomic_inc(meta->pa->stats.fallback_prot);
 		return -EACCES;
+	}
 
 	/* Acquire pairs with the .base release in pisa_window_assign(). */
 	if (unlikely(!smp_load_acquire(&win->base))) {
@@ -445,8 +499,15 @@ int __pisa_map_phys(dma_addr_t *iova, struct device *dev,
 		if (likely(!ret))
 			ret = pisa_window_assign(dev, domain, win);
 
-		if (ret)
+		if (ret) {
+			if (ret == -EOPNOTSUPP)
+				pisa_stat_atomic_inc(meta->pa->stats.fallback_nohuge);
+			else if (ret == -EBUSY)
+				pisa_stat_atomic_inc(meta->pa->stats.fallback_noidx);
+			else
+				pisa_stat_atomic_inc(meta->pa->stats.fallback_nowindow);
 			return ret;
+		}
 	}
 
 	addr = pisa_phys_to_iova(win, meta, phys);
@@ -454,8 +515,10 @@ int __pisa_map_phys(dma_addr_t *iova, struct device *dev,
 	/* Check @dev's own DMA mask and bus limit against the window IOVA. */
 	limit = min_not_zero(dma_get_mask(dev), dev->bus_dma_limit);
 	limit = min_not_zero(limit, dev->coherent_dma_mask);
-	if (unlikely(addr + size - 1 > limit))
+	if (unlikely(addr + size - 1 > limit)) {
+		pisa_stat_atomic_inc(meta->pa->stats.fallback_nowindow);
 		return -ENOSPC;
+	}
 
 	domain_idx = win->domain_idx - PISA_IDX_FIRST;
 	if (likely(test_bit(domain_idx, meta->domains_mapped))) {
@@ -471,10 +534,14 @@ int __pisa_map_phys(dma_addr_t *iova, struct device *dev,
 
 		ret = iommu_map(domain, pisa_phys_to_iova(win, meta, pisa_phys),
 				pisa_pte_phys(meta, pisa_phys), PISA_SIZE, block_prot, GFP_ATOMIC);
-		if (likely(!ret)) {
+		if (unlikely(ret)) {
+			pisa_stat_atomic_inc(meta->pa->stats.fallback_maperr);
+		} else {
 			/* Ensure leaf PTE is visible before setting the domain bit. */
 			smp_mb__before_atomic();
 			set_bit(domain_idx, meta->domains_mapped);
+			atomic_inc(&pisa_domains[domain_idx].slots);
+			pisa_stat_atomic_inc(meta->pa->stats.page_map_cnt);
 		}
 	}
 	spin_unlock_irqrestore(&pisa_domains[domain_idx].map_lock, flags);

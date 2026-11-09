@@ -15,6 +15,7 @@
 #include <linux/nodemask.h>
 #include <linux/sched.h>
 #include <linux/sched/mm.h>
+#include <linux/seq_file.h>
 #include <linux/spinlock.h>
 #include <linux/topology.h>
 #include <linux/workqueue.h>
@@ -139,8 +140,10 @@ static void pisa_reservoir_refill_node(int nid)
 
 		meta = __pisa_page_alloc(GFP_KERNEL | __GFP_THISNODE, nid, true,
 					 pisa_want_decrypt(), &clean);
-		if (IS_ERR(meta))
+		if (IS_ERR(meta)) {
+			pisa_stat_inc(res->stats.refill_err);
 			break;
+		}
 
 		/* Decrypted and init_on_alloc/init_on_free pages are already zeroed. */
 		if (!clean)
@@ -149,6 +152,7 @@ static void pisa_reservoir_refill_node(int nid)
 		spin_lock_irqsave(&res->lock, flags);
 		list_add(&meta->list, &res->pages);
 		res->nr_pages++;
+		pisa_stat_inc(res->stats.refill);
 		spin_unlock_irqrestore(&res->lock, flags);
 
 		cond_resched();
@@ -169,6 +173,7 @@ static void pisa_reservoir_trim_node(int nid, unsigned int max)
 		if (meta) {
 			list_del_init(&meta->list);
 			res->nr_pages--;
+			pisa_stat_inc(res->stats.trim);
 		}
 		spin_unlock_irqrestore(&res->lock, flags);
 		if (!meta)
@@ -184,8 +189,7 @@ void pisa_schedule_scrub(int nid)
 {
 	struct pisa_node *node;
 
-	if ((!READ_ONCE(pisa_scrub_max) && !READ_ONCE(pisa_scrub_migrate)) ||
-	    nid == NUMA_NO_NODE)
+	if (!READ_ONCE(pisa_scrub_max) && !READ_ONCE(pisa_scrub_migrate))
 		return;
 
 	node = &pisa_nodes[nid];
@@ -253,6 +257,7 @@ static struct pisa_meta *pisa_reservoir_pop_node(int nid, unsigned int max, bool
 	if (meta && !!(meta->flags & PISA_DECRYPTED) == decrypt) {
 		list_del_init(&meta->list);
 		res->nr_pages--;
+		pisa_stat_inc(res->stats.hit);
 		refill = res->nr_pages <= max / 2;
 	} else {
 		meta = NULL;
@@ -282,6 +287,7 @@ struct pisa_meta *pisa_reservoir_pop(int nid, gfp_t gfp, bool decrypt, bool *cle
 			*clean = true;
 			return meta;
 		}
+		pisa_stat_atomic_inc(pisa_nodes[nid].stats.miss);
 		/* Empty: pop_node() only schedules after a successful pop. */
 		pisa_schedule_reservoir_node(nid);
 	}
@@ -337,5 +343,36 @@ void __init pisa_node_init(void)
 		spin_lock_init(&pisa_nodes[nid].lock);
 		INIT_LIST_HEAD(&pisa_nodes[nid].pages);
 		INIT_WORK(&pisa_nodes[nid].work, pisa_node_work_fn);
+	}
+}
+
+/* Print the reservoir of each node that has seen any activity. */
+void pisa_reservoir_show(struct seq_file *s)
+{
+	bool header = false;
+	int nid;
+
+	for_each_node_state(nid, N_MEMORY) {
+		struct pisa_node *res = &pisa_nodes[nid];
+		unsigned int nr = READ_ONCE(res->nr_pages);
+		s64 refill = pisa_stat_read(res->stats.refill);
+		s64 refill_err = pisa_stat_read(res->stats.refill_err);
+		s64 miss = pisa_stat_atomic_read(res->stats.miss);
+		char title[16];
+
+		/* Pages served or trimmed were refilled first. */
+		if (!nr && !refill && !refill_err && !miss)
+			continue;
+		if (!header) {
+			seq_puts(s, "reservoir\n");
+			header = true;
+		}
+		snprintf(title, sizeof(title), "node_%d", nid);
+		pisa_seq_kv(s, title, { pisa_pages_2m, nr },
+			    { "hit", pisa_stat_read(res->stats.hit) },
+			    { "miss", miss });
+		pisa_seq_kv(s, title, { "refill", refill },
+			    { "refill_err", refill_err },
+			    { "trim", pisa_stat_read(res->stats.trim) });
 	}
 }

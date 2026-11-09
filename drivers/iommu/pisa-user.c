@@ -21,6 +21,7 @@
 #include <linux/pagewalk.h>
 #include <linux/folio_batch.h>
 #include <linux/sched/clock.h>
+#include <linux/seq_file.h>
 #include <linux/swap.h>
 
 #include "pisa-priv.h"
@@ -88,6 +89,26 @@ module_param_cb(scrub_migrate, &pisa_scrub_migrate_ops, &pisa_scrub_migrate, 064
 static bool pisa_user_ready __read_mostly;
 static DEFINE_MUTEX(pisa_user_lock);
 
+/* Statistics, see pisa_user_show(). */
+struct pisa_user_stats {
+	atomic64_t	in;		/* pages migrated into PISA blocks */
+	atomic64_t	in_fail;	/* ... isolated but not migrated */
+	atomic64_t	out;		/* pages migrated back to ordinary pages */
+	atomic64_t	out_fail;	/* ... isolated but not migrated */
+	atomic64_t	no_budget;	/* pages not moved in: cap reached */
+	atomic64_t	busy;		/* pages skipped: referenced elsewhere */
+	atomic64_t	large;		/* pages skipped: in a large anon folio */
+	atomic64_t	copy;		/* TCP chunks copied: page not in PISA */
+};
+
+static struct pisa_user_stats pisa_user_stats;
+
+/* Called by zerocopy_fill_skb_from_iter() when it asks TCP to copy. */
+void pisa_stats_inc_user_copy(void)
+{
+	pisa_stat_atomic_inc(pisa_user_stats.copy);
+}
+
 /* Lazily create per-node user allocators on first use (process context). */
 static bool pisa_user_init(void)
 {
@@ -141,6 +162,9 @@ static unsigned long pisa_user_in_use(void)
 	unsigned long used = 0;
 	int nid;
 
+	/* Pairs with smp_store_release() in pisa_user_init(). */
+	if (!smp_load_acquire(&pisa_user_ready))
+		return 0;
 	for_each_node_state(nid, N_MEMORY) {
 		unsigned int dir;
 
@@ -255,7 +279,7 @@ static unsigned int pisa_user_migrate_dir(struct list_head *list, bool to_pisa,
 		.same_alloc = same_alloc,
 	};
 	enum migrate_mode mode = MIGRATE_SYNC;
-	unsigned int done = 0;
+	unsigned int nr, done = 0;
 
 	if (list_empty(list))
 		return 0;
@@ -264,9 +288,17 @@ static unsigned int pisa_user_migrate_dir(struct list_head *list, bool to_pisa,
 		if (!gfpflags_allow_blocking(gfp))
 			mode = MIGRATE_ASYNC;
 	}
+	nr = list_count_nodes(list);	/* all order-0 */
 	if (migrate_pages(list, to_pisa ? pisa_user_new_folio : pisa_user_old_folio,
 			  NULL, (unsigned long)&mtc, mode, MR_SYSCALL, &done))
 		putback_movable_pages(list);
+	if (to_pisa) {
+		pisa_stat_atomic_add(pisa_user_stats.in, done);
+		pisa_stat_atomic_add(pisa_user_stats.in_fail, nr - done);
+	} else {
+		pisa_stat_atomic_add(pisa_user_stats.out, done);
+		pisa_stat_atomic_add(pisa_user_stats.out_fail, nr - done);
+	}
 	return done;
 }
 
@@ -285,7 +317,7 @@ bool pisa_upgrade_user_pages(struct page **pages, unsigned int nr,
 	int extra = pinned ? GUP_PIN_COUNTING_BIAS : 1;
 	bool drained = false;
 	LIST_HEAD(list);
-	unsigned int i, want = 0, need_budget = 0;
+	unsigned int i, want = 0, need_budget = 0, large = 0;
 
 	if (!pisa_user_init())
 		return false;
@@ -293,15 +325,21 @@ bool pisa_upgrade_user_pages(struct page **pages, unsigned int nr,
 	for (i = 0; i < nr; i++) {
 		struct folio *folio = page_folio(pages[i]);
 
+		/* THP/mTHP heap pages are never migrated, see pisa_user_want() */
+		large += folio_test_large(folio) && folio_test_anon(folio);
 		if (pisa_user_want_dir(folio, true, dir, false)) {
 			want++;
 			need_budget += !is_pisa_pfn(folio_pfn(folio));
 		}
 	}
+	if (large)
+		pisa_stat_atomic_add(pisa_user_stats.large, large);
 	if (!want)
 		return false;
-	if (need_budget && pisa_user_budget() <= 0)
+	if (need_budget && pisa_user_budget() <= 0) {
+		pisa_stat_atomic_add(pisa_user_stats.no_budget, need_budget);
 		return false;
+	}
 	for (i = 0; i < nr; i++) {
 		struct folio *folio = page_folio(pages[i]);
 
@@ -312,8 +350,10 @@ bool pisa_upgrade_user_pages(struct page **pages, unsigned int nr,
 			lru_add_drain();
 			drained = true;
 		}
-		if (pisa_user_busy(folio, extra))
+		if (pisa_user_busy(folio, extra)) {
+			pisa_stat_atomic_inc(pisa_user_stats.busy);
 			continue;
+		}
 		isolate_folio_to_list(folio, &list);
 	}
 	if (list_empty(&list))
@@ -583,9 +623,14 @@ int pisa_madvise(struct vm_area_struct *vma, unsigned long start, unsigned long 
 		struct folio *folio = folio_walk_start(&fw, vma, addr, 0);
 
 		if (folio) {
-			if (pisa_user_want_dir(folio, to_pisa, DMA_TO_DEVICE, false) &&
-			    !pisa_user_busy(folio, 0) && isolate_folio_to_list(folio, &list))
-				n++;
+			if (to_pisa && folio_test_large(folio) && folio_test_anon(folio)) {
+				pisa_stat_atomic_inc(pisa_user_stats.large);
+			} else if (pisa_user_want_dir(folio, to_pisa, DMA_TO_DEVICE, false)) {
+				if (pisa_user_busy(folio, 0))
+					pisa_stat_atomic_inc(pisa_user_stats.busy);
+				else if (isolate_folio_to_list(folio, &list))
+					n++;
+			}
 			folio_walk_end(&fw, vma);
 		}
 		if (n == PISA_USER_BATCH) {
@@ -596,4 +641,22 @@ int pisa_madvise(struct vm_area_struct *vma, unsigned long start, unsigned long 
 	}
 	pisa_user_migrate_dir(&list, to_pisa, DMA_TO_DEVICE, false, gfp);
 	return 0;
+}
+
+/* Print user page state and migration statistics to debugfs seq_file @s. */
+void pisa_user_show(struct seq_file *s)
+{
+	seq_puts(s, "user\n");
+	pisa_seq_kv(s, pisa_pages_4k, { "in_use", pisa_user_in_use() },
+		    { "max", pisa_user_max_4k_pages });
+	pisa_seq_kv(s, "migrate",
+		    { "in", pisa_stat_atomic_read(pisa_user_stats.in) },
+		    { "in_fail", pisa_stat_atomic_read(pisa_user_stats.in_fail) },
+		    { "out", pisa_stat_atomic_read(pisa_user_stats.out) },
+		    { "out_fail", pisa_stat_atomic_read(pisa_user_stats.out_fail) });
+	pisa_seq_kv(s, "skipped",
+		    { "no_budget", pisa_stat_atomic_read(pisa_user_stats.no_budget) },
+		    { "busy", pisa_stat_atomic_read(pisa_user_stats.busy) },
+		    { "large", pisa_stat_atomic_read(pisa_user_stats.large) },
+		    { "copy", pisa_stat_atomic_read(pisa_user_stats.copy) });
 }

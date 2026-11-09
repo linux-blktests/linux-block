@@ -147,6 +147,7 @@ bool pisa_folio_upgrade(struct folio *folio, enum dma_data_direction dir,
 bool __pisa_bdev_enabled(struct block_device *bdev, enum dma_data_direction dir);
 bool __pisa_mapping_enabled(const struct address_space *mapping,
 			    enum dma_data_direction dir);
+void pisa_stats_inc_user_copy(void);
 int pisa_madvise(struct vm_area_struct *vma, unsigned long start,
 		 unsigned long end, bool to_pisa);
 
@@ -329,6 +330,10 @@ pisa_filemap_alloc(const struct address_space *mapping, gfp_t gfp,
 		   unsigned int order, bool is_write)
 {
 	return NULL;
+}
+
+static inline void pisa_stats_inc_user_copy(void)
+{
 }
 
 static inline int pisa_madvise(struct vm_area_struct *vma, unsigned long start,

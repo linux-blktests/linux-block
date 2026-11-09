@@ -291,9 +291,9 @@ static int fake_domain_setup(struct kunit *test)
 
 static void test_map_and_domain_lifecycle(struct kunit *test)
 {
+	struct shrink_control sc = { .nr_to_scan = ULONG_MAX };
 	struct device dev = { .init_name = "pisa_map_kunit", .numa_node = NUMA_NO_NODE,
 			      .coherent_dma_mask = DMA_BIT_MASK(64) };
-	struct shrink_control sc = { .nr_to_scan = ULONG_MAX };
 	struct pisa_window *win;
 	struct pisa_meta *meta;
 	struct pisa_alloc *pa;
@@ -574,14 +574,15 @@ static void test_gfp_pisa(struct kunit *test)
 
 static void test_reservoir_and_scrubber(struct kunit *test)
 {
+	struct shrink_control sc = { .nr_to_scan = ULONG_MAX };
 	unsigned int old_res = READ_ONCE(pisa_reservoir_max);
 	unsigned int old_scrub = READ_ONCE(pisa_scrub_max);
-	struct shrink_control sc = { .nr_to_scan = ULONG_MAX };
 	struct pisa_meta *meta;
 	struct pisa_alloc *pa;
 	struct page *p;
 	int nid;
 
+	KUNIT_ASSERT_EQ(test, pisa_meta_init(), 0);
 	pisa_shrink_scan(NULL, &sc);
 
 	/* Refill reservoir to 1 PISA page per memory node, then consume one. */
@@ -607,9 +608,9 @@ static void test_reservoir_and_scrubber(struct kunit *test)
 			WRITE_ONCE(pisa_scrub_max, 512);
 			pisa_scrub_node(pa->nid);
 			KUNIT_EXPECT_EQ(test, meta->nr_dirty, 0U);
+			KUNIT_EXPECT_GE(test, pa->stats.block_scrub_cnt, 1ULL);
 		}
 	}
-	pisa_shrink_scan(NULL, &sc);
 
 	/* Trim reservoirs back to 0. */
 	WRITE_ONCE(pisa_reservoir_max, 0);

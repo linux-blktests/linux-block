@@ -693,6 +693,8 @@ static bool pisa_zc_iter(int *ret, struct sk_buff *skb, struct iov_iter *from, s
 	if (keep)
 		return false;
 
+	if (skb->len == orig_len)
+		pisa_stats_inc_user_copy();
 	*ret = (skb->len != orig_len) ? 0 : -EXDEV;
 	return true;
 }
