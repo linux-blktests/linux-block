@@ -36,6 +36,7 @@
 #include <trace/events/swiotlb.h>
 
 #include "dma-iommu.h"
+#include "pisa-priv.h"
 #include "iommu-pages.h"
 #include "iommu-priv.h"
 
@@ -76,6 +77,8 @@ struct iommu_dma_cookie {
 	struct iommu_domain *fq_domain;
 	/* Options for dma-iommu use */
 	struct iommu_dma_options options;
+	/* IOVA window reserved for PISA pages. Nothing else can go here. */
+	struct pisa_window win_pisa;
 };
 
 struct iommu_dma_msi_cookie {
@@ -1213,6 +1216,21 @@ static inline size_t iova_unaligned(struct iova_domain *iovad, phys_addr_t phys,
 				    size_t size)
 {
 	return iova_offset(iovad, phys | size);
+}
+
+/* Return @domain's PISA window, or NULL if @domain cannot use PISA. */
+struct pisa_window *pisa_dma_window(struct iommu_domain *domain)
+{
+	if (static_branch_unlikely(&iommu_deferred_attach_enabled) ||
+	    !domain || domain->cookie_type != IOMMU_COOKIE_DMA_IOVA)
+		return NULL;
+
+	return &domain->iova_cookie->win_pisa;
+}
+
+struct iova_domain *pisa_dma_iovad(struct iommu_domain *domain)
+{
+	return pisa_dma_window(domain) ? &domain->iova_cookie->iovad : NULL;
 }
 
 dma_addr_t iommu_dma_map_phys(struct device *dev, phys_addr_t phys, size_t size,

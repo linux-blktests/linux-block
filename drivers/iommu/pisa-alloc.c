@@ -84,10 +84,12 @@ static void pisa_release_page_rcu(struct rcu_head *head)
 	/* Read @meta before freeing blocks; the frame can be reused immediately. */
 	struct pisa_meta *meta = container_of(head, struct pisa_meta, rcu);
 	struct page *block, *page = pfn_to_page(pisa_meta_to_pfn(meta));
-	unsigned int i, order = meta->pa->order;
+	unsigned int i, order = meta->pa->order, slot = meta->slot;
 
 	WRITE_ONCE(meta->pa, NULL);
 
+	/* The page has been unmapped from every domain by pisa_release_page() */
+	pisa_slot_free(slot);
 	atomic_long_dec(&pisa_nr_pages);
 	for (i = 0; i < PISA_BLOCKS(order); i++) {
 		block = page + (i << order);
@@ -426,10 +428,16 @@ static struct pisa_meta *pisa_alloc_split_page(unsigned int order, gfp_t gfp, in
 	if (IS_ERR(meta))
 		return meta;
 
+	if (unlikely(pisa_slot_alloc(meta))) {
+		pisa_release_page(meta);
+		return ERR_PTR(-ENOSPC);
+	}
+
 	page = pfn_to_page(pisa_meta_to_pfn(meta));
 
 	/* Fails with -EBUSY if a concurrent PFN walker holds a speculative ref. */
 	if (split_page_compound(page, PISA_ORDER, order)) {
+		pisa_slot_free(meta->slot);
 		pisa_release_page(meta);
 		pisa_alloc_backoff(nid, can_block);
 		return ERR_PTR(-EBUSY);
@@ -781,6 +789,8 @@ static int __init pisa_init(void)
 	/* Default ceiling is 1/8th of RAM (floor of 16 PISA pages). */
 	if (!pisa_max_pages)
 		pisa_max_pages = max(totalram_pages() >> (PISA_ORDER + 3), 16UL);
+
+	pisa_slots_init();
 
 	/* Preallocate the supported per-node allocators. */
 	for_each_node_state(nid, N_MEMORY) {

@@ -10,6 +10,7 @@
 #include <linux/skbuff.h>
 #include <net/sock.h>
 
+#include "dma-iommu.h"
 #include "pisa-priv.h"
 
 static void test_meta_init_and_roundtrip(struct kunit *test)
@@ -179,6 +180,26 @@ static void test_alloc_and_recycle(struct kunit *test)
 	WRITE_ONCE(pisa_max_pages, old_max);
 }
 
+#ifdef CONFIG_IOMMU_DMA
+static void test_window_helpers(struct kunit *test)
+{
+	struct pisa_window win = {};
+
+	KUNIT_ASSERT_EQ(test, pisa_meta_init(), 0);
+
+	/* Empty window (base == 0) never owns any IOVA. */
+	KUNIT_EXPECT_FALSE(test, is_pisa_iova(&win, 0));
+	KUNIT_EXPECT_FALSE(test, is_pisa_iova(&win, SZ_4G));
+
+	win.base = SZ_4G;
+	KUNIT_EXPECT_FALSE(test, is_pisa_iova(&win, SZ_4G - 1));
+	KUNIT_EXPECT_TRUE(test, is_pisa_iova(&win, SZ_4G));
+	KUNIT_EXPECT_TRUE(test, is_pisa_iova(&win, SZ_4G + pisa_window_size - 1));
+	KUNIT_EXPECT_FALSE(test, is_pisa_iova(&win, SZ_4G + pisa_window_size));
+}
+
+#endif /* CONFIG_IOMMU_DMA */
+
 static void test_reservoir_and_scrubber(struct kunit *test)
 {
 	KUNIT_ASSERT_EQ(test, pisa_meta_init(), 0);
@@ -190,6 +211,9 @@ static struct kunit_case pisa_meta_test_cases[] = {
 	KUNIT_CASE(test_meta_invalid_phys),
 	KUNIT_CASE(test_meta_active_toggle),
 	KUNIT_CASE(test_alloc_and_recycle),
+#ifdef CONFIG_IOMMU_DMA
+	KUNIT_CASE(test_window_helpers),
+#endif
 	KUNIT_CASE(test_reservoir_and_scrubber),
 	{}
 };

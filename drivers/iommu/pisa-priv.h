@@ -13,11 +13,34 @@
 #include <linux/types.h>
 #include <linux/workqueue.h>
 
+/**
+ * struct pisa_window - A domain's IOVA window reserved for PISA pages
+ * @base: Window base IOVA (PISA_SIZE aligned), or 0 if unassigned
+ * @domain_idx: Dense index + PISA_IDX_FIRST, or PISA_IDX_* sentinel while @base == 0
+ * @idx_gen: Value of pisa_idx_gen when @domain_idx was set to NOIDX
+ *
+ * Lives in iommu_dma_cookie. Active PISA pages map at @base + slot * PISA_SIZE.
+ */
+struct pisa_window {
+	dma_addr_t base;
+	u16 domain_idx;
+	u32 idx_gen;
+};
+
 #ifdef CONFIG_PISA
 
 #define PISA_MAX_BLOCKS		512U
 
 #define PISA_BLOCKS(order)	(1U << (PISA_ORDER - (order)))
+
+/* Sentinel values of pisa_window.domain_idx below PISA_IDX_FIRST. */
+enum {
+	PISA_IDX_NONE,	/* not attempted yet */
+	PISA_IDX_NOHUGE,	/* @domain can never use PISA */
+	PISA_IDX_NOWINDOW,	/* no IOVA range for the window */
+	PISA_IDX_NOIDX,	/* all domain indices were in use */
+	PISA_IDX_FIRST,	/* first valid domain index */
+};
 
 /*
  * Lock hierarchy:
@@ -32,6 +55,7 @@
  * @nr_clean:	Zeroed available blocks in @clean_bitmap
  * @nr_dirty:	Dirty available blocks in @dirty_bitmap
  * @on_list:	Current placement in @pa (enum pisa_meta_list)
+ * @slot:	Dense IOVA slot index in every domain's window
  * @pa:		Owning pisa_alloc (NULL for reservoir pages)
  * @list:	Node in @pa lists or per-node reservoir (pisa_node.pages)
  * @llnode:	Node in lockless pisa_free_list for async release to the buddy allocator
@@ -44,6 +68,7 @@ struct pisa_meta {
 	u16 nr_clean;
 	u16 nr_dirty;
 	u8 on_list;
+	u32 slot;
 	struct pisa_alloc *pa;
 	struct list_head list;
 
@@ -172,4 +197,37 @@ unsigned long pisa_reservoir_count(void);
 unsigned long pisa_reservoir_shrink(struct list_head *release_list, unsigned long nr_to_scan);
 
 #endif /* CONFIG_PISA */
+
+#if defined(CONFIG_PISA) && defined(CONFIG_IOMMU_DMA)
+
+/* Size in bytes of every domain's PISA IOVA window, fixed at boot. */
+extern u64 pisa_window_size;
+extern unsigned int pisa_nr_slots;
+
+void pisa_slots_init(void);
+int pisa_slot_alloc(struct pisa_meta *meta);
+void pisa_slot_free(unsigned int slot);
+
+/* Return true if @dma falls within @win's reserved PISA IOVA window. */
+static inline bool is_pisa_iova(const struct pisa_window *win, dma_addr_t dma)
+{
+	/* Acquire pairs with the release of @base in pisa_window_assign(). */
+	dma_addr_t base = smp_load_acquire(&win->base);
+
+	return base && dma - base < pisa_window_size;
+}
+
+#else /* !CONFIG_PISA || !CONFIG_IOMMU_DMA */
+
+#define pisa_nr_slots 0U
+static inline void pisa_slots_init(void) {}
+static inline int pisa_slot_alloc(struct pisa_meta *meta) { return 0; }
+static inline void pisa_slot_free(unsigned int slot) {}
+
+static inline bool is_pisa_iova(const struct pisa_window *win, dma_addr_t dma)
+{
+	return false;
+}
+
+#endif /* CONFIG_PISA && CONFIG_IOMMU_DMA */
 #endif /* _DRIVERS_IOMMU_PISA_PRIV_H */
