@@ -100,6 +100,7 @@ struct pisa_alloc {
 /* Per-NUMA-node PISA state. */
 struct pisa_node {
 	unsigned long		next_alloc;	/* atomic alloc backoff jiffies */
+	struct pisa_alloc	*pa[2][PISA_ORDER + 1]; /* [0]=RW, [1]=RO by order */
 
 	spinlock_t		lock;		/* protects @pages and @nr_pages */
 	struct list_head	pages;		/* reservoir */
@@ -113,11 +114,6 @@ extern struct pisa_node pisa_nodes[MAX_NUMNODES];
 int pisa_meta_ensure_pfn(unsigned long pfn, bool can_block);
 struct pisa_meta *pisa_meta_of_pfn(unsigned long pfn);
 unsigned long pisa_meta_to_pfn(const struct pisa_meta *meta);
-
-struct pisa_alloc *pisa_create(int nid, unsigned int order, enum dma_data_direction dir);
-__printf(2, 3)
-void pisa_set_name(struct pisa_alloc *pa, const char *fmt, ...);
-void pisa_release_page(struct pisa_meta *meta);
 
 static inline int pisa_sanitize_nid(int nid)
 {
@@ -133,6 +129,24 @@ static inline void pisa_alloc_backoff(int nid, bool can_block)
 	nid = pisa_sanitize_nid(nid);
 	if (!can_block)
 		WRITE_ONCE(pisa_nodes[nid].next_alloc, jiffies + DIV_ROUND_UP(HZ, 100));
+}
+
+/* pisa-alloc.c, also used by the per-node code in pisa-node.c */
+struct pisa_alloc *pisa_create(int nid, unsigned int order, enum dma_data_direction dir);
+struct pisa_alloc *pisa_node_pa(int nid, unsigned int order, bool ro);
+__printf(2, 3)
+void pisa_set_name(struct pisa_alloc *pa, const char *fmt, ...);
+void pisa_release_page(struct pisa_meta *meta);
+unsigned long pisa_alloc_bulk(struct pisa_alloc *pa, gfp_t gfp,
+			      unsigned long nr_pages, struct page **page_array, bool frozen);
+
+static inline struct page *pisa_alloc(struct pisa_alloc *pa, gfp_t gfp)
+{
+	struct page *page = NULL;
+
+	if (pa)
+		pisa_alloc_bulk(pa, gfp, 1, &page, false);
+	return page;
 }
 
 /* pisa-node.c: per-NUMA-node PISA page reservoir and work item */

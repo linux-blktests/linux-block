@@ -7,6 +7,7 @@
 #include <linux/bitops.h>
 #include <linux/jump_label.h>
 #include <linux/mm.h>
+#include <linux/numa.h>
 #include <linux/rcupdate.h>
 
 #ifdef CONFIG_PISA
@@ -72,6 +73,11 @@ static inline bool pisa_free_page(struct page *page)
 	return ret;
 }
 
+unsigned long pisa_alloc_pages_bulk(gfp_t gfp, unsigned int order,
+				    int preferred_nid, nodemask_t *nodemask,
+				    int nr_pages, struct page **page_array,
+				    bool frozen);
+
 #else /* !CONFIG_PISA */
 
 static inline int pisa_meta_init(void)
@@ -91,7 +97,25 @@ static inline bool pisa_free_page(struct page *page)
 	return false;
 }
 
+static inline unsigned long
+pisa_alloc_pages_bulk(gfp_t gfp, unsigned int order, int preferred_nid,
+		      nodemask_t *nodemask, int nr_pages,
+		      struct page **page_array, bool frozen)
+{
+	return 0;
+}
+
 #endif /* CONFIG_PISA */
+
+static inline struct page *
+pisa_alloc_pages(gfp_t gfp, unsigned int order, int preferred_nid,
+		 nodemask_t *nodemask)
+{
+	struct page *page = NULL;
+
+	pisa_alloc_pages_bulk(gfp, order, preferred_nid, nodemask, 1, &page, true);
+	return page;
+}
 
 static inline bool is_pisa_phys(phys_addr_t phys)
 {
@@ -102,4 +126,5 @@ static inline bool is_pisa_page(const struct page *page)
 {
 	return is_pisa_pfn(page_to_pfn(page));
 }
+
 #endif /* _LINUX_PISA_H */

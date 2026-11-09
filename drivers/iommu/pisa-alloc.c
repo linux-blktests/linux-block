@@ -14,13 +14,19 @@
 #include <linux/gfp.h>
 #include <linux/list.h>
 #include <linux/llist.h>
+#include <linux/memcontrol.h>
 #include <linux/mm.h>
 #include <linux/moduleparam.h>
 #include <linux/mutex.h>
+#include <linux/page_owner.h>
+#include <linux/pgalloc_tag.h>
 #include <linux/rcupdate.h>
+#include <linux/sched/mm.h>
+#include <linux/skbuff.h>
 #include <linux/slab.h>
 #include <linux/spinlock.h>
 #include <linux/workqueue.h>
+#include <net/sock.h>
 
 #include "pisa-priv.h"
 
@@ -328,6 +334,318 @@ static void pisa_return_block_locked(struct pisa_alloc *pa, struct page *block, 
 	*release |= pisa_place_meta(meta);
 }
 
+/*
+ * Return the predefined per-node allocator for (@nid, @order, @ro), or NULL.
+ */
+struct pisa_alloc *pisa_node_pa(int nid, unsigned int order, bool ro)
+{
+	if (order > PISA_ORDER)
+		return NULL;
+	nid = pisa_sanitize_nid(nid);
+
+	return pisa_nodes[nid].pa[ro][order];
+}
+
+/**
+ * pisa_alloc_pages_bulk - Allocate pages from a per-node __GFP_PISA_* allocator
+ * @gfp: GFP flags (must have __GFP_PISA_RW or __GFP_PISA_RO set)
+ * @order: Page order
+ * @preferred_nid: Preferred NUMA node (or NUMA_NO_NODE)
+ * @nodemask: Allowed NUMA nodemask (declined if non-NULL)
+ * @nr_pages: Total entries in @page_array
+ * @page_array: Output array of page pointers (populated entries are skipped)
+ * @frozen: Leave allocated pages frozen at refcount 0 if true
+ *
+ * Return: Number of populated entries at the start of @page_array.
+ */
+unsigned long pisa_alloc_pages_bulk(gfp_t gfp, unsigned int order, int preferred_nid,
+				    nodemask_t *nodemask, int nr_pages,
+				    struct page **page_array, bool frozen)
+{
+	struct pisa_alloc *pa = NULL;
+
+	if (unlikely(nr_pages <= 0))
+		return 0;
+	if (likely(!nodemask) && (!order || (gfp & __GFP_COMP)))
+		pa = pisa_node_pa(preferred_nid, order, !(gfp & __GFP_WRITE));
+	return pisa_alloc_bulk(pa, gfp & ~__GFP_PISA_RW, nr_pages, page_array, frozen);
+}
+
+/*
+ * Split a non-compound page of @old_order into 1 << (@old_order - @new_order)
+ * pages of @new_order (compound if @new_order > 0), all frozen at refcount 0.
+ * Fails with -EBUSY if a speculative PFN walker holds a reference to @page.
+ */
+static int split_page_compound(struct page *page, unsigned int old_order, unsigned int new_order)
+{
+	unsigned int i;
+
+	if (WARN_ON_ONCE(PageCompound(page) || !page_count(page) ||
+			 new_order > old_order ||
+			 folio_memcg_charged(page_folio(page))))
+		return -EINVAL;
+
+	/* Freeze @page[0] (1 -> 0) so all resulting pieces start at refcount 0. */
+	if (!page_ref_freeze(page, 1))
+		return -EBUSY;
+
+	if (new_order < old_order) {
+		split_page_owner(page, old_order, new_order);
+		pgalloc_tag_split(page_folio(page), old_order, new_order);
+	}
+
+	/* Subpages of non-compound pages are already initialized as order 0. */
+	if (new_order == 0)
+		return 0;
+
+	for (i = 0; i < (1U << old_order); i += (1U << new_order))
+		prep_compound_page(page + i, new_order);
+
+	return 0;
+}
+
+/* Obtain and split a new PISA page on @nid into blocks of @order. */
+static struct pisa_meta *pisa_alloc_split_page(unsigned int order, gfp_t gfp, int nid)
+{
+	bool can_block = gfpflags_allow_blocking(gfp), clean;
+	unsigned int bpp = PISA_BLOCKS(order);
+	struct pisa_meta *meta;
+	struct page *page;
+
+	/* __GFP_DMA/__GFP_DMA32 were already declined by pisa_alloc_bulk(). */
+	meta = pisa_reservoir_pop(nid, gfp & ~__GFP_ZERO, &clean);
+	if (IS_ERR(meta))
+		return meta;
+
+	page = pfn_to_page(pisa_meta_to_pfn(meta));
+
+	/* Fails with -EBUSY if a concurrent PFN walker holds a speculative ref. */
+	if (split_page_compound(page, PISA_ORDER, order)) {
+		pisa_release_page(meta);
+		pisa_alloc_backoff(nid, can_block);
+		return ERR_PTR(-EBUSY);
+	}
+
+	INIT_LIST_HEAD(&meta->list);
+
+	if (clean) {
+		bitmap_set(meta->clean_bitmap, 0, bpp);
+		meta->nr_clean = bpp;
+	} else {
+		bitmap_set(meta->dirty_bitmap, 0, bpp);
+		meta->nr_dirty = bpp;
+	}
+
+	return meta;
+}
+
+/* Reset fields normally cleared by prep_new_page()/post_alloc_hook(). */
+static void pisa_block_prep(struct page *block)
+{
+	set_page_private(block, 0);
+	clear_page_pfmemalloc(block);
+}
+
+/*
+ * Collect up to @want blocks from @meta's dirty or clean bitmap. With
+ * @unfreeze they get refcount 1; otherwise they stay at refcount 0.
+ */
+static unsigned int pisa_scan_bitmap(struct pisa_meta *meta, bool dirty,
+				     unsigned int want, struct page **out, bool unfreeze)
+{
+	unsigned long *bitmap = dirty ? meta->dirty_bitmap : meta->clean_bitmap;
+	u16 *countp = dirty ? &meta->nr_dirty : &meta->nr_clean;
+	struct pisa_alloc *pa = meta->pa;
+	unsigned int idx, got = 0, used = 0;
+	unsigned long base_pfn;
+
+	if (!*countp || !want)
+		return 0;
+
+	base_pfn = pisa_meta_to_pfn(meta);
+	for_each_set_bit(idx, bitmap, PISA_BLOCKS(pa->order)) {
+		struct page *block = pfn_to_page(base_pfn + (idx << pa->order));
+
+		__clear_bit(idx, bitmap);
+		used++;
+		if (!pisa_block_poisoned(pa, block)) {
+			pisa_block_prep(block);
+			if (unfreeze)
+				page_ref_unfreeze(block, 1);
+			out[got++] = block;
+		}
+
+		if (used == *countp || got == want)
+			break;
+	}
+	*countp -= used;
+	return got;
+}
+
+/* @zero: prefer PISA pages with blocks in @meta->clean_bitmap. */
+static struct pisa_meta *pisa_pick_meta(struct pisa_alloc *pa, bool zero)
+{
+	struct pisa_meta *m_dirty, *m_clean, *meta;
+
+	if (zero) {
+		/* Clean blocks first: the head of @partial, then of @idle. */
+		if (!list_empty(&pa->partial))
+			return list_first_entry(&pa->partial, struct pisa_meta, list);
+		meta = list_first_entry_or_null(&pa->idle, struct pisa_meta, list);
+		if (meta && meta->nr_clean) {
+			pa->num_idle_pages--;
+			WRITE_ONCE(pa->idle_jiffies, jiffies);
+			return meta;
+		}
+	}
+
+	m_dirty = list_first_entry_or_null(&pa->partial_dirty, struct pisa_meta, list);
+	m_clean = list_first_entry_or_null(&pa->partial, struct pisa_meta, list);
+	if (m_dirty && m_clean) {
+		bool dirty_dense = m_dirty->on_list == PISA_LIST_PARTIAL_DIRTY_DENSE;
+		bool clean_dense = m_clean->on_list == PISA_LIST_PARTIAL_CLEAN_DENSE;
+
+		if (dirty_dense != clean_dense)
+			return dirty_dense ? m_dirty : m_clean;
+		return pisa_meta_avail(m_dirty) <= pisa_meta_avail(m_clean) ?
+		       m_dirty : m_clean;
+	}
+	if (m_dirty)
+		return m_dirty;
+	if (m_clean)
+		return m_clean;
+	if (!list_empty(&pa->idle)) {
+		meta = list_last_entry(&pa->idle, struct pisa_meta, list);
+		pa->num_idle_pages--;
+		WRITE_ONCE(pa->idle_jiffies, jiffies);
+		return meta;
+	}
+	return NULL;
+}
+
+/* Extract up to @want blocks from @meta under @pa->lock. */
+static unsigned int take_blocks(struct pisa_meta *meta, unsigned int want,
+				struct page **out, bool zero, bool frozen)
+{
+	unsigned int avail_before = pisa_meta_avail(meta), got = 0, used;
+	struct pisa_alloc *pa = meta->pa;
+
+	lockdep_assert_held(&pa->lock);
+
+	if (zero) {
+		unsigned int dirty, i;
+
+		/* First choice are clean blocks, followed by dirty */
+		got += pisa_scan_bitmap(meta, false, want, out, !frozen);
+		dirty = pisa_scan_bitmap(meta, true, want - got, out + got, false);
+		for (i = got; i < got + dirty; i++)
+			set_page_private(out[i], 1);
+		got += dirty;
+	} else {
+		/* First choice are dirty blocks, followed by clean */
+		got += pisa_scan_bitmap(meta, true, want, out, !frozen);
+		got += pisa_scan_bitmap(meta, false, want - got, out + got, !frozen);
+	}
+
+	used = avail_before - pisa_meta_avail(meta);
+	/* If counts disagreed with bitmaps, zero them so @meta moves to @pa->full. */
+	if (WARN_ON_ONCE(!used)) {
+		meta->nr_clean = 0;
+		meta->nr_dirty = 0;
+	}
+	pisa_place_meta(meta);
+
+	return got;
+}
+
+/* Allocate @nr_pages blocks from @pa. */
+static unsigned long __pisa_alloc_bulk(struct pisa_alloc *pa, gfp_t gfp, unsigned long nr_pages,
+				       struct page **pages, bool zero, bool frozen)
+{
+	unsigned long n, flags, i;
+	struct pisa_meta *meta;
+	unsigned int want;
+
+	/* Held across bitmap scans; dropped around slow-path pisa_alloc_split_page(). */
+	spin_lock_irqsave(&pa->lock, flags);
+	for (n = 0; n < nr_pages; n += take_blocks(meta, want, &pages[n], zero, frozen)) {
+		want = min_t(unsigned long, nr_pages - n, PISA_BLOCKS(pa->order));
+		meta = pisa_pick_meta(pa, zero);
+		if (meta)
+			continue;
+
+		/* Fallback to a new allocation */
+		spin_unlock_irqrestore(&pa->lock, flags);
+		/* With @zero, fresh dirty blocks are zeroed below. */
+		meta = pisa_alloc_split_page(pa->order, gfp, pa->nid);
+		if (IS_ERR(meta))
+			goto out;
+		spin_lock_irqsave(&pa->lock, flags);
+		meta->pa = pa;
+		/* Set PISA_ACTIVE after @meta is fully set up. */
+		WRITE_ONCE(meta->flags, meta->flags | PISA_ACTIVE);
+	}
+	spin_unlock_irqrestore(&pa->lock, flags);
+
+out:
+	for (i = 0; zero && i < n; i++) {
+		/* Dirty blocks for a zeroing caller were marked with page_private = 1. */
+		if (!page_private(pages[i]))
+			continue;
+		set_page_private(pages[i], 0);
+		memset(page_address(pages[i]), 0, PAGE_SIZE << pa->order);
+		if (frozen) /* Order zeroing before caller publishes the page. */
+			smp_wmb();
+		else
+			page_ref_unfreeze(pages[i], 1);
+	}
+	return n;
+}
+
+/**
+ * pisa_alloc_bulk - Allocate up to @nr_pages blocks from @pa
+ * @pa: Allocator to allocate from
+ * @gfp: GFP flags (requests with __GFP_THISNODE, __GFP_DMA, __GFP_DMA32, or
+ *	__GFP_ACCOUNT are declined)
+ * @nr_pages: Number of entries in @page_array (populated entries are skipped)
+ * @page_array: Output array of page pointers
+ * @frozen: Leave allocated pages frozen at refcount 0 if true
+ *
+ * Return: Number of populated entries at the start of @page_array.
+ */
+unsigned long pisa_alloc_bulk(struct pisa_alloc *pa, gfp_t gfp,
+			      unsigned long nr_pages, struct page **page_array, bool frozen)
+{
+	unsigned long i = 0, n, got;
+
+	if (unlikely(!pa ||
+		     (gfp & (__GFP_DMA | __GFP_DMA32 | __GFP_THISNODE | __GFP_ACCOUNT))))
+		goto skip;
+
+	while (i < nr_pages) {
+		if (page_array[i]) {
+			i++;
+			continue;
+		}
+		/* Fill the run of @n NULL entries at @i. */
+		for (n = 1; i + n < nr_pages && !page_array[i + n]; n++)
+			;
+		got = __pisa_alloc_bulk(pa, gfp, n, page_array + i,
+					want_init_on_alloc(gfp), frozen);
+		i += got;
+		if (got < n)
+			break;
+	}
+	return i;
+
+skip:
+	/* Declined: report the populated prefix, as alloc_pages_bulk_node() does. */
+	while (i < nr_pages && page_array[i])
+		i++;
+	return i;
+}
+
+
 /**
  * __pisa_free_page - Recycle a freed block back into its PISA allocator
  * @page: Block being freed (called from __free_pages_prepare() under RCU)
@@ -372,7 +690,34 @@ bool __pisa_free_page(struct page *page)
 
 static int __init pisa_init(void)
 {
+	const struct {
+		u8 order;
+		bool ro;
+	} cfg[] = {
+		{ 0, false },
+		{ 2, true },
+		{ SKB_FRAG_PAGE_ORDER, true },
+	};
+	int nid, i;
+
 	pisa_node_init();
+
+	/* Preallocate the supported per-node allocators. */
+	for_each_node_state(nid, N_MEMORY) {
+		for (i = 0; i < ARRAY_SIZE(cfg); i++) {
+			unsigned int order = cfg[i].order;
+			bool ro = cfg[i].ro;
+			struct pisa_alloc *pa;
+
+			if (order > PISA_ORDER || pisa_nodes[nid].pa[ro][order])
+				continue;
+			pa = pisa_create(nid, order, ro ? DMA_TO_DEVICE : DMA_BIDIRECTIONAL);
+			if (!pa)
+				continue;
+			pisa_set_name(pa, "pisa%s_o%u_n%d", ro ? "_ro" : "", order, nid);
+			pisa_nodes[nid].pa[ro][order] = pa;
+		}
+	}
 
 	/* Dedicated WQ_MEM_RECLAIM workqueue so reclaim never blocks behind system_wq. */
 	pisa_wq = alloc_workqueue("pisa", WQ_MEM_RECLAIM, 0);
