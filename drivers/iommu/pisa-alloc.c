@@ -10,6 +10,8 @@
 #include <linux/bitops.h>
 #include <linux/cache.h>
 #include <linux/device.h>
+#include <linux/dma-direct.h>
+#include <linux/dma-map-ops.h>
 #include <linux/dma-mapping.h>
 #include <linux/pisa.h>
 #include <linux/export.h>
@@ -697,6 +699,150 @@ skip:
 	return i;
 }
 
+/* Find and reserve @nblocks aligned contiguous blocks in @meta under @pa->lock. */
+static struct page *pisa_take_contig(struct pisa_meta *meta, unsigned int nblocks,
+				     unsigned long align_mask)
+{
+	DECLARE_BITMAP(busy, PISA_MAX_BLOCKS);
+	struct pisa_alloc *pa = meta->pa;
+	unsigned int bpp = PISA_BLOCKS(0), i;
+	bool poisoned = false;
+	unsigned long off;
+	struct page *page;
+
+	if (pisa_meta_avail(meta) < nblocks)
+		return NULL;
+
+	bitmap_or(busy, meta->clean_bitmap, meta->dirty_bitmap, bpp);
+	bitmap_complement(busy, busy, bpp);
+
+	off = 0;
+	for (;;) {
+		off = bitmap_find_next_zero_area(busy, bpp, off, nblocks, align_mask);
+		if (off >= bpp) {
+			if (poisoned) {
+				if (meta->on_list == PISA_LIST_IDLE_CLEAN ||
+				    meta->on_list == PISA_LIST_IDLE_DIRTY)
+					pa->num_idle_pages--;
+				pisa_place_meta(meta);
+			}
+			return NULL;
+		}
+
+		page = pfn_to_page(pisa_meta_to_pfn(meta) + off);
+		for (i = 0; i < nblocks; i++) {
+			if (!pisa_block_poisoned(pa, page + i))
+				continue;
+			if (__test_and_clear_bit(off + i, meta->clean_bitmap))
+				meta->nr_clean--;
+			else if (__test_and_clear_bit(off + i, meta->dirty_bitmap))
+				meta->nr_dirty--;
+			__set_bit(off + i, busy);
+			poisoned = true;
+			off += i + 1;
+			break;
+		}
+		if (i == nblocks)
+			break;
+	}
+
+	if (meta->on_list == PISA_LIST_IDLE_CLEAN ||
+	    meta->on_list == PISA_LIST_IDLE_DIRTY)
+		pa->num_idle_pages--;
+
+	for (i = 0; i < nblocks; i++) {
+		if (__test_and_clear_bit(off + i, meta->clean_bitmap)) {
+			meta->nr_clean--;
+		} else {
+			__clear_bit(off + i, meta->dirty_bitmap);
+			meta->nr_dirty--;
+		}
+		pisa_block_prep(page + i);
+		page_ref_unfreeze(page + i, 1);
+	}
+	pisa_place_meta(meta);
+	return page;
+}
+
+/*
+ * Specialized memory provider for iommu_dma_alloc() and dma_direct_alloc():
+ * allocate a zeroed, naturally aligned contiguous range of order-0 pages for
+ * @size bytes (<= PISA_SIZE) from @dev's per-node coherent allocator into
+ * *@pagep and return its kernel virtual address, or NULL.
+ */
+void *pisa_alloc_coherent(struct page **pagep, struct device *dev,
+			  struct iommu_domain *domain, size_t size,
+			  gfp_t gfp, unsigned long attrs)
+{
+	bool should_release = false;
+	struct list_head *lists[3];
+	unsigned long align_mask, flags;
+	unsigned int nblocks, i;
+	struct pisa_meta *meta;
+	struct pisa_alloc *pa;
+	struct page *page = NULL;
+
+	size = PAGE_ALIGN(size);
+	if (!pagep || !dev || !READ_ONCE(dev->pisa_coherent) ||
+	    !dev_is_dma_coherent(dev) || !size || size > PISA_SIZE)
+		return NULL;
+	if (min_not_zero(dev->coherent_dma_mask, dev->bus_dma_limit) <= DMA_BIT_MASK(32))
+		return NULL;
+	if ((current_gfp_context(gfp) & ~(__GFP_ZERO | __GFP_NOWARN)) != GFP_KERNEL ||
+	    (attrs & ~DMA_ATTR_NO_WARN))
+		return NULL;
+
+	if (domain) {
+		struct pisa_window *win = pisa_dma_window(domain);
+
+		if (!win || pisa_window_declined(win) || !(domain->pgsize_bitmap & PISA_SIZE))
+			return NULL;
+	} else if (is_swiotlb_for_alloc(dev) ||
+		   force_dma_unencrypted(dev) ||
+		   !dma_coherent_ok(dev, PFN_PHYS(max_pfn) - 1, 1)) {
+		return NULL;
+	}
+
+	pa = pisa_node_pa(dev_to_node(dev), 0, false);
+	if (!pa)
+		return NULL;
+
+	nblocks = size >> PAGE_SHIFT;
+	align_mask = (1UL << get_order(size)) - 1;
+	lists[0] = &pa->partial;
+	lists[1] = &pa->partial_dirty;
+	lists[2] = &pa->idle;
+
+	spin_lock_irqsave(&pa->lock, flags);
+	for (i = 0; i < ARRAY_SIZE(lists) && !page; i++) {
+		list_for_each_entry(meta, lists[i], list) {
+			page = pisa_take_contig(meta, nblocks, align_mask);
+			if (page)
+				break;
+		}
+	}
+	if (!page) {
+		spin_unlock_irqrestore(&pa->lock, flags);
+		meta = pisa_alloc_split_page(0, gfp, pa->nid);
+		if (IS_ERR(meta))
+			return NULL;
+		spin_lock_irqsave(&pa->lock, flags);
+		meta->pa = pa;
+		meta->prot = pa->prot;
+		WRITE_ONCE(meta->flags, meta->flags | PISA_ACTIVE);
+		page = pisa_take_contig(meta, nblocks, align_mask);
+		if (unlikely(!page))
+			should_release = pisa_place_meta(meta);
+	}
+	spin_unlock_irqrestore(&pa->lock, flags);
+
+	if (should_release)
+		pisa_schedule_reclaim();
+	if (!page)
+		return NULL;
+	*pagep = page;
+	return memset(page_address(page), 0, size);
+}
 
 /**
  * __pisa_free_page - Recycle a freed block back into its PISA allocator

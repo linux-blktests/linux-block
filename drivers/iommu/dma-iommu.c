@@ -1658,6 +1658,8 @@ static void __iommu_dma_free(struct device *dev, size_t size, void *cpu_addr)
 	} else {
 		/* Lowmem means a coherent atomic or CMA allocation */
 		page = virt_to_page(cpu_addr);
+		if (pisa_free_coherent(page, alloc_size))
+			return;
 	}
 
 	if (pages)
@@ -1716,6 +1718,7 @@ void *iommu_dma_alloc(struct device *dev, size_t size, dma_addr_t *handle,
 		gfp_t gfp, unsigned long attrs)
 {
 	bool coherent = dev_is_dma_coherent(dev);
+	struct iommu_domain *domain = iommu_get_dma_domain(dev);
 	int ioprot = dma_info_to_prot(DMA_BIDIRECTIONAL, coherent, attrs);
 	bool is_alloc_cc_shared = attrs & __DMA_ATTR_ALLOC_CC_SHARED;
 	struct page *page = NULL;
@@ -1726,6 +1729,12 @@ void *iommu_dma_alloc(struct device *dev, size_t size, dma_addr_t *handle,
 		return NULL;
 
 	gfp |= __GFP_ZERO;
+
+	if (domain) {
+		cpu_addr = pisa_alloc_coherent(&page, dev, domain, size, gfp, attrs);
+		if (cpu_addr)
+			goto map;
+	}
 
 	if (gfpflags_allow_blocking(gfp) &&
 	    !(attrs & DMA_ATTR_FORCE_CONTIGUOUS)) {
@@ -1744,6 +1753,7 @@ void *iommu_dma_alloc(struct device *dev, size_t size, dma_addr_t *handle,
 			return NULL;
 	}
 
+map:
 	*handle = __iommu_dma_map(dev, page_to_phys(page), size, ioprot,
 			dev->coherent_dma_mask);
 	if (*handle == DMA_MAPPING_ERROR) {

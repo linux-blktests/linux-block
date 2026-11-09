@@ -13,6 +13,7 @@
 #include <linux/rcupdate.h>
 
 struct device;
+struct iommu_domain;
 
 #ifdef CONFIG_PISA
 
@@ -78,6 +79,21 @@ static inline bool pisa_free_page(struct page *page)
 	return ret;
 }
 
+void *pisa_alloc_coherent(struct page **pagep, struct device *dev,
+			  struct iommu_domain *domain, size_t size,
+			  gfp_t gfp, unsigned long attrs);
+
+static inline bool pisa_free_coherent(struct page *page, size_t size)
+{
+	unsigned long count = PAGE_ALIGN(size) >> PAGE_SHIFT;
+
+	if (!page || !is_pisa_page(page))
+		return false;
+	while (count--)
+		__free_page(page++);
+	return true;
+}
+
 unsigned long pisa_alloc_pages_bulk(gfp_t gfp, unsigned int order,
 				    int preferred_nid, nodemask_t *nodemask,
 				    int nr_pages, struct page **page_array,
@@ -105,6 +121,20 @@ static inline bool is_pisa_pfn(unsigned long pfn)
 }
 
 static inline bool pisa_free_page(struct page *page)
+{
+	return false;
+}
+
+static inline void *pisa_alloc_coherent(struct page **pagep,
+					struct device *dev,
+					struct iommu_domain *domain,
+					size_t size, gfp_t gfp,
+					unsigned long attrs)
+{
+	return NULL;
+}
+
+static inline bool pisa_free_coherent(struct page *page, size_t size)
 {
 	return false;
 }
