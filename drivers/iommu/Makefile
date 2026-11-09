@@ -11,7 +11,7 @@ obj-$(CONFIG_IOMMU_API) += iommu-traces.o
 obj-$(CONFIG_IOMMU_API) += iommu-sysfs.o
 obj-$(CONFIG_IOMMU_DEBUGFS) += iommu-debugfs.o
 obj-$(CONFIG_IOMMU_DMA) += dma-iommu.o
-obj-$(CONFIG_PISA) += pisa-meta.o pisa-alloc.o pisa-node.o
+obj-$(CONFIG_PISA) += pisa-meta.o pisa-alloc.o pisa-node.o pisa-user.o
 ifeq ($(CONFIG_IOMMU_DMA),y)
 obj-$(CONFIG_PISA) += pisa-map.o
 endif

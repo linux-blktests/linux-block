@@ -1756,6 +1756,8 @@ static int __init pisa_init(void)
 		}
 	}
 
+	pisa_user_boot_enable();
+
 	/* Dedicated WQ_MEM_RECLAIM workqueue so reclaim never blocks behind system_wq. */
 	pisa_wq = alloc_workqueue("pisa", WQ_MEM_RECLAIM, 0);
 	if (!pisa_wq)

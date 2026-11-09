@@ -39,6 +39,7 @@
 #include <linux/kernel.h>
 #include <linux/uaccess.h>
 #include <linux/mm.h>
+#include <linux/pisa.h>
 #include <linux/interrupt.h>
 #include <linux/errno.h>
 #include <linux/sched.h>
@@ -632,10 +633,74 @@ int skb_copy_datagram_from_iter_full(struct sk_buff *skb, int offset,
 }
 EXPORT_SYMBOL(skb_copy_datagram_from_iter_full);
 
-int zerocopy_fill_skb_from_iter(struct sk_buff *skb,
-				struct iov_iter *from, size_t length)
+/*
+ * Upgrade user @pages to PISA memory and, for TCP over a pisa_tx_bufs device,
+ * trim non-PISA trailing pages from the batch.
+ *
+ * Return: false to proceed with attaching *@copied bytes from @pages to @skb,
+ * or true to stop and make the caller return *@ret.
+ */
+static bool pisa_zc_iter(int *ret, struct sk_buff *skb, struct iov_iter *from, size_t *length,
+			 const struct sock *sk, struct page **pages, int max_pages,
+			 unsigned int orig_len, size_t *start, ssize_t *copied)
+{
+	unsigned int i, nr;
+	ssize_t keep;
+
+	if (!pisa_user_enabled() || !user_backed_iter(from))
+		return false;
+
+	/* Move user pages into PISA memory, then look them up again. */
+	if (pisa_upgrade_user_pages(pages, DIV_ROUND_UP(*start + *copied, PAGE_SIZE))) {
+		iov_iter_revert(from, *copied);
+		*copied = iov_iter_get_pages2(from, pages, *length, max_pages, start);
+		if (*copied < 0) {
+			*ret = -EFAULT;
+			return true;
+		}
+	}
+
+	/* Only TCP (which sets skb->sk at transmit time) handles short appends/-EXDEV. */
+	if (!sk || skb->sk)
+		return false;
+
+	/* Only plain MSG_ZEROCOPY ubufs (not io_uring/vhost/devmem). */
+	if (skb_zcopy(skb) && skb_zcopy(skb)->ops != &msg_zerocopy_ubuf_ops)
+		return false;
+
+	/* Egress device must have pisa_tx_bufs enabled so the copy uses a PISA page_frag. */
+	if (!dst_tx_pisa_ok(__sk_dst_get(sk)))
+		return false;
+
+	/*
+	 * Trim @from to the leading pages that are in PISA memory: drop the
+	 * references to the others, give their bytes back to @from, and cap
+	 * *@length so that the caller ends after attaching what is left.
+	 */
+	nr = DIV_ROUND_UP(*start + *copied, PAGE_SIZE);
+	for (i = 0; i < nr && is_pisa_page(pages[i]); i++)
+		;
+	if (i == nr)
+		return false;
+
+	keep = i ? i * PAGE_SIZE - *start : 0;
+	while (nr > i)
+		put_page(pages[--nr]);
+	iov_iter_revert(from, *copied - keep);
+	*copied = keep;
+	*length = keep;
+	if (keep)
+		return false;
+
+	*ret = (skb->len != orig_len) ? 0 : -EXDEV;
+	return true;
+}
+
+static int __zerocopy_fill_skb_from_iter(struct sk_buff *skb, struct iov_iter *from,
+					 size_t length, const struct sock *sk)
 {
 	int frag = skb_shinfo(skb)->nr_frags;
+	unsigned int orig_len = skb->len;
 
 	if (!skb_frags_readable(skb))
 		return -EFAULT;
@@ -643,7 +708,7 @@ int zerocopy_fill_skb_from_iter(struct sk_buff *skb,
 	while (length && iov_iter_count(from)) {
 		struct page *head, *last_head = NULL;
 		struct page *pages[MAX_SKB_FRAGS];
-		int refs, order, n = 0;
+		int refs, order, n = 0, ret;
 		size_t start;
 		ssize_t copied;
 
@@ -654,6 +719,9 @@ int zerocopy_fill_skb_from_iter(struct sk_buff *skb,
 					    MAX_SKB_FRAGS - frag, &start);
 		if (copied < 0)
 			return -EFAULT;
+		if (pisa_zc_iter(&ret, skb, from, &length, sk, pages,
+				 MAX_SKB_FRAGS - frag, orig_len, &start, &copied))
+			return ret;
 
 		length -= copied;
 
@@ -701,6 +769,12 @@ int zerocopy_fill_skb_from_iter(struct sk_buff *skb,
 			page_ref_sub(last_head, refs);
 	}
 	return 0;
+}
+
+int zerocopy_fill_skb_from_iter(struct sk_buff *skb,
+				struct iov_iter *from, size_t length)
+{
+	return __zerocopy_fill_skb_from_iter(skb, from, length, NULL);
 }
 
 static int
@@ -760,7 +834,7 @@ int __zerocopy_sg_from_iter(struct msghdr *msg, struct sock *sk,
 	else if (binding)
 		ret = zerocopy_fill_skb_from_devmem(skb, from, length, binding);
 	else
-		ret = zerocopy_fill_skb_from_iter(skb, from, length);
+		ret = __zerocopy_fill_skb_from_iter(skb, from, length, sk);
 
 	truesize = skb->truesize - orig_size;
 	if (sk && sk->sk_type == SOCK_STREAM) {

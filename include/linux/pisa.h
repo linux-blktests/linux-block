@@ -132,6 +132,18 @@ static inline void pisa_task_frag_release(struct task_struct *tsk)
 		put_page(tsk->task_frag_pisa.page);
 }
 
+/* User pages in PISA blocks, see drivers/iommu/pisa-user.c */
+DECLARE_STATIC_KEY_FALSE(pisa_user_key);
+bool pisa_upgrade_user_pages(struct page **pages, unsigned int nr);
+int pisa_madvise(struct vm_area_struct *vma, unsigned long start,
+		 unsigned long end, bool to_pisa);
+
+/* Is pisa.user_max_4K_pages non-zero? */
+static inline bool pisa_user_enabled(void)
+{
+	return static_branch_unlikely(&pisa_user_key);
+}
+
 #else /* !CONFIG_PISA */
 
 static inline int pisa_meta_init(void)
@@ -211,6 +223,22 @@ static inline void pisa_task_frag_init(struct task_struct *tsk)
 
 static inline void pisa_task_frag_release(struct task_struct *tsk)
 {
+}
+
+static inline bool pisa_user_enabled(void)
+{
+	return false;
+}
+
+static inline bool pisa_upgrade_user_pages(struct page **pages, unsigned int nr)
+{
+	return false;
+}
+
+static inline int pisa_madvise(struct vm_area_struct *vma, unsigned long start,
+			       unsigned long end, bool to_pisa)
+{
+	return -EINVAL;
 }
 
 #endif /* CONFIG_PISA */
