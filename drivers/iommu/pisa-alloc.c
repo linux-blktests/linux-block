@@ -29,6 +29,7 @@
 #include <linux/percpu.h>
 #include <linux/pgalloc_tag.h>
 #include <linux/rcupdate.h>
+#include <linux/sched/clock.h>
 #include <linux/sched/mm.h>
 #include <linux/set_memory.h>
 #include <linux/shrinker.h>
@@ -72,6 +73,10 @@ module_param_named(idle_ms, pisa_idle_ms, uint, 0644);
 static unsigned int pisa_compact __read_mostly;
 module_param_named(compact, pisa_compact, uint, 0644);
 
+/* Max pages zeroed in each scrubber run (0 = disabled, capped at PISA_SCRUB_MAX_LIMIT). */
+unsigned int pisa_scrub_max __read_mostly;
+#define PISA_SCRUB_MAX_LIMIT	65536U
+
 /* All live allocators, protected by pisa_allocs_lock. */
 static LIST_HEAD(pisa_allocs);
 static DEFINE_RWLOCK(pisa_allocs_lock);
@@ -86,6 +91,24 @@ struct pisa_node pisa_nodes[MAX_NUMNODES] = {
 
 static void pisa_schedule_reclaim(void);
 
+static int pisa_scrub_set(const char *val, const struct kernel_param *kp)
+{
+	int ret = param_set_uint(val, kp);
+
+	if (ret)
+		return ret;
+	WRITE_ONCE(pisa_scrub_max, min(pisa_scrub_max, PISA_SCRUB_MAX_LIMIT));
+	/* Serve demand accumulated while the scrubber was off (once initialized). */
+	if (pisa_scrub_max && static_branch_unlikely(&pisa_key))
+		pisa_schedule_scrub_all();
+	return 0;
+}
+
+static const struct kernel_param_ops pisa_scrub_ops = {
+	.set = pisa_scrub_set,
+	.get = param_get_uint,
+};
+module_param_cb(scrub_max, &pisa_scrub_ops, &pisa_scrub_max, 0644);
 /* Return true if a new PISA page should be decrypted. */
 bool pisa_want_decrypt(void)
 {
@@ -263,6 +286,7 @@ static void pisa_schedule_reclaim(void)
 	else
 		queue_delayed_work(wq, &pisa_reclaim_work, msecs_to_jiffies(idle_ms));
 }
+
 /*
  * Update @meta's position on @pa's lists under @pa->lock. When all blocks
  * become available (avail == bpp), either queues @meta to @pisa_free_list (and
@@ -351,6 +375,148 @@ static bool pisa_block_poisoned(struct pisa_alloc *pa, struct page *block)
 		}
 	}
 	return false;
+}
+
+/*
+ * Background page scrubber: pre-zeroes dirty blocks in @pa->nid's work item
+ * to match inline-zeroed demand (@pa->scrub_demand) when scrub_max > 0.
+ */
+static struct pisa_meta *pisa_pick_dirty_meta(struct pisa_alloc *pa)
+{
+	struct pisa_meta *meta;
+
+	meta = list_first_entry_or_null(&pa->partial_dirty, struct pisa_meta, list);
+	if (meta)
+		return meta;
+
+	list_for_each_entry(meta, &pa->partial, list) {
+		if (meta->nr_dirty)
+			return meta;
+	}
+
+	if (!list_empty(&pa->idle)) {
+		meta = list_last_entry(&pa->idle, struct pisa_meta, list);
+		if (meta->nr_dirty) {
+			pa->num_idle_pages--;
+			return meta;
+		}
+	}
+
+	return NULL;
+}
+
+/* Dirty blocks per allocator, inline-zeroed since the last run, that queue a run. */
+#define PISA_SCRUB_TRIGGER	32U
+/* Cap on @pa->scrub_demand, so a long-off scrubber does not owe too much. */
+#define PISA_SCRUB_DEMAND_MAX	4096U
+/* Bytes zeroed per batch: a few microseconds of memset(). */
+/* XXX assumes PAGE_SIZE <= SZ_128K (32 * 4KB pages). */
+#define PISA_SCRUB_BYTES	SZ_128K
+#define PISA_SCRUB_BATCH	(PISA_SCRUB_BYTES >> PAGE_SHIFT)
+/* Time after which a run stops and requeues. */
+#define PISA_SCRUB_RUN_NS	(50 * NSEC_PER_USEC)
+
+/*
+ * Scrub one batch of dirty blocks in @pa outside @pa->lock.
+ * Returns the number of PAGE_SIZE pages taken off the dirty bitmap.
+ */
+static unsigned long pisa_scrub_alloc(struct pisa_alloc *pa)
+{
+	unsigned int bpp, order, idx, count = 0, used = 0, want;
+	u16 idxs[PISA_SCRUB_BATCH];
+	unsigned long base_pfn, flags;
+	bool should_release;
+	struct pisa_meta *meta;
+
+	spin_lock_irqsave(&pa->lock, flags);
+	if (!pa->scrub_demand) {
+		spin_unlock_irqrestore(&pa->lock, flags);
+		return 0;
+	}
+
+	meta = pisa_pick_dirty_meta(pa);
+	if (!meta) {
+		pa->scrub_demand = 0;
+		spin_unlock_irqrestore(&pa->lock, flags);
+		return 0;
+	}
+
+	order = pa->order;
+	bpp = PISA_BLOCKS(order);
+	base_pfn = pisa_meta_to_pfn(meta);
+	want = min(max(PISA_SCRUB_BATCH >> order, 1U), pa->scrub_demand);
+
+	for_each_set_bit(idx, meta->dirty_bitmap, bpp) {
+		struct page *block = pfn_to_page(base_pfn + (idx << order));
+
+		__clear_bit(idx, meta->dirty_bitmap);
+		used++;
+		if (!pisa_block_poisoned(pa, block))
+			idxs[count++] = idx;
+		if (used == meta->nr_dirty || count == want)
+			break;
+	}
+	meta->nr_dirty -= used;
+	pa->blocks_in_use += used - count;
+	pisa_place_meta(meta);
+	spin_unlock_irqrestore(&pa->lock, flags);
+
+	if (unlikely(!count))
+		return (unsigned long)used << order;
+
+	for (idx = 0; idx < count; idx++) {
+		struct page *block = pfn_to_page(base_pfn + (idxs[idx] << order));
+
+		memset(page_address(block), 0, PAGE_SIZE << order);
+	}
+
+	spin_lock_irqsave(&pa->lock, flags);
+	for (idx = 0; idx < count; idx++)
+		__set_bit(idxs[idx], meta->clean_bitmap);
+	meta->nr_clean += count;
+	pa->scrub_demand -= min(count, pa->scrub_demand);
+	should_release = pisa_place_meta(meta);
+	spin_unlock_irqrestore(&pa->lock, flags);
+
+	if (should_release)
+		pisa_schedule_reclaim();
+
+	return (unsigned long)used << order;
+}
+
+/*
+ * Scrub dirty blocks for allocators homed on @nid up to @pisa_scrub_max pages or
+ * PISA_SCRUB_RUN_NS. Returns true if stopped early with demand remaining.
+ */
+bool pisa_scrub_node(int nid)
+{
+	unsigned long budget = READ_ONCE(pisa_scrub_max), done = 0, n;
+	u64 deadline = local_clock() + PISA_SCRUB_RUN_NS;
+	struct pisa_alloc *pa;
+	bool more = false;
+
+	read_lock(&pisa_allocs_lock);
+	list_for_each_entry(pa, &pisa_allocs, node) {
+		if (pa->nid != nid || !READ_ONCE(pa->scrub_demand))
+			continue;
+		read_unlock(&pisa_allocs_lock);
+
+		while ((n = pisa_scrub_alloc(pa))) {
+			done += n;
+			if (done >= budget || local_clock() >= deadline) {
+				more = true;
+				break;
+			}
+			cond_resched();
+		}
+
+		read_lock(&pisa_allocs_lock);
+		if (more)
+			break;
+	}
+	read_unlock(&pisa_allocs_lock);
+
+	return more;
 }
 
 /**
@@ -952,6 +1118,7 @@ static unsigned int take_blocks(struct pisa_meta *meta, unsigned int want,
 		for (i = got; i < got + dirty; i++)
 			set_page_private(out[i], 1);
 		got += dirty;
+		pa->scrub_demand = min(pa->scrub_demand + dirty, PISA_SCRUB_DEMAND_MAX);
 	} else {
 		/* First choice are dirty blocks, followed by clean */
 		got += pisa_scan_bitmap(meta, true, want, out, !frozen);
@@ -973,6 +1140,7 @@ static unsigned int take_blocks(struct pisa_meta *meta, unsigned int want,
 static unsigned long __pisa_alloc_bulk(struct pisa_alloc *pa, gfp_t gfp, unsigned long nr_pages,
 				       struct page **pages, bool zero, bool frozen)
 {
+	bool should_scrub = false;
 	unsigned long n, flags, i;
 	struct pisa_meta *meta;
 	unsigned int want;
@@ -986,6 +1154,7 @@ static unsigned long __pisa_alloc_bulk(struct pisa_alloc *pa, gfp_t gfp, unsigne
 			continue;
 
 		/* Fallback to a new allocation */
+		should_scrub |= pa->scrub_demand >= PISA_SCRUB_TRIGGER;
 		spin_unlock_irqrestore(&pa->lock, flags);
 		/* With @zero, fresh dirty blocks are zeroed below. */
 		meta = pisa_alloc_split_page(pa->order, gfp, pa->nid);
@@ -998,6 +1167,8 @@ static unsigned long __pisa_alloc_bulk(struct pisa_alloc *pa, gfp_t gfp, unsigne
 		WRITE_ONCE(meta->flags, meta->flags | PISA_ACTIVE);
 		pa->stats.page_alloc_cnt++;
 	}
+	/* Queue the scrubber when the inline zeroing crosses the trigger. */
+	should_scrub |= pa->scrub_demand >= PISA_SCRUB_TRIGGER;
 	spin_unlock_irqrestore(&pa->lock, flags);
 
 out:
@@ -1012,6 +1183,8 @@ out:
 		else
 			page_ref_unfreeze(pages[i], 1);
 	}
+	if (should_scrub)
+		pisa_schedule_scrub(pa->nid);
 	return n;
 }
 
@@ -1112,7 +1285,7 @@ static struct page *pisa_take_contig(struct pisa_meta *meta, unsigned int nblock
 {
 	DECLARE_BITMAP(busy, PISA_MAX_BLOCKS);
 	struct pisa_alloc *pa = meta->pa;
-	unsigned int bpp = PISA_BLOCKS(0), i;
+	unsigned int bpp = PISA_BLOCKS(0), i, dirty = 0;
 	bool poisoned = false;
 	unsigned long off;
 	struct page *page;
@@ -1166,11 +1339,13 @@ static struct page *pisa_take_contig(struct pisa_meta *meta, unsigned int nblock
 		} else {
 			__clear_bit(off + i, meta->dirty_bitmap);
 			meta->nr_dirty--;
+			dirty++;
 		}
 		pisa_block_prep(page + i);
 		page_ref_unfreeze(page + i, 1);
 	}
 	pa->blocks_in_use += nblocks;
+	pa->scrub_demand = min(pa->scrub_demand + dirty, PISA_SCRUB_DEMAND_MAX);
 	pisa_place_meta(meta);
 	return page;
 }
@@ -1185,7 +1360,7 @@ void *pisa_alloc_coherent(struct page **pagep, struct device *dev,
 			  struct iommu_domain *domain, size_t size,
 			  gfp_t gfp, unsigned long attrs)
 {
-	bool should_release = false;
+	bool should_scrub = false, should_release = false;
 	struct list_head *lists[3];
 	unsigned long align_mask, flags;
 	unsigned int nblocks, i;
@@ -1234,10 +1409,14 @@ void *pisa_alloc_coherent(struct page **pagep, struct device *dev,
 		}
 	}
 	if (!page) {
+		should_scrub |= pa->scrub_demand >= PISA_SCRUB_TRIGGER;
 		spin_unlock_irqrestore(&pa->lock, flags);
 		meta = pisa_alloc_split_page(0, gfp, pa->nid);
-		if (IS_ERR(meta))
+		if (IS_ERR(meta)) {
+			if (should_scrub)
+				pisa_schedule_scrub(pa->nid);
 			return NULL;
+		}
 		spin_lock_irqsave(&pa->lock, flags);
 		meta->pa = pa;
 		meta->prot = pa->prot;
@@ -1247,10 +1426,13 @@ void *pisa_alloc_coherent(struct page **pagep, struct device *dev,
 		if (unlikely(!page))
 			should_release = pisa_place_meta(meta);
 	}
+	should_scrub |= pa->scrub_demand >= PISA_SCRUB_TRIGGER;
 	spin_unlock_irqrestore(&pa->lock, flags);
 
 	if (should_release)
 		pisa_schedule_reclaim();
+	if (should_scrub)
+		pisa_schedule_scrub(pa->nid);
 	if (!page)
 		return NULL;
 	*pagep = page;

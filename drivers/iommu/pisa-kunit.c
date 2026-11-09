@@ -572,8 +572,53 @@ static void test_gfp_pisa(struct kunit *test)
 
 static void test_reservoir_and_scrubber(struct kunit *test)
 {
-	KUNIT_ASSERT_EQ(test, pisa_meta_init(), 0);
-	KUNIT_EXPECT_EQ(test, READ_ONCE(pisa_reservoir_max), 16U);
+	unsigned int old_res = READ_ONCE(pisa_reservoir_max);
+	unsigned int old_scrub = READ_ONCE(pisa_scrub_max);
+	struct shrink_control sc = { .nr_to_scan = ULONG_MAX };
+	struct pisa_meta *meta;
+	struct pisa_alloc *pa;
+	struct page *p;
+	int nid;
+
+	pisa_shrink_scan(NULL, &sc);
+
+	/* Refill reservoir to 1 PISA page per memory node, then consume one. */
+	WRITE_ONCE(pisa_reservoir_max, 1);
+	pisa_schedule_reservoir();
+	for_each_node_state(nid, N_MEMORY)
+		flush_work(&pisa_nodes[nid].work);
+	KUNIT_EXPECT_GE(test, pisa_reservoir_count(), 1UL);
+
+	pa = pisa_node_pa(first_memory_node, 2, true);
+	KUNIT_ASSERT_NOT_NULL(test, pa);
+	p = pisa_alloc(pa, GFP_KERNEL);
+	if (p) {
+		meta = pisa_meta_of_pfn(page_to_pfn(p));
+		/* Reservoir pages come pre-zeroed (all remaining blocks clean). */
+		KUNIT_EXPECT_EQ(test, meta->nr_dirty, 0U);
+		__free_pages(p, 2);
+		if (!want_init_on_free()) {
+			KUNIT_EXPECT_EQ(test, meta->nr_dirty, 1U);
+
+			/* Scrub dirty block back into clean_bitmap. */
+			pa->scrub_demand = 1;
+			WRITE_ONCE(pisa_scrub_max, 512);
+			pisa_scrub_node(pa->nid);
+			KUNIT_EXPECT_EQ(test, meta->nr_dirty, 0U);
+		}
+	}
+	pisa_shrink_scan(NULL, &sc);
+
+	/* Trim reservoirs back to 0. */
+	WRITE_ONCE(pisa_reservoir_max, 0);
+	pisa_schedule_reservoir();
+	for_each_node_state(nid, N_MEMORY)
+		flush_work(&pisa_nodes[nid].work);
+	KUNIT_EXPECT_EQ(test, pisa_reservoir_count(), 0UL);
+
+	WRITE_ONCE(pisa_reservoir_max, old_res);
+	pisa_schedule_reservoir();
+	WRITE_ONCE(pisa_scrub_max, old_scrub);
 }
 
 static struct kunit_case pisa_meta_test_cases[] = {

@@ -5,6 +5,7 @@
  */
 
 #include <linux/atomic.h>
+#include <linux/bitops.h>
 #include <linux/pisa.h>
 #include <linux/err.h>
 #include <linux/gfp.h>
@@ -31,6 +32,9 @@
  * allocators on that node.
  */
 unsigned int pisa_reservoir_max __read_mostly = 16;
+
+/* Scrub the allocators whose home node (@pa->nid) is this one. */
+#define PISA_NODE_SCRUB	0
 
 static int pisa_reservoir_max_set(const char *val, const struct kernel_param *kp)
 {
@@ -175,6 +179,30 @@ static void pisa_reservoir_trim_node(int nid, unsigned int max)
 	}
 }
 
+/* Schedule node @nid's work item to scrub allocators homed on @nid. */
+void pisa_schedule_scrub(int nid)
+{
+	struct pisa_node *node;
+
+	if (!READ_ONCE(pisa_scrub_max) || nid == NUMA_NO_NODE)
+		return;
+
+	node = &pisa_nodes[nid];
+	set_bit(PISA_NODE_SCRUB, &node->flags);
+	/* Pairs with the clearing of PENDING before the work runs. */
+	smp_mb__after_atomic();
+	if (!work_pending(&node->work))
+		queue_work_node(nid, system_dfl_wq, &node->work);
+}
+
+void pisa_schedule_scrub_all(void)
+{
+	int nid;
+
+	for_each_node_state(nid, N_MEMORY)
+		pisa_schedule_scrub(nid);
+}
+
 /* Per-node worker: trim/refill the reservoir, then scrub allocators homed on @nid. */
 static void pisa_node_work_fn(struct work_struct *work)
 {
@@ -184,6 +212,9 @@ static void pisa_node_work_fn(struct work_struct *work)
 	pisa_reservoir_trim_node(nid, READ_ONCE(pisa_reservoir_max));
 	if (READ_ONCE(pisa_reservoir_max) && static_branch_unlikely(&pisa_key))
 		pisa_reservoir_refill_node(nid);
+
+	if (test_and_clear_bit(PISA_NODE_SCRUB, &node->flags) && pisa_scrub_node(nid))
+		pisa_schedule_scrub(nid);
 }
 
 /* Queue node @nid's work if its reservoir is below or above the target. */

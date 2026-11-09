@@ -144,8 +144,9 @@ struct pisa_alloc_stats {
  * @num_idle_pages: Length of @idle
  * @max_idle_pages: High watermark of @idle before async release to the buddy allocator
  * @idle_jiffies: Timestamp (jiffies) when @idle last exceeded @max_idle_pages
+ * @scrub_demand: Dirty blocks zeroed inline since the scrubber last ran
  * @blocks_in_use: Blocks handed out and not yet freed
- * @nid:	NUMA node id
+ * @nid:	NUMA node whose worker scrubs this allocator
  * @node:	Node in the global pisa_allocs list
  * @name:	Debug name (defaults to caller of pisa_create())
  * @stats:	Per-allocator statistics
@@ -162,6 +163,7 @@ struct pisa_alloc {
 	struct list_head	full;
 	unsigned int		num_idle_pages;
 	unsigned int		max_idle_pages;
+	unsigned int		scrub_demand;
 	unsigned long		idle_jiffies;
 	unsigned long		blocks_in_use;
 	/* Cold. */
@@ -187,7 +189,8 @@ struct pisa_node {
 	spinlock_t		lock;		/* protects @pages and @nr_pages */
 	struct list_head	pages;		/* reservoir */
 	unsigned int		nr_pages;
-	struct work_struct	work;		/* refill/trim, on this node */
+	unsigned long		flags;		/* PISA_NODE_* requests */
+	struct work_struct	work;		/* refill/trim/scrub, on this node */
 } ____cacheline_aligned_in_smp;
 
 /* Per-NUMA-node PISA state (ring/TX/user allocators, reservoir). */
@@ -263,11 +266,15 @@ static inline struct page *pisa_alloc(struct pisa_alloc *pa, gfp_t gfp)
 unsigned long pisa_shrink_list(spinlock_t *lock, struct list_head *list,
 			       unsigned int *nr, struct list_head *release_list,
 			       unsigned long nr_to_scan);
+extern unsigned int pisa_scrub_max;
+bool pisa_scrub_node(int nid);
 
 /* pisa-node.c: per-NUMA-node PISA page reservoir and work item */
 extern unsigned int pisa_reservoir_max;
 void pisa_node_init(void);
 void pisa_schedule_reservoir(void);
+void pisa_schedule_scrub(int nid);
+void pisa_schedule_scrub_all(void);
 struct pisa_meta *pisa_reservoir_pop(int nid, gfp_t gfp, bool decrypt, bool *clean);
 unsigned long pisa_reservoir_count(void);
 unsigned long pisa_reservoir_shrink(struct list_head *release_list, unsigned long nr_to_scan);
