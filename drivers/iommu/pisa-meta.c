@@ -272,6 +272,7 @@ int pisa_meta_init(void)
 
 	/* Register outside pisa_meta_mutex (taken by the notifier under chain lock). */
 	register_memory_notifier(&pisa_meta_memory_nb);
+	pisa_schedule_reservoir();
 	return 0;
 
 out_free_vm:

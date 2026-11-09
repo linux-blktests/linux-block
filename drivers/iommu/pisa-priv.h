@@ -4,12 +4,14 @@
 
 #include <linux/dma-direction.h>
 #include <linux/pisa.h>
+#include <linux/jiffies.h>
 #include <linux/list.h>
 #include <linux/llist.h>
 #include <linux/nodemask.h>
 #include <linux/spinlock.h>
 #include <linux/topology.h>
 #include <linux/types.h>
+#include <linux/workqueue.h>
 
 #ifdef CONFIG_PISA
 
@@ -95,6 +97,19 @@ struct pisa_alloc {
 	char			name[48];
 } ____cacheline_aligned;
 
+/* Per-NUMA-node PISA state. */
+struct pisa_node {
+	unsigned long		next_alloc;	/* atomic alloc backoff jiffies */
+
+	spinlock_t		lock;		/* protects @pages and @nr_pages */
+	struct list_head	pages;		/* reservoir */
+	unsigned int		nr_pages;
+	struct work_struct	work;		/* refill/trim, on this node */
+} ____cacheline_aligned_in_smp;
+
+/* Per-NUMA-node PISA state (ring/TX/user allocators, reservoir). */
+extern struct pisa_node pisa_nodes[MAX_NUMNODES];
+
 int pisa_meta_ensure_pfn(unsigned long pfn, bool can_block);
 struct pisa_meta *pisa_meta_of_pfn(unsigned long pfn);
 unsigned long pisa_meta_to_pfn(const struct pisa_meta *meta);
@@ -102,6 +117,7 @@ unsigned long pisa_meta_to_pfn(const struct pisa_meta *meta);
 struct pisa_alloc *pisa_create(int nid, unsigned int order, enum dma_data_direction dir);
 __printf(2, 3)
 void pisa_set_name(struct pisa_alloc *pa, const char *fmt, ...);
+void pisa_release_page(struct pisa_meta *meta);
 
 static inline int pisa_sanitize_nid(int nid)
 {
@@ -111,6 +127,20 @@ static inline int pisa_sanitize_nid(int nid)
 		nid = first_memory_node;
 	return nid;
 }
+
+static inline void pisa_alloc_backoff(int nid, bool can_block)
+{
+	nid = pisa_sanitize_nid(nid);
+	if (!can_block)
+		WRITE_ONCE(pisa_nodes[nid].next_alloc, jiffies + DIV_ROUND_UP(HZ, 100));
+}
+
+/* pisa-node.c: per-NUMA-node PISA page reservoir and work item */
+extern unsigned int pisa_reservoir_max;
+void pisa_node_init(void);
+void pisa_schedule_reservoir(void);
+struct pisa_meta *pisa_reservoir_pop(int nid, gfp_t gfp, bool *clean);
+unsigned long pisa_reservoir_count(void);
 
 #endif /* CONFIG_PISA */
 #endif /* _DRIVERS_IOMMU_PISA_PRIV_H */

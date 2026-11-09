@@ -46,6 +46,14 @@ module_param_named(idle_ms, pisa_idle_ms, uint, 0644);
 static LIST_HEAD(pisa_allocs);
 static DEFINE_RWLOCK(pisa_allocs_lock);
 
+/* Per-NUMA-node PISA state (ring/TX/user allocators, reservoir). */
+struct pisa_node pisa_nodes[MAX_NUMNODES] = {
+	[0 ... MAX_NUMNODES - 1] = {
+		.next_alloc = INITIAL_JIFFIES,
+		.lock = __SPIN_LOCK_UNLOCKED(pisa_nodes.lock),
+	},
+};
+
 static void pisa_schedule_reclaim(void);
 
 /*
@@ -75,8 +83,13 @@ static void pisa_release_page_rcu(struct rcu_head *head)
 }
 
 /* Unmap a retired PISA page, clear PISA_ACTIVE, and queue RCU release. */
-static void pisa_release_page(struct pisa_meta *meta)
+void pisa_release_page(struct pisa_meta *meta)
 {
+	if (!meta->pa) {
+		__free_pages(pfn_to_page(pisa_meta_to_pfn(meta)), PISA_ORDER);
+		return;
+	}
+
 	/* pisa_unmap_all(meta) will be called here once IOMMU mappings are added. */
 
 	/* Clear PISA_ACTIVE before the RCU grace period so new readers stop entering. */
@@ -359,6 +372,8 @@ bool __pisa_free_page(struct page *page)
 
 static int __init pisa_init(void)
 {
+	pisa_node_init();
+
 	/* Dedicated WQ_MEM_RECLAIM workqueue so reclaim never blocks behind system_wq. */
 	pisa_wq = alloc_workqueue("pisa", WQ_MEM_RECLAIM, 0);
 	if (!pisa_wq)
