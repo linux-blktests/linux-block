@@ -1290,9 +1290,10 @@ new_segment:
 			copy = msg_data_left(msg);
 
 		if (zc == 0) {
+			const struct dst_entry *dst = __sk_dst_get(sk);
 			bool merge = true;
 			int i = skb_shinfo(skb)->nr_frags;
-			struct page_frag *pfrag = sk_page_frag(sk);
+			struct page_frag *pfrag = sk_page_frag_dst(sk, dst);
 
 			if (!sk_page_frag_refill(sk, pfrag))
 				goto wait_for_space;

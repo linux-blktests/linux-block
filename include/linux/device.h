@@ -814,6 +814,15 @@ struct device {
 	DECLARE_BITMAP(flags, DEV_FLAG_COUNT);
 };
 
+#if defined(CONFIG_NET) && defined(CONFIG_PISA)
+int net_pisa_tx_bufs_set(struct device *dev, bool val);
+#else
+static inline int net_pisa_tx_bufs_set(struct device *dev, bool val)
+{
+	return -EOPNOTSUPP;
+}
+#endif
+
 #define __create_dev_flag_accessors(accessor_name, flag_name) \
 static inline bool dev_##accessor_name(const struct device *dev) \
 { \

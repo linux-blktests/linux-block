@@ -2670,6 +2670,95 @@ static inline struct page_frag *sk_page_frag(struct sock *sk)
 	return &sk->sk_frag;
 }
 
+/* 256-jiffy cache in dev->pisa_tx_stamp; see netdev_tx_pisa_refresh(). */
+#define PISA_TX_STAMP_OK	BIT(0)
+#define PISA_TX_STAMP_MASK	(~0xffU)
+
+#ifdef CONFIG_PISA
+DECLARE_STATIC_KEY_FALSE(net_pisa_tx_bufs_key);
+
+static inline bool net_pisa_tx_bufs_enabled(void)
+{
+	return static_branch_unlikely(&net_pisa_tx_bufs_key);
+}
+
+bool netdev_tx_pisa_refresh(struct net_device *dev, u32 now);
+
+static inline bool __netdev_tx_pisa_ok(const struct net_device *dev)
+{
+	u32 stamp, now;
+
+	if (!dev)
+		return false;
+	stamp = READ_ONCE(dev->pisa_tx_stamp);
+	now = (u32)jiffies & PISA_TX_STAMP_MASK;
+	if (likely((stamp & PISA_TX_STAMP_MASK) == now))
+		return stamp & PISA_TX_STAMP_OK;
+	return netdev_tx_pisa_refresh((struct net_device *)dev, now);
+}
+#else
+static inline bool net_pisa_tx_bufs_enabled(void)
+{
+	return false;
+}
+
+static inline bool __netdev_tx_pisa_ok(const struct net_device *dev)
+{
+	return false;
+}
+#endif
+
+/*
+ * May TX payload routed through @dst be copied into PISA pages? Those pages
+ * stay readable by every device that mapped them for as long as they are
+ * active, so only data that leaves the host in clear qualifies: IPsec payload
+ * is still plaintext here.
+ */
+static inline bool dst_tx_pisa_ok(const struct dst_entry *dst)
+{
+	bool ok = false;
+
+	if (!net_pisa_tx_bufs_enabled() || !dst)
+		return false;
+
+	rcu_read_lock();
+	if (!dst_xfrm(dst))
+		ok = __netdev_tx_pisa_ok(dst_dev_rcu(dst));
+	rcu_read_unlock();
+	return ok;
+}
+
+/* Is @pfrag the task's frag reserved for PISA-eligible data? */
+static inline bool is_pisa_pfrag(const struct page_frag *pfrag)
+{
+#ifdef CONFIG_PISA
+	return pfrag == &current->task_frag_pisa;
+#else
+	return false;
+#endif
+}
+
+/* current->task_frag, or its PISA twin if @dst qualifies. */
+static inline struct page_frag *task_page_frag(const struct dst_entry *dst)
+{
+#ifdef CONFIG_PISA
+	if (dst_tx_pisa_ok(dst))
+		return &current->task_frag_pisa;
+#endif
+	return &current->task_frag;
+}
+
+/*
+ * sk_page_frag() for data routed through @dst. PISA pages only ever enter
+ * current->task_frag_pisa, so data of sockets that do not qualify (or that use
+ * sk_page_frag() directly: kTLS, sockmap, KCM, MPTCP) never lands in them.
+ */
+static inline struct page_frag *sk_page_frag_dst(struct sock *sk,
+						 const struct dst_entry *dst)
+{
+	return sk->sk_use_task_frag ? task_page_frag(dst) : &sk->sk_frag;
+}
+
 bool sk_page_frag_refill(struct sock *sk, struct page_frag *pfrag);
 
 static inline bool __sock_writeable(const struct sock *sk, int wmem_alloc)

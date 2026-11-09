@@ -1486,7 +1486,10 @@ static int __ip6_append_data(struct sock *sk,
 		dst_exthdrlen = rt->dst.header_len - rt->rt6i_nfheader_len;
 	}
 
-	paged = !!cork->gso_size;
+	paged = !!cork->gso_size ||
+		(sk->sk_type != SOCK_RAW &&
+		 (rt->dst.dev->features & NETIF_F_SG) &&
+		 is_pisa_pfrag(pfrag));
 	mtu = cork->gso_size ? IP6_MAX_MTU : cork->fragsize;
 	orig_mtu = mtu;
 
@@ -1889,8 +1892,8 @@ int ip6_append_data(struct sock *sk,
 	}
 
 	return __ip6_append_data(sk, &sk->sk_write_queue, &inet->cork,
-				 sk_page_frag(sk), getfrag,
-				 from, length, transhdrlen, flags);
+				 sk_page_frag_dst(sk, inet->cork.base.dst),
+				 getfrag, from, length, transhdrlen, flags);
 }
 EXPORT_SYMBOL_GPL(ip6_append_data);
 
@@ -2092,7 +2095,7 @@ struct sk_buff *ip6_make_skb(struct sock *sk,
 	}
 
 	err = __ip6_append_data(sk, &queue, cork,
-				&current->task_frag, getfrag, from,
+				task_page_frag(cork->base.dst), getfrag, from,
 				length + exthdrlen, transhdrlen + exthdrlen,
 				flags);
 	if (err) {

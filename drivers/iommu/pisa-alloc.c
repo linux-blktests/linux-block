@@ -644,6 +644,63 @@ bool pisa_has_free_blocks_rx(const struct device *dev, unsigned int order, int n
 }
 EXPORT_SYMBOL(pisa_has_free_blocks_rx);
 
+#ifdef CONFIG_NET
+/* Enabled while at least one device has pisa_tx_bufs set. */
+DEFINE_STATIC_KEY_FALSE(net_pisa_tx_bufs_key);
+EXPORT_SYMBOL(net_pisa_tx_bufs_key);
+
+int net_pisa_tx_bufs_set(struct device *dev, bool val)
+{
+	static DEFINE_MUTEX(lock);
+
+	mutex_lock(&lock);
+	if (dev->pisa_tx_bufs != val) {
+		WRITE_ONCE(dev->pisa_tx_bufs, val);
+		if (val)
+			static_branch_inc(&net_pisa_tx_bufs_key);
+		else
+			static_branch_dec(&net_pisa_tx_bufs_key);
+	}
+	mutex_unlock(&lock);
+	return 0;
+}
+
+/*
+ * The sysfs attribute pisa_tx_bufs lives on the physical DMA parent
+ * (dev->dev.parent), whereas a socket route (dst->dev) may point to an upper
+ * virtual net_device (bond, VLAN, ipvlan, etc.). Walking lower devices via
+ * netdev_walk_all_lower_dev_rcu() on every TX allocation would be too
+ * expensive, so dev->pisa_tx_stamp caches the walk result on the net_device
+ * and refreshes it at most once every 256 jiffies:
+ *   bit 0 (PISA_TX_STAMP_OK):         pisa_tx_bufs enabled on lower device(s)
+ *   bits 31..8 (PISA_TX_STAMP_MASK):  upper 24 bits of (u32)jiffies
+ */
+static int netdev_pisa_tx_bufs_walk(struct net_device *dev, struct netdev_nested_priv *priv)
+{
+	return dev->dev.parent && READ_ONCE(dev->dev.parent->pisa_tx_bufs);
+}
+
+/* Slow path of __netdev_tx_pisa_ok(): refresh dev->pisa_tx_stamp. */
+bool netdev_tx_pisa_refresh(struct net_device *dev, u32 now)
+{
+	bool ok;
+
+	if (dev->dev.parent) {
+		ok = READ_ONCE(dev->dev.parent->pisa_tx_bufs);
+	} else {
+		rcu_read_lock();
+		ok = netdev_walk_all_lower_dev_rcu(dev,
+						   netdev_pisa_tx_bufs_walk,
+						   NULL) != 0;
+		rcu_read_unlock();
+	}
+	now |= ok ? PISA_TX_STAMP_OK : 0;
+	WRITE_ONCE(dev->pisa_tx_stamp, now);
+	return now & PISA_TX_STAMP_OK;
+}
+EXPORT_SYMBOL(netdev_tx_pisa_refresh);
+#endif /* CONFIG_NET */
+
 /*
  * Split a non-compound page of @old_order into 1 << (@old_order - @new_order)
  * pages of @new_order (compound if @new_order > 0), all frozen at refcount 0.

@@ -986,7 +986,10 @@ static int __ip_append_data(struct sock *sk,
 
 	exthdrlen = !skb ? rt->dst.header_len : 0;
 	mtu = cork->gso_size ? IP_MAX_MTU : cork->fragsize;
-	paged = !!cork->gso_size;
+	paged = !!cork->gso_size ||
+		(sk->sk_type != SOCK_RAW &&
+		 (rt->dst.dev->features & NETIF_F_SG) &&
+		 is_pisa_pfrag(pfrag));
 
 	hh_len = LL_RESERVED_SPACE(rt->dst.dev);
 
@@ -1383,8 +1386,8 @@ int ip_append_data(struct sock *sk, struct flowi4 *fl4,
 	}
 
 	return __ip_append_data(sk, fl4, &sk->sk_write_queue, &inet->cork.base,
-				sk_page_frag(sk), getfrag,
-				from, length, transhdrlen, flags);
+				sk_page_frag_dst(sk, inet->cork.base.dst),
+				getfrag, from, length, transhdrlen, flags);
 }
 
 static void ip_cork_release(struct inet_cork *cork)
@@ -1592,7 +1595,7 @@ struct sk_buff *ip_make_skb(struct sock *sk,
 		return ERR_PTR(err);
 
 	err = __ip_append_data(sk, fl4, &queue, cork,
-			       &current->task_frag, getfrag,
+			       task_page_frag(cork->dst), getfrag,
 			       from, length, transhdrlen, flags);
 	if (err) {
 		__ip_flush_pending_frames(sk, &queue, cork);

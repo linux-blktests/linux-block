@@ -1455,6 +1455,10 @@ struct task_struct {
 	struct pipe_inode_info		*splice_pipe;
 
 	struct page_frag		task_frag;
+#ifdef CONFIG_PISA
+	/* TX frag that may hold PISA pages, see sk_page_frag_dst(). */
+	struct page_frag		task_frag_pisa;
+#endif
 
 #ifdef CONFIG_ARCH_HAS_LAZY_MMU_MODE
 	struct lazy_mmu_state		lazy_mmu_state;

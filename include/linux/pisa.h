@@ -107,6 +107,18 @@ static inline gfp_t pisa_rx_gfp(const struct device *dev)
 	return dev && READ_ONCE(dev->pisa_rx_bufs) ? __GFP_PISA_RW : 0;
 }
 
+/* current->task_frag_pisa lifetime, see task_page_frag(). */
+static inline void pisa_task_frag_init(struct task_struct *tsk)
+{
+	tsk->task_frag_pisa.page = NULL;
+}
+
+static inline void pisa_task_frag_release(struct task_struct *tsk)
+{
+	if (tsk->task_frag_pisa.page)
+		put_page(tsk->task_frag_pisa.page);
+}
+
 #else /* !CONFIG_PISA */
 
 static inline int pisa_meta_init(void)
@@ -162,6 +174,14 @@ static inline bool pisa_has_free_blocks_rx(const struct device *dev,
 					   unsigned int order, int nid)
 {
 	return false;
+}
+
+static inline void pisa_task_frag_init(struct task_struct *tsk)
+{
+}
+
+static inline void pisa_task_frag_release(struct task_struct *tsk)
+{
 }
 
 #endif /* CONFIG_PISA */

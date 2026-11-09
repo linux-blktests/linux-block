@@ -115,6 +115,7 @@
 #include <linux/memcontrol.h>
 #include <linux/prefetch.h>
 #include <linux/compat.h>
+#include <linux/pisa.h>
 #include <linux/mroute.h>
 #include <linux/mroute6.h>
 #include <linux/icmpv6.h>
@@ -3257,13 +3258,20 @@ DEFINE_STATIC_KEY_FALSE(net_high_order_alloc_disable_key);
  */
 bool skb_page_frag_refill(unsigned int sz, struct page_frag *pfrag, gfp_t gfp)
 {
+	/* PISA pages only go into current->task_frag_pisa, see sk_page_frag_dst(). */
+	if (is_pisa_pfrag(pfrag))
+		gfp |= __GFP_PISA_RO;
+
 	if (pfrag->page) {
+		if ((gfp & __GFP_PISA_RO) && !pisa_page_can_recycle(pfrag->page))
+			goto drop_page;
 		if (page_ref_count(pfrag->page) == 1) {
 			pfrag->offset = 0;
 			return true;
 		}
 		if (pfrag->offset + sz <= pfrag->size)
 			return true;
+drop_page:
 		put_page(pfrag->page);
 	}
 
@@ -3288,6 +3296,39 @@ bool skb_page_frag_refill(unsigned int sz, struct page_frag *pfrag, gfp_t gfp)
 	return false;
 }
 EXPORT_SYMBOL(skb_page_frag_refill);
+
+/**
+ * skb_page_frag_refill_dev - GFP_ATOMIC skb_page_frag_refill() for @skb TX
+ * @sz: minimum size of the fragment we want to get
+ * @pfrag: pointer to page_frag, private to the caller
+ * @skb: packet being transmitted
+ *
+ * Pages come from the per-node DMA_TO_DEVICE PISA allocators when they are
+ * useful for @skb's egress device (__netdev_tx_pisa_ok()), otherwise from the
+ * buddy allocator. PISA pages are readable by every device that maps them
+ * while they stay active, so @pfrag must only ever hold data meant for devices,
+ * e.g. ciphertext; it may mix PISA and ordinary pages.
+ */
+bool skb_page_frag_refill_dev(unsigned int sz, struct page_frag *pfrag,
+			      const struct sk_buff *skb)
+{
+	gfp_t gfp = GFP_ATOMIC;
+
+	/*
+	 * Before ip_finish_output2() populates skb->dev (e.g. esp_output),
+	 * the egress device is carried by skb_dst(skb).
+	 */
+	if (net_pisa_tx_bufs_enabled()) {
+		const struct dst_entry *dst = skb_dst(skb);
+
+		rcu_read_lock();
+		if (__netdev_tx_pisa_ok(skb->dev ?: (dst ? dst_dev_rcu(dst) : NULL)))
+			gfp |= __GFP_PISA_RO;
+		rcu_read_unlock();
+	}
+	return skb_page_frag_refill(sz, pfrag, gfp);
+}
+EXPORT_SYMBOL(skb_page_frag_refill_dev);
 
 bool sk_page_frag_refill(struct sock *sk, struct page_frag *pfrag)
 {
