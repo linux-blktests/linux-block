@@ -5345,6 +5345,12 @@ Kernel parameters
 	pirq=		[SMP,APIC] Manual mp-table setup
 			See Documentation/arch/x86/i386/IO-APIC.rst.
 
+	pisa.*=		[IOMMU] Pre-mapped IOVA Superpage Allocator (PISA)
+			tuning parameters (max_bits, max_pages, slots, max_idle,
+			idle_ms, reservoir_max, scrub_max, compact, wasted_pct,
+			old_ms, pcp_batch, user_max_4K_pages, scrub_migrate).
+			See Documentation/core-api/pisa.rst.
+
 	plip=		[PPT,NET] Parallel port network link
 			Format: { parport<nr> | timid | 0 }
 			See also Documentation/admin-guide/parport.rst.
