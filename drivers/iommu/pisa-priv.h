@@ -53,6 +53,7 @@ enum {
  * Lock hierarchy:
  * - pisa_allocs_lock (rwlock): outermost; protects pisa_allocs list.
  * - pisa_meta_mutex (mutex): serializes pisa_meta_init() and page-table alloc.
+ * - pcp->lock (spinlock, irqsave): per-CPU block cache.
  * - pa->lock (spinlock, irqsave): per-allocator lists, bitmaps, and stats.
  * - pisa_domains[].map_lock (spinlock, irqsave): first-time iommu_map() in __pisa_map_phys().
  * - pisa_domains_lock (spinlock, irqsave): leaf lock over pisa_domains[]/windows.
@@ -105,11 +106,28 @@ static inline unsigned int pisa_meta_avail(const struct pisa_meta *meta)
 	return meta->nr_clean + meta->nr_dirty;
 }
 
+/* Per-CPU front cache of free blocks at refcount 0, see pisa_enable_pcp(). */
+#define PISA_PCP_HIGH	64U	/* blocks cached per CPU at most */
+#define PISA_PCP_BATCH	32U	/* blocks moved per refill or flush */
+
+struct pisa_pcp {
+	spinlock_t	lock;	/* by this CPU, or by a drain from any CPU */
+	unsigned int	count;
+	struct page	*blocks[PISA_PCP_HIGH];
+};
+
+/* Per-allocator statistics, see pisa_allocs_show(). */
+struct pisa_alloc_stats {
+	u64		page_alloc_cnt;
+	u64		page_free_cnt;
+};
+
 /**
  * struct pisa_alloc - Allocator managing 2MB-backed blocks of a fixed order
- * @lock:	Spinlock protecting lists and block bitmaps
+ * @lock:	Spinlock protecting lists, block bitmaps, and u64 @stats
  * @order:	Block order managed by this allocator (<= PISA_ORDER)
  * @prot:	IOMMU_READ and/or IOMMU_WRITE from @dir passed to pisa_create()
+ * @pcp:	Per-CPU block caches, or NULL (see pisa_enable_pcp())
  * @partial:	Partially used PISA pages with @nr_clean > 0
  * @partial_dirty: Partially used PISA pages with @nr_clean == 0 and @nr_dirty > 0
  * @idle:	Completely free PISA pages (reclaimable under pressure)
@@ -117,15 +135,18 @@ static inline unsigned int pisa_meta_avail(const struct pisa_meta *meta)
  * @num_idle_pages: Length of @idle
  * @max_idle_pages: High watermark of @idle before async release to the buddy allocator
  * @idle_jiffies: Timestamp (jiffies) when @idle last exceeded @max_idle_pages
+ * @blocks_in_use: Blocks handed out and not yet freed
  * @nid:	NUMA node id
  * @node:	Node in the global pisa_allocs list
  * @name:	Debug name (defaults to caller of pisa_create())
+ * @stats:	Per-allocator statistics
  */
 struct pisa_alloc {
 	/* First cacheline: hot fields touched on block alloc and free. */
 	spinlock_t		lock;
 	u8			order;
 	u8			prot;
+	struct pisa_pcp __percpu *pcp;
 	struct list_head	partial;
 	struct list_head	partial_dirty;
 	struct list_head	idle;
@@ -133,11 +154,21 @@ struct pisa_alloc {
 	unsigned int		num_idle_pages;
 	unsigned int		max_idle_pages;
 	unsigned long		idle_jiffies;
+	unsigned long		blocks_in_use;
 	/* Cold. */
 	int			nid;
 	struct list_head	node;
 	char			name[48];
+	struct pisa_alloc_stats	stats;
 } ____cacheline_aligned;
+
+/* Active non-idle PISA pages held by @pa, for soft compaction checks. */
+static inline long pisa_alloc_held_pages(const struct pisa_alloc *pa)
+{
+	return (long)(READ_ONCE(pa->stats.page_alloc_cnt) -
+		      READ_ONCE(pa->stats.page_free_cnt)) -
+	       READ_ONCE(pa->num_idle_pages);
+}
 
 /* Per-NUMA-node PISA state. */
 struct pisa_node {
@@ -202,6 +233,8 @@ struct pisa_alloc *pisa_create(int nid, unsigned int order, enum dma_data_direct
 struct pisa_alloc *pisa_node_pa(int nid, unsigned int order, bool ro);
 __printf(2, 3)
 void pisa_set_name(struct pisa_alloc *pa, const char *fmt, ...);
+int pisa_enable_pcp(struct pisa_alloc *pa);
+void pisa_pcp_drain(struct pisa_alloc *pa);
 void pisa_release_page(struct pisa_meta *meta);
 unsigned long pisa_alloc_bulk(struct pisa_alloc *pa, gfp_t gfp,
 			      unsigned long nr_pages, struct page **page_array, bool frozen);

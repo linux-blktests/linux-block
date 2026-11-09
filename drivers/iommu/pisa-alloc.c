@@ -9,6 +9,7 @@
 #include <linux/bitmap.h>
 #include <linux/bitops.h>
 #include <linux/cache.h>
+#include <linux/cpuhotplug.h>
 #include <linux/device.h>
 #include <linux/dma-direct.h>
 #include <linux/dma-map-ops.h>
@@ -24,6 +25,7 @@
 #include <linux/moduleparam.h>
 #include <linux/mutex.h>
 #include <linux/page_owner.h>
+#include <linux/percpu.h>
 #include <linux/pgalloc_tag.h>
 #include <linux/rcupdate.h>
 #include <linux/sched/mm.h>
@@ -60,6 +62,10 @@ module_param_named(max_idle, pisa_max_idle, uint, 0644);
 static unsigned int pisa_idle_ms __read_mostly = 200;
 module_param_named(idle_ms, pisa_idle_ms, uint, 0644);
 
+/* Stop recycling partial-page blocks when free blocks exceed @pisa_compact PISA pages. */
+static unsigned int pisa_compact __read_mostly;
+module_param_named(compact, pisa_compact, uint, 0644);
+
 /* All live allocators, protected by pisa_allocs_lock. */
 static LIST_HEAD(pisa_allocs);
 static DEFINE_RWLOCK(pisa_allocs_lock);
@@ -90,7 +96,11 @@ static void pisa_release_page_rcu(struct rcu_head *head)
 	struct pisa_meta *meta = container_of(head, struct pisa_meta, rcu);
 	struct page *block, *page = pfn_to_page(pisa_meta_to_pfn(meta));
 	unsigned int i, order = meta->pa->order, slot = meta->slot;
+	unsigned long flags;
 
+	spin_lock_irqsave(&meta->pa->lock, flags);
+	meta->pa->stats.page_free_cnt++;
+	spin_unlock_irqrestore(&meta->pa->lock, flags);
 	WRITE_ONCE(meta->pa, NULL);
 
 	/* Possibly still mapped by a device: leak it, still charged. */
@@ -355,7 +365,221 @@ static void pisa_return_block_locked(struct pisa_alloc *pa, struct page *block, 
 		__set_bit(idx, meta->dirty_bitmap);
 		meta->nr_dirty++;
 	}
+	pa->blocks_in_use--;
 	*release |= pisa_place_meta(meta);
+}
+
+/**
+ * pisa_page_can_recycle - Check if a block can stay cached in a caller pool
+ * @page: Block head page
+ *
+ * Called on the recycle fast path (per-CPU cache, TX page_frag, page_pool).
+ * Fast-path cost is a static-key branch plus a READ_ONCE() of module parameters
+ * (~1-2 ns when compaction is off); when enabled, it does a lockless RCU +
+ * metadata array lookup (~5-10 ns).
+ *
+ * Return: true if @page can be recycled in place, false if it should be
+ * released back to its allocator so sparse 2MB pages can drain.
+ */
+bool pisa_page_can_recycle(const struct page *page)
+{
+	unsigned long bpp, in_use, free_blocks, pfn;
+	const struct pisa_meta *meta;
+	const struct pisa_alloc *pa;
+	unsigned int compact;
+	bool ret = true;
+	u8 on_list;
+	long held;
+
+	if (!static_branch_unlikely(&pisa_key))
+		return true;
+
+	compact = READ_ONCE(pisa_compact);
+	if (!compact)
+		return true;
+
+	pfn = page_to_pfn(page);
+	rcu_read_lock();
+	if (!is_pisa_pfn(pfn))
+		goto out;
+
+	meta = pisa_meta_of_pfn(pfn);
+	on_list = READ_ONCE(meta->on_list);
+	if (on_list == PISA_LIST_FULL || on_list == PISA_LIST_NONE)
+		goto out;
+
+	pa = meta->pa;
+	if (!pa)
+		goto out;
+
+	/* Do not drain the partial page currently being filled at list head. */
+	if (READ_ONCE(pa->partial_dirty.next) == &meta->list ||
+	    READ_ONCE(pa->partial.next) == &meta->list)
+		goto out;
+
+	bpp = PISA_BLOCKS(pa->order);
+	/* Do not drain dense pages that still have more than half their blocks in use. */
+	if (READ_ONCE(meta->nr_clean) + READ_ONCE(meta->nr_dirty) < (bpp >> 1))
+		goto out;
+
+	held = pisa_alloc_held_pages(pa);
+	in_use = READ_ONCE(pa->blocks_in_use);
+	free_blocks = held > 0 && (unsigned long)held * bpp > in_use ?
+		      (unsigned long)held * bpp - in_use : 0;
+
+	ret = free_blocks <= (unsigned long)compact * bpp;
+out:
+	rcu_read_unlock();
+	return ret;
+}
+EXPORT_SYMBOL_GPL(pisa_page_can_recycle);
+
+/* Return @n freed blocks to @pa under a single acquisition of @pa->lock. */
+static void pisa_free_bulk(struct pisa_alloc *pa, struct page **blocks, unsigned int n)
+{
+	bool release = false;
+	unsigned long flags;
+	unsigned int i;
+
+	spin_lock_irqsave(&pa->lock, flags);
+	for (i = 0; i < n; i++) {
+		if (likely(!pisa_block_poisoned(pa, blocks[i])))
+			pisa_return_block_locked(pa, blocks[i], &release);
+	}
+	spin_unlock_irqrestore(&pa->lock, flags);
+
+	if (release)
+		pisa_schedule_reclaim();
+}
+
+/*
+ * Per-CPU block cache: each CPU caches up to PISA_PCP_HIGH free blocks
+ * (refcount 0, not in bitmaps), refilling and flushing in PISA_PCP_BATCH
+ * batches. Drained by the shrinker and CPU hotplug.
+ */
+
+/* Max blocks moved per per-CPU cache refill or flush (1..PISA_PCP_BATCH). */
+static unsigned int pisa_pcp_batch __read_mostly = PISA_PCP_BATCH;
+
+static int pisa_pcp_batch_set(const char *val, const struct kernel_param *kp)
+{
+	return param_set_uint_minmax(val, kp, 1, PISA_PCP_BATCH);
+}
+
+static const struct kernel_param_ops pisa_pcp_batch_ops = {
+	.set = pisa_pcp_batch_set,
+	.get = param_get_uint,
+};
+module_param_cb(pcp_batch, &pisa_pcp_batch_ops, &pisa_pcp_batch, 0644);
+
+/* Cache @n blocks at refcount 0 on this CPU, @n <= PISA_PCP_BATCH. */
+static void pisa_pcp_push(struct pisa_alloc *pa, struct page **blocks, unsigned int n)
+{
+	unsigned int i, batch = READ_ONCE(pisa_pcp_batch);
+	struct pisa_pcp *pcp;
+	unsigned long flags;
+
+	local_irq_save(flags);
+	pcp = this_cpu_ptr(pa->pcp);
+	spin_lock(&pcp->lock);
+	for (i = 0; i < n; i++) {
+		if (pcp->count == PISA_PCP_HIGH) {
+			/* Keep the most recently freed, likely still in cache. */
+			pisa_free_bulk(pa, pcp->blocks, batch);
+			pcp->count -= batch;
+			memmove(pcp->blocks, pcp->blocks + batch,
+				pcp->count * sizeof(*pcp->blocks));
+		}
+		pcp->blocks[pcp->count++] = blocks[i];
+	}
+	spin_unlock(&pcp->lock);
+	local_irq_restore(flags);
+}
+
+/* Take up to @nr blocks, at refcount 0, from this CPU's cache. */
+static unsigned int pisa_pcp_pop(struct pisa_alloc *pa, unsigned int nr, struct page **out)
+{
+	struct pisa_pcp *pcp;
+	unsigned int got = 0;
+	unsigned long flags;
+
+	local_irq_save(flags);
+	pcp = this_cpu_ptr(pa->pcp);
+	spin_lock(&pcp->lock);
+	while (got < nr && pcp->count)
+		out[got++] = pcp->blocks[--pcp->count];
+	spin_unlock(&pcp->lock);
+	local_irq_restore(flags);
+
+	return got;
+}
+
+/* Return the blocks @cpu caches for @pa. Process context. */
+static void pisa_pcp_drain_cpu(struct pisa_alloc *pa, int cpu)
+{
+	struct pisa_pcp *pcp = per_cpu_ptr(pa->pcp, cpu);
+	unsigned long flags;
+
+	spin_lock_irqsave(&pcp->lock, flags);
+	if (pcp->count) {
+		pisa_free_bulk(pa, pcp->blocks, pcp->count);
+		pcp->count = 0;
+	}
+	spin_unlock_irqrestore(&pcp->lock, flags);
+}
+
+/* Drain every non-empty CPU cache of @pa. */
+void pisa_pcp_drain(struct pisa_alloc *pa)
+{
+	int cpu;
+
+	/* Pairs with smp_store_release() in pisa_enable_pcp(). */
+	if (!smp_load_acquire(&pa->pcp))
+		return;
+	for_each_possible_cpu(cpu) {
+		if (!READ_ONCE(per_cpu_ptr(pa->pcp, cpu)->count))
+			continue;
+		pisa_pcp_drain_cpu(pa, cpu);
+	}
+}
+
+/* Blocks in @pa's caches, for shrinker and debugfs. */
+static unsigned long pisa_pcp_count(struct pisa_alloc *pa)
+{
+	unsigned long n = 0;
+	int cpu;
+
+	if (!pa->pcp)
+		return 0;
+	for_each_possible_cpu(cpu) {
+		/* A racy sum is good enough for reclaim and statistics. */
+		n += data_race(per_cpu_ptr(pa->pcp, cpu)->count);
+	}
+	return n;
+}
+
+/**
+ * pisa_enable_pcp - Put per-CPU block caches in front of an allocator
+ * @pa: Allocator to cache
+ *
+ * Return: 0, or -ENOMEM; @pa works without the cache.
+ */
+int pisa_enable_pcp(struct pisa_alloc *pa)
+{
+	struct pisa_pcp __percpu *pcp;
+	int cpu;
+
+	if (!pa || pa->pcp)
+		return 0;
+	pcp = alloc_percpu(struct pisa_pcp);
+	if (!pcp)
+		return -ENOMEM;
+	for_each_possible_cpu(cpu)
+		spin_lock_init(&per_cpu_ptr(pcp, cpu)->lock);
+	/* Publish initialized locks; readers depend on the pointer. */
+	if (cmpxchg_release(&pa->pcp, NULL, pcp))
+		free_percpu(pcp);
+	return 0;
 }
 
 /*
@@ -412,7 +636,9 @@ bool pisa_has_free_blocks_rx(const struct device *dev, unsigned int order, int n
 		return false;
 	pa = pisa_node_pa(nid, order, false);
 	return pa &&
-	       (!list_empty_careful(&pa->partial) ||
+	       /* Pairs with cmpxchg_release() in pisa_enable_pcp(). */
+	       ((smp_load_acquire(&pa->pcp) && raw_cpu_read(pa->pcp->count)) ||
+		!list_empty_careful(&pa->partial) ||
 		!list_empty_careful(&pa->partial_dirty) ||
 		!list_empty_careful(&pa->idle));
 }
@@ -532,6 +758,7 @@ static unsigned int pisa_scan_bitmap(struct pisa_meta *meta, bool dirty,
 			break;
 	}
 	*countp -= used;
+	pa->blocks_in_use += used;
 	return got;
 }
 
@@ -638,6 +865,7 @@ static unsigned long __pisa_alloc_bulk(struct pisa_alloc *pa, gfp_t gfp, unsigne
 		meta->prot = pa->prot;
 		/* Set PISA_ACTIVE after @meta is fully set up. */
 		WRITE_ONCE(meta->flags, meta->flags | PISA_ACTIVE);
+		pa->stats.page_alloc_cnt++;
 	}
 	spin_unlock_irqrestore(&pa->lock, flags);
 
@@ -654,6 +882,49 @@ out:
 			page_ref_unfreeze(pages[i], 1);
 	}
 	return n;
+}
+
+/* Allocate @nr_pages blocks through this CPU's cache, refilling in batches on miss. */
+static unsigned long pisa_pcp_alloc(struct pisa_alloc *pa, gfp_t gfp, unsigned long nr_pages,
+				    struct page **page_array, bool frozen)
+{
+	unsigned int pcp_batch = READ_ONCE(pisa_pcp_batch);
+	unsigned long got, n, i, j;
+
+	got = pisa_pcp_pop(pa, nr_pages, page_array);
+	if (got < nr_pages) {
+		if (nr_pages - got >= pcp_batch) {
+			got += __pisa_alloc_bulk(pa, gfp, nr_pages - got,
+						 page_array + got, false, true);
+		} else {
+			struct page *batch[PISA_PCP_BATCH];
+
+			n = __pisa_alloc_bulk(pa, gfp, pcp_batch, batch, false, true);
+			for (i = 0; i < n && got < nr_pages; i++)
+				page_array[got++] = batch[i];
+			if (i < n)
+				pisa_pcp_push(pa, batch + i, n - i);
+		}
+	}
+
+	for (i = j = 0; i < got; i++) {
+		struct page *block = page_array[i];
+
+		page_array[i] = NULL;
+		/* Poisoned while cached: leak it, as pisa_scan_bitmap() does. */
+		if (pisa_block_poisoned(pa, block))
+			continue;
+		pisa_block_prep(block);
+		if (want_init_on_alloc(gfp)) {
+			memset(page_address(block), 0, PAGE_SIZE << pa->order);
+			if (frozen) /* Order zeroing before caller publishes the page. */
+				smp_wmb();
+		}
+		if (!frozen)
+			page_ref_unfreeze(block, 1);
+		page_array[j++] = block;
+	}
+	return j;
 }
 
 /**
@@ -681,11 +952,16 @@ unsigned long pisa_alloc_bulk(struct pisa_alloc *pa, gfp_t gfp,
 			i++;
 			continue;
 		}
+
 		/* Fill the run of @n NULL entries at @i. */
 		for (n = 1; i + n < nr_pages && !page_array[i + n]; n++)
 			;
-		got = __pisa_alloc_bulk(pa, gfp, n, page_array + i,
-					want_init_on_alloc(gfp), frozen);
+		/* Pairs with smp_store_release() in pisa_enable_pcp(). */
+		if (smp_load_acquire(&pa->pcp))
+			got = pisa_pcp_alloc(pa, gfp, n, page_array + i, frozen);
+		else
+			got = __pisa_alloc_bulk(pa, gfp, n, page_array + i,
+						want_init_on_alloc(gfp), frozen);
 		i += got;
 		if (got < n)
 			break;
@@ -733,10 +1009,13 @@ static struct page *pisa_take_contig(struct pisa_meta *meta, unsigned int nblock
 		for (i = 0; i < nblocks; i++) {
 			if (!pisa_block_poisoned(pa, page + i))
 				continue;
-			if (__test_and_clear_bit(off + i, meta->clean_bitmap))
+			if (__test_and_clear_bit(off + i, meta->clean_bitmap)) {
 				meta->nr_clean--;
-			else if (__test_and_clear_bit(off + i, meta->dirty_bitmap))
+				pa->blocks_in_use++;
+			} else if (__test_and_clear_bit(off + i, meta->dirty_bitmap)) {
 				meta->nr_dirty--;
+				pa->blocks_in_use++;
+			}
 			__set_bit(off + i, busy);
 			poisoned = true;
 			off += i + 1;
@@ -760,6 +1039,7 @@ static struct page *pisa_take_contig(struct pisa_meta *meta, unsigned int nblock
 		pisa_block_prep(page + i);
 		page_ref_unfreeze(page + i, 1);
 	}
+	pa->blocks_in_use += nblocks;
 	pisa_place_meta(meta);
 	return page;
 }
@@ -806,6 +1086,7 @@ void *pisa_alloc_coherent(struct page **pagep, struct device *dev,
 	pa = pisa_node_pa(dev_to_node(dev), 0, false);
 	if (!pa)
 		return NULL;
+	pisa_pcp_drain(pa);
 
 	nblocks = size >> PAGE_SHIFT;
 	align_mask = (1UL << get_order(size)) - 1;
@@ -830,6 +1111,7 @@ void *pisa_alloc_coherent(struct page **pagep, struct device *dev,
 		meta->pa = pa;
 		meta->prot = pa->prot;
 		WRITE_ONCE(meta->flags, meta->flags | PISA_ACTIVE);
+		pa->stats.page_alloc_cnt++;
 		page = pisa_take_contig(meta, nblocks, align_mask);
 		if (unlikely(!page))
 			should_release = pisa_place_meta(meta);
@@ -876,6 +1158,17 @@ bool __pisa_free_page(struct page *page)
 	if (want_init_on_free())
 		memset(page_address(page), 0, PAGE_SIZE << pa->order);
 
+	/* Pairs with cmpxchg_release() in pisa_enable_pcp(). */
+	if (smp_load_acquire(&pa->pcp) && pa->nid == numa_mem_id() &&
+	    page_to_nid(page) == numa_mem_id()) {
+		if (pisa_page_can_recycle(page)) {
+			pisa_pcp_push(pa, &page, 1);
+			return true;
+		}
+		if (this_cpu_read(pa->pcp->count))
+			pisa_pcp_drain_cpu(pa, raw_smp_processor_id());
+	}
+
 	spin_lock_irqsave(&pa->lock, flags);
 	pisa_return_block_locked(pa, page, &should_release);
 	spin_unlock_irqrestore(&pa->lock, flags);
@@ -889,15 +1182,17 @@ bool __pisa_free_page(struct page *page)
 /* Shrinker: releases reservoir pages first, then idle allocator pages. */
 static unsigned long pisa_shrink_count(struct shrinker *shrink, struct shrink_control *sc)
 {
-	unsigned long nr = pisa_reservoir_count();
+	unsigned long nr = pisa_reservoir_count() << PISA_ORDER;
 	struct pisa_alloc *pa;
 
 	read_lock(&pisa_allocs_lock);
-	list_for_each_entry(pa, &pisa_allocs, node)
-		nr += READ_ONCE(pa->num_idle_pages);
+	list_for_each_entry(pa, &pisa_allocs, node) {
+		nr += (unsigned long)READ_ONCE(pa->num_idle_pages) << PISA_ORDER;
+		nr += pisa_pcp_count(pa) << pa->order;
+	}
 	read_unlock(&pisa_allocs_lock);
 
-	return nr << PISA_ORDER;
+	return nr;
 }
 
 /* Detach PISA pages from @list onto @release_list up to @nr_to_scan base pages. */
@@ -930,6 +1225,8 @@ VISIBLE_IF_KUNIT unsigned long pisa_shrink_scan(struct shrinker *shrink, struct 
 	if (freed < sc->nr_to_scan) {
 		read_lock(&pisa_allocs_lock);
 		list_for_each_entry(pa, &pisa_allocs, node) {
+			/* Cached blocks keep PISA pages from going idle. */
+			pisa_pcp_drain(pa);
 			freed += pisa_shrink_list(&pa->lock, &pa->idle,
 						  &pa->num_idle_pages, &release_list,
 						  sc->nr_to_scan - freed);
@@ -952,15 +1249,30 @@ VISIBLE_IF_KUNIT unsigned long pisa_shrink_scan(struct shrinker *shrink, struct 
 	return freed ?: SHRINK_STOP;
 }
 
+/* Return the blocks a dead CPU cached, which nothing else would. */
+static int pisa_cpu_dead(unsigned int cpu)
+{
+	struct pisa_alloc *pa;
+
+	read_lock(&pisa_allocs_lock);
+	list_for_each_entry(pa, &pisa_allocs, node)
+		/* Pairs with smp_store_release() in pisa_enable_pcp(). */
+		if (smp_load_acquire(&pa->pcp))
+			pisa_pcp_drain_cpu(pa, cpu);
+	read_unlock(&pisa_allocs_lock);
+	return 0;
+}
+
 static int __init pisa_init(void)
 {
 	const struct {
 		u8 order;
 		bool ro;
+		bool pcp;
 	} cfg[] = {
-		{ 0, false },
-		{ 2, true },
-		{ SKB_FRAG_PAGE_ORDER, true },
+		{ 0, false, true },
+		{ 2, true, false },
+		{ SKB_FRAG_PAGE_ORDER, true, true },
 	};
 	struct shrinker *shrink;
 	int nid, i;
@@ -986,6 +1298,8 @@ static int __init pisa_init(void)
 			if (!pa)
 				continue;
 			pisa_set_name(pa, "pisa%s_o%u_n%d", ro ? "_ro" : "", order, nid);
+			if (cfg[i].pcp)
+				pisa_enable_pcp(pa);
 			pisa_nodes[nid].pa[ro][order] = pa;
 		}
 	}
@@ -994,6 +1308,10 @@ static int __init pisa_init(void)
 	pisa_wq = alloc_workqueue("pisa", WQ_MEM_RECLAIM, 0);
 	if (!pisa_wq)
 		pr_warn("pisa: no reclaim workqueue, falling back to system_wq\n");
+
+	if (cpuhp_setup_state_nocalls(CPUHP_BP_PREPARE_DYN, "iommu/pisa:dead", NULL,
+				      pisa_cpu_dead) < 0)
+		pr_warn("pisa: no CPU hotplug callback, offline CPUs keep cached blocks\n");
 
 	shrink = shrinker_alloc(0, "pisa");
 	if (!shrink) {

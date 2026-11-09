@@ -482,6 +482,82 @@ static void test_dev_pisa_attrs(struct kunit *test)
 	device_unregister(dev);
 }
 
+static void test_pcp_cache(struct kunit *test)
+{
+	struct page *blocks[PISA_PCP_HIGH + 1];
+	struct pisa_alloc *pa;
+	struct page *p1, *p2;
+	unsigned int i, n = 0;
+
+	KUNIT_EXPECT_EQ(test, pisa_enable_pcp(NULL), 0);
+	pa = pisa_node_pa(first_memory_node, 0, false);
+	KUNIT_ASSERT_NOT_NULL(test, pa);
+	KUNIT_ASSERT_EQ(test, pisa_enable_pcp(pa), 0);
+
+	p1 = pisa_alloc(pa, GFP_KERNEL);
+	KUNIT_ASSERT_NOT_NULL(test, p1);
+	__free_page(p1);
+	p2 = pisa_alloc(pa, GFP_KERNEL | __GFP_ZERO);
+	KUNIT_EXPECT_PTR_EQ(test, p2, p1);
+	if (p2)
+		__free_page(p2);
+
+	/* Overflowing PISA_PCP_HIGH flushes a batch back to the allocator. */
+	for (i = 0; i < ARRAY_SIZE(blocks); i++) {
+		blocks[i] = pisa_alloc(pa, GFP_KERNEL);
+		if (!blocks[i])
+			break;
+		n++;
+	}
+	KUNIT_EXPECT_EQ(test, n, (unsigned int)ARRAY_SIZE(blocks));
+	for (i = 0; i < n; i++)
+		__free_page(blocks[i]);
+}
+
+static void test_gfp_pisa(struct kunit *test)
+{
+	struct shrink_control sc = { .nr_to_scan = ULONG_MAX };
+	struct device dev = { .numa_node = first_memory_node };
+	struct page *p, *p_ro, *bulk[4] = {};
+	unsigned long n;
+	int i;
+
+	pisa_shrink_scan(NULL, &sc);
+	KUNIT_EXPECT_EQ(test, pisa_rx_gfp(NULL), 0);
+	KUNIT_EXPECT_EQ(test, pisa_rx_gfp(&dev), 0);
+	KUNIT_EXPECT_FALSE(test, pisa_has_free_blocks_rx(&dev, 0, first_memory_node));
+
+	dev.pisa_rx_bufs = true;
+	KUNIT_EXPECT_EQ(test, pisa_rx_gfp(&dev), __GFP_PISA_RW);
+
+	p = alloc_pages_node(first_memory_node, GFP_KERNEL | pisa_rx_gfp(&dev), 0);
+	KUNIT_ASSERT_NOT_NULL(test, p);
+	if (p) {
+		KUNIT_EXPECT_TRUE(test, is_pisa_page(p));
+		KUNIT_EXPECT_EQ(test, pisa_meta_of_pfn(page_to_pfn(p))->prot,
+				IOMMU_READ | IOMMU_WRITE);
+		__free_page(p);
+		KUNIT_EXPECT_TRUE(test, pisa_has_free_blocks_rx(&dev, 0, first_memory_node));
+	}
+
+	p_ro = alloc_pages(GFP_KERNEL | __GFP_COMP | __GFP_PISA_RO, 3);
+	KUNIT_ASSERT_NOT_NULL(test, p_ro);
+	if (p_ro) {
+		KUNIT_EXPECT_TRUE(test, is_pisa_page(p_ro));
+		KUNIT_EXPECT_EQ(test, pisa_meta_of_pfn(page_to_pfn(p_ro))->prot,
+				IOMMU_READ);
+		__free_pages(p_ro, 3);
+	}
+
+	n = alloc_pages_bulk_node(GFP_KERNEL | __GFP_PISA_RW, first_memory_node,
+				  ARRAY_SIZE(bulk), bulk);
+	KUNIT_EXPECT_EQ(test, n, ARRAY_SIZE(bulk));
+	for (i = 0; i < n; i++) {
+		KUNIT_EXPECT_TRUE(test, is_pisa_page(bulk[i]));
+		__free_page(bulk[i]);
+	}
+}
+
 static void test_reservoir_and_scrubber(struct kunit *test)
 {
 	KUNIT_ASSERT_EQ(test, pisa_meta_init(), 0);
@@ -499,6 +575,8 @@ static struct kunit_case pisa_meta_test_cases[] = {
 #endif
 	KUNIT_CASE(test_coherent_alloc_and_free),
 	KUNIT_CASE(test_dev_pisa_attrs),
+	KUNIT_CASE(test_pcp_cache),
+	KUNIT_CASE(test_gfp_pisa),
 	KUNIT_CASE(test_reservoir_and_scrubber),
 	{}
 };
