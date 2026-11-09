@@ -299,9 +299,11 @@ struct pisa_alloc *pisa_create(int nid, unsigned int order, enum dma_data_direct
 
 	spin_lock_init(&pa->lock);
 	pa->order = order;
-	pa->nid = pisa_sanitize_nid(nid);
+	pa->prot = (dir != DMA_FROM_DEVICE ? IOMMU_READ : 0) |
+		     (dir != DMA_TO_DEVICE ? IOMMU_WRITE : 0);
 	pa->max_idle_pages = READ_ONCE(pisa_max_idle) ? : 1;
 	pisa_set_name(pa, "%ps", (void *)_RET_IP_);
+	pa->nid = pisa_sanitize_nid(nid);
 	INIT_LIST_HEAD(&pa->partial);
 	INIT_LIST_HEAD(&pa->partial_dirty);
 	INIT_LIST_HEAD(&pa->idle);
@@ -607,6 +609,7 @@ static unsigned long __pisa_alloc_bulk(struct pisa_alloc *pa, gfp_t gfp, unsigne
 			goto out;
 		spin_lock_irqsave(&pa->lock, flags);
 		meta->pa = pa;
+		meta->prot = pa->prot;
 		/* Set PISA_ACTIVE after @meta is fully set up. */
 		WRITE_ONCE(meta->flags, meta->flags | PISA_ACTIVE);
 	}

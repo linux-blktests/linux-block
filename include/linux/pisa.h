@@ -5,10 +5,13 @@
 
 #include <linux/types.h>
 #include <linux/bitops.h>
+#include <linux/dma-mapping.h>
 #include <linux/jump_label.h>
 #include <linux/mm.h>
 #include <linux/numa.h>
 #include <linux/rcupdate.h>
+
+struct device;
 
 #ifdef CONFIG_PISA
 

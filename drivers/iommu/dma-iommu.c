@@ -837,6 +837,8 @@ static void __iommu_dma_unmap(struct device *dev, dma_addr_t dma_addr,
 	struct iommu_iotlb_gather iotlb_gather;
 	size_t unmapped;
 
+	if (is_pisa_iova(&cookie->win_pisa, dma_addr))
+		return;
 	dma_addr -= iova_off;
 	size = iova_align(iovad, size + iova_off);
 	iommu_iotlb_gather_init(&iotlb_gather);
@@ -863,6 +865,8 @@ static dma_addr_t __iommu_dma_map(struct device *dev, phys_addr_t phys,
 	    iommu_deferred_attach(dev, domain))
 		return DMA_MAPPING_ERROR;
 
+	if (!pisa_map_phys(&iova, dev, domain, phys, size, prot))
+		return iova;
 	/* If anyone ever wants this we'd need support in the IOVA allocator */
 	if (dev_WARN_ONCE(dev, dma_get_min_align_mask(dev) > iova_mask(iovad),
 	    "Unsupported alignment constraint\n"))
@@ -1277,6 +1281,10 @@ void iommu_dma_unmap_phys(struct device *dev, dma_addr_t dma_handle,
 {
 	phys_addr_t phys;
 
+	/* PISA mapped buffer: nothing to unmap or release. */
+	if (is_pisa_iova(&iommu_get_dma_domain(dev)->iova_cookie->win_pisa, dma_handle))
+		return;
+
 	if (attrs & (DMA_ATTR_MMIO | DMA_ATTR_REQUIRE_COHERENT)) {
 		__iommu_dma_unmap(dev, dma_handle, size);
 		return;
@@ -1478,6 +1486,13 @@ int iommu_dma_map_sg(struct device *dev, struct scatterlist *sg, int nents,
 			 */
 			break;
 		case PCI_P2PDMA_MAP_NONE:
+			/* Map PISA pages and mark as bus addresses to skip IOVA alloc and unmap. */
+			if (!pisa_map_phys(&s->dma_address, dev, domain,
+					   sg_phys(s), s_length, prot)) {
+				sg_dma_len(s) = s_length;
+				sg_dma_mark_bus_address(s);
+				continue;
+			}
 			break;
 		case PCI_P2PDMA_MAP_BUS_ADDR:
 			/*

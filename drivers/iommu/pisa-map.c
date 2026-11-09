@@ -12,6 +12,8 @@
 #include <linux/pisa.h>
 #include <linux/export.h>
 #include <linux/iommu.h>
+#include <linux/iova.h>
+#include <linux/memblock.h>
 #include <linux/mm.h>
 #include <linux/moduleparam.h>
 #include <linux/slab.h>
@@ -103,6 +105,7 @@ void __init pisa_slots_init(void)
 static struct {
 	struct iommu_domain *domain;
 	dma_addr_t base;
+	spinlock_t map_lock;	/* serialises iommu_map() in __pisa_map_phys() */
 } pisa_domains[PISA_MAX_DOMAINS] __read_mostly;
 static DEFINE_SPINLOCK(pisa_domains_lock);
 
@@ -299,4 +302,185 @@ void pisa_domain_quiesce(struct iommu_domain *domain)
 	if (done)
 		pr_debug("pisa: unmapped %u PISA pages from idle domain %p (index %d)\n",
 			 done, domain, idx);
+}
+
+/* Allocate a PISA_SIZE-aligned IOVA window of @size bytes from @domain. */
+static dma_addr_t pisa_dma_window_alloc(struct device *dev, struct iommu_domain *domain, u64 size)
+{
+	u64 limit = min_not_zero(dma_get_mask(dev), dev->bus_dma_limit);
+	struct iova_domain *iovad = pisa_dma_iovad(domain);
+	unsigned long shift, iova_len;
+	struct iova *new_iova;
+
+	limit = min_not_zero(limit, dev->coherent_dma_mask);
+
+	if (!iovad)
+		return 0;
+
+	if (domain->geometry.force_aperture)
+		limit = min_t(u64, limit, domain->geometry.aperture_end);
+
+	/* Ignore devices with too many constraints. */
+	if (limit <= DMA_BIT_MASK(32) || size > limit - PISA_SIZE)
+		return 0;
+
+	shift = iova_shift(iovad);
+	iova_len = (size + PISA_SIZE) >> shift;
+
+	/* Ignore advisory dev->iommu->pci_32bit_workaround preference. */
+	new_iova = alloc_iova(iovad, iova_len, limit >> shift, false);
+	if (!new_iova)
+		return 0;
+
+	return ALIGN((dma_addr_t)new_iova->pfn_lo << shift, PISA_SIZE);
+}
+
+/*
+ * Assign @domain an IOVA window and dense domain index on first use, recording
+ * permanent or retryable failures in @win->domain_idx.
+ */
+int pisa_window_assign(struct device *dev, struct iommu_domain *domain, struct pisa_window *win)
+{
+	u64 limit = min_not_zero(dma_get_mask(dev), dev->bus_dma_limit);
+	u64 size = pisa_window_size;
+	unsigned long flags;
+	dma_addr_t base = 0;
+	int idx, ret;
+
+	limit = min_not_zero(limit, dev->coherent_dma_mask);
+
+	if (!dev_is_dma_coherent(dev))
+		return -EOPNOTSUPP;
+
+	if (limit <= DMA_BIT_MASK(32) || size > limit - PISA_SIZE)
+		return -ENOSPC;
+
+	if (!(domain->pgsize_bitmap & PISA_SIZE)) {
+		if (cmpxchg(&win->domain_idx, PISA_IDX_NONE, PISA_IDX_NOHUGE) == PISA_IDX_NONE)
+			dev_warn_ratelimited(dev, "pisa: domain lacks a %luKB page size, not PISA\n",
+					     (unsigned long)(PISA_SIZE >> 10));
+		return -EOPNOTSUPP;
+	}
+
+	spin_lock_irqsave(&pisa_domains_lock, flags);
+
+	/* Bail if another CPU got here first, or if declined earlier. */
+	ret = win->base ? 0 : pisa_window_declined(win);
+	if (win->base || ret) {
+		spin_unlock_irqrestore(&pisa_domains_lock, flags);
+		return ret;
+	}
+
+	for (idx = 0; idx < PISA_MAX_DOMAINS; idx++) {
+		if (!pisa_domains[idx].domain && !pisa_domains[idx].base)
+			break;
+	}
+	if (idx == PISA_MAX_DOMAINS) {
+		win->idx_gen = pisa_idx_gen;
+		WRITE_ONCE(win->domain_idx, PISA_IDX_NOIDX);
+		ret = -EBUSY;
+	} else {
+		base = pisa_dma_window_alloc(dev, domain, size);
+		if (!base) {
+			WRITE_ONCE(win->domain_idx, PISA_IDX_NOWINDOW);
+			ret = -ENOSPC;
+		} else {
+			pisa_domains[idx].domain = domain;
+			pisa_domains[idx].base = base;
+			spin_lock_init(&pisa_domains[idx].map_lock);
+			WRITE_ONCE(win->domain_idx, idx + PISA_IDX_FIRST);
+			/* Publish .domain_idx before .base (paired with is_pisa_iova()). */
+			smp_store_release(&win->base, base);
+		}
+	}
+	spin_unlock_irqrestore(&pisa_domains_lock, flags);
+
+	if (ret == -EBUSY)
+		pr_warn_ratelimited("pisa: all %d domain indices in use, not PISA for domain %p until one is released\n",
+				    PISA_MAX_DOMAINS, domain);
+	else if (ret == -ENOSPC)
+		dev_warn_ratelimited(dev,
+				     "pisa: no free %llu MB IOVA range for a PISA window\n",
+				     size >> 20);
+	else
+		dev_info(dev, "pisa: domain %p index %d window %pad + %llu MB\n",
+			 domain, idx, &base, size >> 20);
+	return ret;
+}
+
+/*
+ * Compute the window IOVA of active address @phys for @dev and store it in
+ * *@iova. On first use in a domain, reserves @win via alloc_iova(), and on
+ * first use of a PISA page in that domain, installs its 2MB leaf PTE via
+ * iommu_map(..., GFP_ATOMIC) under spinlocks.
+ * Returns 0 on success, or negative errno if @phys/@prot/@dev cannot use the window.
+ */
+int __pisa_map_phys(dma_addr_t *iova, struct device *dev,
+		    struct iommu_domain *domain, phys_addr_t phys,
+		    size_t size, int prot)
+{
+	struct pisa_window *win = pisa_dma_window(domain);
+	unsigned long pfn = phys >> PAGE_SHIFT, flags;
+	struct pisa_meta *meta;
+	unsigned int domain_idx;
+	int block_prot, ret;
+	dma_addr_t addr;
+	u64 limit;
+
+	if (unlikely(!iova || !dev || !win || !dev_is_dma_coherent(dev) ||
+		     (phys & (PISA_SIZE - 1)) + size > PISA_SIZE))
+		return -EINVAL;
+
+	meta = pisa_meta_of_pfn(pfn);
+
+	/* Every leaf PTE of the page carries IOMMU_CACHE | @meta->prot. */
+	block_prot = IOMMU_CACHE | meta->prot;
+	if (unlikely(prot & ~block_prot))
+		return -EACCES;
+
+	/* Acquire pairs with the .base release in pisa_window_assign(). */
+	if (unlikely(!smp_load_acquire(&win->base))) {
+		/* Test cached decline in @domain_idx before taking @pisa_domains_lock. */
+		ret = pisa_window_declined(win);
+		if (likely(!ret))
+			ret = pisa_window_assign(dev, domain, win);
+
+		if (ret)
+			return ret;
+	}
+
+	addr = pisa_phys_to_iova(win, meta, phys);
+
+	/* Check @dev's own DMA mask and bus limit against the window IOVA. */
+	limit = min_not_zero(dma_get_mask(dev), dev->bus_dma_limit);
+	limit = min_not_zero(limit, dev->coherent_dma_mask);
+	if (unlikely(addr + size - 1 > limit))
+		return -ENOSPC;
+
+	domain_idx = win->domain_idx - PISA_IDX_FIRST;
+	if (likely(test_bit(domain_idx, meta->domains_mapped))) {
+		*iova = addr;
+		return 0;
+	}
+
+	/* First use of this PISA page in this domain: install the leaf PTE. */
+	ret = 0;
+	spin_lock_irqsave(&pisa_domains[domain_idx].map_lock, flags);
+	if (!test_bit(domain_idx, meta->domains_mapped)) {
+		phys_addr_t pisa_phys = phys & PISA_MASK;
+
+		ret = iommu_map(domain, pisa_phys_to_iova(win, meta, pisa_phys),
+				pisa_phys, PISA_SIZE, block_prot, GFP_ATOMIC);
+		if (likely(!ret)) {
+			/* Ensure leaf PTE is visible before setting the domain bit. */
+			smp_mb__before_atomic();
+			set_bit(domain_idx, meta->domains_mapped);
+		}
+	}
+	spin_unlock_irqrestore(&pisa_domains[domain_idx].map_lock, flags);
+	if (unlikely(ret))
+		return ret;
+
+	*iova = addr;
+	return 0;
 }

@@ -428,6 +428,7 @@ config PISA
 	bool "Pre-mapped IOVA Superpage Allocator"
 	depends on X86_64 || ARM64
 	depends on !PREEMPT_RT
+	select NEED_SG_DMA_FLAGS
 	default y
 	help
 	  PISA is a specialized memory allocator with an API similar to

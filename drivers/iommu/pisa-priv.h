@@ -2,7 +2,7 @@
 #ifndef _DRIVERS_IOMMU_PISA_PRIV_H
 #define _DRIVERS_IOMMU_PISA_PRIV_H
 
-#include <linux/dma-direction.h>
+#include <linux/dma-mapping.h>
 #include <linux/pisa.h>
 #include <linux/jiffies.h>
 #include <linux/list.h>
@@ -13,6 +13,7 @@
 #include <linux/types.h>
 #include <linux/workqueue.h>
 
+struct device;
 struct iommu_domain;
 struct iommu_iotlb_gather;
 
@@ -53,6 +54,7 @@ enum {
  * - pisa_allocs_lock (rwlock): outermost; protects pisa_allocs list.
  * - pisa_meta_mutex (mutex): serializes pisa_meta_init() and page-table alloc.
  * - pa->lock (spinlock, irqsave): per-allocator lists, bitmaps, and stats.
+ * - pisa_domains[].map_lock (spinlock, irqsave): first-time iommu_map() in __pisa_map_phys().
  * - pisa_domains_lock (spinlock, irqsave): leaf lock over pisa_domains[]/windows.
  * - pisa_srcu: protects pisa_domains[] readers against pisa_domain_release().
  */
@@ -60,6 +62,7 @@ enum {
 /**
  * struct pisa_meta - Metadata for a single PISA page in @pisa_meta_array
  * @flags:	PISA_ACTIVE / PISA_QUARANTINED
+ * @prot:	Owning allocator's IOMMU_READ/WRITE protection bits
  * @nr_clean:	Zeroed available blocks in @clean_bitmap
  * @nr_dirty:	Dirty available blocks in @dirty_bitmap
  * @on_list:	Current placement in @pa (enum pisa_meta_list)
@@ -74,6 +77,7 @@ enum {
  */
 struct pisa_meta {
 	u8 flags;
+	u8 prot;
 	u16 nr_clean;
 	u16 nr_dirty;
 	u8 on_list;
@@ -105,6 +109,7 @@ static inline unsigned int pisa_meta_avail(const struct pisa_meta *meta)
  * struct pisa_alloc - Allocator managing 2MB-backed blocks of a fixed order
  * @lock:	Spinlock protecting lists and block bitmaps
  * @order:	Block order managed by this allocator (<= PISA_ORDER)
+ * @prot:	IOMMU_READ and/or IOMMU_WRITE from @dir passed to pisa_create()
  * @partial:	Partially used PISA pages with @nr_clean > 0
  * @partial_dirty: Partially used PISA pages with @nr_clean == 0 and @nr_dirty > 0
  * @idle:	Completely free PISA pages (reclaimable under pressure)
@@ -120,6 +125,7 @@ struct pisa_alloc {
 	/* First cacheline: hot fields touched on block alloc and free. */
 	spinlock_t		lock;
 	u8			order;
+	u8			prot;
 	struct list_head	partial;
 	struct list_head	partial_dirty;
 	struct list_head	idle;
@@ -147,6 +153,14 @@ struct pisa_node {
 
 /* Per-NUMA-node PISA state (ring/TX/user allocators, reservoir). */
 extern struct pisa_node pisa_nodes[MAX_NUMNODES];
+
+/* IOVA of @phys inside active RAM page @meta in @win. */
+static inline dma_addr_t pisa_phys_to_iova(const struct pisa_window *win,
+					  const struct pisa_meta *meta, phys_addr_t phys)
+{
+	return win->base + ((dma_addr_t)meta->slot << PISA_SHIFT) +
+	       (phys & (PISA_SIZE - 1));
+}
 
 /* Offset of @meta from the start of a domain's window. */
 static inline dma_addr_t pisa_meta_win_offset(const struct pisa_meta *meta)
@@ -228,6 +242,18 @@ void pisa_slots_init(void);
 int pisa_slot_alloc(struct pisa_meta *meta);
 void pisa_slot_free(unsigned int slot);
 int pisa_unmap_all(struct pisa_meta *meta);
+int pisa_window_assign(struct device *dev, struct iommu_domain *domain, struct pisa_window *win);
+int __pisa_map_phys(dma_addr_t *iova, struct device *dev,
+		    struct iommu_domain *domain, phys_addr_t phys,
+		    size_t size, int prot);
+
+static inline int pisa_map_phys(dma_addr_t *iova, struct device *dev,
+				struct iommu_domain *domain, phys_addr_t phys,
+				size_t size, int prot)
+{
+	return is_pisa_phys(phys) ?
+	       __pisa_map_phys(iova, dev, domain, phys, size, prot) : -EINVAL;
+}
 
 /* Return negative errno if @win's domain was permanently/currently declined, or 0. */
 static inline int pisa_window_declined(const struct pisa_window *win)
@@ -264,6 +290,13 @@ static inline void pisa_slots_init(void) {}
 static inline int pisa_slot_alloc(struct pisa_meta *meta) { return 0; }
 static inline void pisa_slot_free(unsigned int slot) {}
 static inline int pisa_unmap_all(struct pisa_meta *meta) { return 0; }
+
+static inline int pisa_map_phys(dma_addr_t *iova, struct device *dev,
+				struct iommu_domain *domain, phys_addr_t phys,
+				size_t size, int prot)
+{
+	return -EOPNOTSUPP;
+}
 
 static inline int pisa_window_declined(const struct pisa_window *win)
 {

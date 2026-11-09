@@ -6,6 +6,7 @@
 #include <linux/gfp.h>
 #include <linux/pisa.h>
 #include <linux/iommu.h>
+#include <linux/iova.h>
 #include <linux/mm.h>
 #include <linux/shrinker.h>
 #include <linux/skbuff.h>
@@ -184,8 +185,10 @@ static void test_alloc_and_recycle(struct kunit *test)
 #ifdef CONFIG_IOMMU_DMA
 static void test_window_helpers(struct kunit *test)
 {
+	struct device dev = { .numa_node = NUMA_NO_NODE };
 	struct iommu_domain dummy_domain = {};
 	struct pisa_window win = {};
+	dma_addr_t d;
 
 	KUNIT_ASSERT_EQ(test, pisa_meta_init(), 0);
 
@@ -212,10 +215,139 @@ static void test_window_helpers(struct kunit *test)
 	win.idx_gen--;
 	KUNIT_EXPECT_EQ(test, pisa_window_declined(&win), 0);
 
+	/* A device without an IOMMU group has no PISA window. */
+	KUNIT_EXPECT_NE(test, pisa_map_phys(&d, NULL, NULL, 0, PAGE_SIZE, 0), 0);
+	KUNIT_EXPECT_NE(test, pisa_map_phys(&d, &dev, NULL, 0, PAGE_SIZE, 0), 0);
 	/* Releasing an unregistered domain with an active allocator is a safe no-op. */
 	pisa_domain_release(&dummy_domain);
 }
 
+/*
+ * Fake DMA domain for the mapping and coherent allocation tests, backed by a
+ * real iommu_dma_cookie and no-op page table ops.
+ */
+static int fake_map_pages(struct iommu_domain *domain, unsigned long iova,
+			  phys_addr_t paddr, size_t pgsize, size_t pgcount,
+			  int prot, gfp_t gfp, size_t *mapped)
+{
+	*mapped = pgsize * pgcount;
+	return 0;
+}
+
+static size_t fake_unmap_pages(struct iommu_domain *domain, unsigned long iova,
+			       size_t pgsize, size_t pgcount,
+			       struct iommu_iotlb_gather *iotlb_gather)
+{
+	return pgsize * pgcount;
+}
+
+static const struct iommu_domain_ops fake_domain_ops = {
+	.map_pages = fake_map_pages,
+	.unmap_pages = fake_unmap_pages,
+};
+
+static struct iommu_domain fake_domain = {
+	.type = IOMMU_DOMAIN_DMA,
+	.pgsize_bitmap = SZ_4K | PISA_SIZE,
+	.ops = &fake_domain_ops,
+};
+
+static void fake_domain_teardown(void *unused)
+{
+	iommu_put_dma_cookie(&fake_domain);
+	fake_domain.cookie_type = IOMMU_COOKIE_NONE;
+	fake_domain.iova_cookie = NULL;
+	iova_cache_put();
+}
+
+static int fake_domain_setup(struct kunit *test)
+{
+	int ret = iova_cache_get();
+
+	if (ret)
+		return ret;
+	ret = iommu_get_dma_cookie(&fake_domain);
+	if (ret) {
+		iova_cache_put();
+		return ret;
+	}
+	init_iova_domain(pisa_dma_iovad(&fake_domain), SZ_4K, 1);
+	return kunit_add_action_or_reset(test, fake_domain_teardown, NULL);
+}
+
+static void test_map_and_domain_lifecycle(struct kunit *test)
+{
+	struct device dev = { .init_name = "pisa_map_kunit", .numa_node = NUMA_NO_NODE,
+			      .coherent_dma_mask = DMA_BIT_MASK(64) };
+	struct shrink_control sc = { .nr_to_scan = ULONG_MAX };
+	struct pisa_window *win;
+	struct pisa_meta *meta;
+	struct pisa_alloc *pa;
+	unsigned int domain_idx;
+	dma_addr_t d1, d2;
+	struct page *p;
+	phys_addr_t phys;
+
+	dev.dma_mask = &dev.coherent_dma_mask;
+	set_dev_node(&dev, first_memory_node);
+#if defined(CONFIG_ARCH_HAS_SYNC_DMA_FOR_DEVICE) || \
+	defined(CONFIG_ARCH_HAS_SYNC_DMA_FOR_CPU) || \
+	defined(CONFIG_ARCH_HAS_SYNC_DMA_FOR_CPU_ALL)
+	dev.dma_coherent = true;
+#endif
+	KUNIT_ASSERT_EQ(test, fake_domain_setup(test), 0);
+	win = pisa_dma_window(&fake_domain);
+
+	pa = pisa_node_pa(first_memory_node, 2, true);
+	KUNIT_ASSERT_NOT_NULL(test, pa);
+	p = pisa_alloc(pa, GFP_KERNEL);
+	KUNIT_ASSERT_NOT_NULL(test, p);
+
+	phys = page_to_phys(p);
+	meta = pisa_meta_of_pfn(page_to_pfn(p));
+	KUNIT_EXPECT_TRUE(test, is_pisa_phys(phys));
+
+	/* TX-only allocator declines IOMMU_WRITE mappings. */
+	KUNIT_EXPECT_EQ(test,
+			pisa_map_phys(&d1, &dev, &fake_domain, phys, PAGE_SIZE,
+				      IOMMU_READ | IOMMU_WRITE | IOMMU_CACHE), -EACCES);
+
+	/* First map assigns the window and installs the 2MB PTE. */
+	KUNIT_ASSERT_EQ(test,
+			pisa_map_phys(&d1, &dev, &fake_domain, phys, PAGE_SIZE,
+				      IOMMU_READ | IOMMU_CACHE), 0);
+	KUNIT_EXPECT_TRUE(test, is_pisa_iova(win, d1));
+	domain_idx = win->domain_idx - PISA_IDX_FIRST;
+	KUNIT_EXPECT_TRUE(test, test_bit(domain_idx, meta->domains_mapped));
+
+	/* Second map at an offset hits the lockless fast path. */
+	KUNIT_ASSERT_EQ(test,
+			pisa_map_phys(&d2, &dev, &fake_domain, phys + 128, 256,
+				      IOMMU_READ | IOMMU_CACHE), 0);
+	KUNIT_EXPECT_EQ(test, d2, d1 + 128);
+
+	/* Quiescing the domain unmaps the PISA page but keeps the window. */
+	pisa_domain_quiesce(&fake_domain);
+	KUNIT_EXPECT_FALSE(test, test_bit(domain_idx, meta->domains_mapped));
+	KUNIT_ASSERT_EQ(test,
+			pisa_map_phys(&d2, &dev, &fake_domain, phys, PAGE_SIZE,
+				      IOMMU_READ | IOMMU_CACHE), 0);
+	KUNIT_EXPECT_EQ(test, d2, d1);
+	KUNIT_EXPECT_TRUE(test, test_bit(domain_idx, meta->domains_mapped));
+
+	/* Releasing the domain forgets the mapping bit across allocators. */
+	pisa_domain_release(&fake_domain);
+	KUNIT_EXPECT_FALSE(test, test_bit(domain_idx, meta->domains_mapped));
+
+	/* Re-map into a fresh window so shrinking exercises pisa_unmap_all(). */
+	*win = (struct pisa_window){};
+	KUNIT_EXPECT_EQ(test,
+			pisa_map_phys(&d1, &dev, &fake_domain, phys, PAGE_SIZE,
+				      IOMMU_READ | IOMMU_CACHE), 0);
+
+	__free_pages(p, 2);
+	pisa_shrink_scan(NULL, &sc);
+}
 #endif /* CONFIG_IOMMU_DMA */
 
 static void test_reservoir_and_scrubber(struct kunit *test)
@@ -231,6 +363,7 @@ static struct kunit_case pisa_meta_test_cases[] = {
 	KUNIT_CASE(test_alloc_and_recycle),
 #ifdef CONFIG_IOMMU_DMA
 	KUNIT_CASE(test_window_helpers),
+	KUNIT_CASE(test_map_and_domain_lifecycle),
 #endif
 	KUNIT_CASE(test_reservoir_and_scrubber),
 	{}
