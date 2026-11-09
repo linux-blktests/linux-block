@@ -75,11 +75,10 @@ static unsigned int pisa_compact __read_mostly;
 module_param_named(compact, pisa_compact, uint, 0644);
 
 /* Stop recycling partial pages older than @pisa_old_ms when wasted blocks > @pisa_wasted_pct%. */
-#define PISA_OLD_MS_MAX		100000U
-static unsigned int pisa_wasted_pct __read_mostly;
+unsigned int pisa_wasted_pct __read_mostly;
 module_param_named(wasted_pct, pisa_wasted_pct, uint, 0644);
 
-static unsigned int pisa_old_ms __read_mostly;
+unsigned int pisa_old_ms __read_mostly;
 module_param_named(old_ms, pisa_old_ms, uint, 0644);
 
 /* Max pages zeroed in each scrubber run (0 = disabled, capped at PISA_SCRUB_MAX_LIMIT). */
@@ -97,8 +96,6 @@ struct pisa_node pisa_nodes[MAX_NUMNODES] = {
 		.lock = __SPIN_LOCK_UNLOCKED(pisa_nodes.lock),
 	},
 };
-
-static void pisa_schedule_reclaim(void);
 
 static int pisa_scrub_set(const char *val, const struct kernel_param *kp)
 {
@@ -229,18 +226,6 @@ void pisa_release_page(struct pisa_meta *meta)
 	call_rcu(&meta->rcu, pisa_release_page_rcu);
 }
 
-/* Value of @meta->on_list. 0 is "not on an allocator list", as for a zeroed @meta. */
-enum pisa_meta_list {
-	PISA_LIST_NONE,
-	PISA_LIST_FULL,
-	PISA_LIST_IDLE_CLEAN,		/* head of @idle */
-	PISA_LIST_IDLE_DIRTY,		/* tail of @idle */
-	PISA_LIST_PARTIAL_CLEAN_DENSE,	/* head of @partial */
-	PISA_LIST_PARTIAL_CLEAN_SPARSE,	/* tail of @partial */
-	PISA_LIST_PARTIAL_DIRTY_DENSE,	/* head of @partial_dirty */
-	PISA_LIST_PARTIAL_DIRTY_SPARSE,	/* tail of @partial_dirty */
-};
-
 static void pisa_reclaim_work_fn(struct work_struct *work);
 
 /* Asynchronous reclaim worker for pisa_free_list and expired idle pages. */
@@ -285,7 +270,7 @@ static void pisa_reclaim_work_fn(struct work_struct *work)
 		queue_delayed_work(pisa_wq ?: system_wq, &pisa_reclaim_work, next_delay);
 }
 
-static void pisa_schedule_reclaim(void)
+void pisa_schedule_reclaim(void)
 {
 	struct workqueue_struct *wq = pisa_wq ?: system_wq;
 	unsigned int idle_ms = READ_ONCE(pisa_idle_ms);
@@ -301,7 +286,7 @@ static void pisa_schedule_reclaim(void)
  * become available (avail == bpp), either queues @meta to @pisa_free_list (and
  * returns true so the caller schedules reclaim) or moves it to @pa->idle.
  */
-static bool pisa_place_meta(struct pisa_meta *meta)
+bool pisa_place_meta(struct pisa_meta *meta)
 {
 	struct pisa_alloc *pa = meta->pa;
 	unsigned int avail = pisa_meta_avail(meta), bpp = PISA_BLOCKS(pa->order);
@@ -505,6 +490,9 @@ bool pisa_scrub_node(int nid)
 	struct pisa_alloc *pa;
 	bool more = false;
 
+	if (!budget)
+		goto migrate;
+
 	read_lock(&pisa_allocs_lock);
 	list_for_each_entry(pa, &pisa_allocs, node) {
 		if (pa->nid != nid || !READ_ONCE(pa->scrub_demand))
@@ -525,6 +513,16 @@ bool pisa_scrub_node(int nid)
 			break;
 	}
 	read_unlock(&pisa_allocs_lock);
+
+migrate:
+	if (READ_ONCE(pisa_scrub_migrate)) {
+		unsigned long rem = !budget ? 512 : (budget > done ? budget - done : 0);
+
+		if (rem && local_clock() < deadline)
+			more |= pisa_user_scrub_node(nid, rem, deadline);
+		else
+			more = true;
+	}
 
 	return more;
 }

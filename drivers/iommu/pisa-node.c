@@ -184,7 +184,8 @@ void pisa_schedule_scrub(int nid)
 {
 	struct pisa_node *node;
 
-	if (!READ_ONCE(pisa_scrub_max) || nid == NUMA_NO_NODE)
+	if ((!READ_ONCE(pisa_scrub_max) && !READ_ONCE(pisa_scrub_migrate)) ||
+	    nid == NUMA_NO_NODE)
 		return;
 
 	node = &pisa_nodes[nid];

@@ -1868,7 +1868,7 @@ bool dma_iova_try_alloc(struct device *dev, struct dma_iova_state *state,
 	dma_addr_t addr;
 
 	memset(state, 0, sizeof(*state));
-	if (!use_dma_iommu(dev))
+	if (!use_dma_iommu(dev) || is_pisa_phys(phys))
 		return false;
 
 	domain = iommu_get_dma_domain(dev);

@@ -37,6 +37,7 @@
 #include <linux/sched/rt.h>
 #include <linux/sched/signal.h>
 #include <linux/mm_inline.h>
+#include <linux/pisa.h>
 #include <linux/shmem_fs.h>
 #include <trace/events/writeback.h>
 
@@ -2409,6 +2410,7 @@ static pgoff_t wbc_end(struct writeback_control *wbc)
 static struct folio *writeback_get_folio(struct address_space *mapping,
 		struct writeback_control *wbc)
 {
+	pgoff_t upgraded = ULONG_MAX;
 	struct folio *folio;
 
 retry:
@@ -2421,6 +2423,12 @@ retry:
 		folio = folio_batch_next(&wbc->fbatch);
 		if (!folio)
 			return NULL;
+	}
+
+	if (folio->index != upgraded &&
+	    pisa_writeback_upgrade(mapping, folio, &wbc->index, &wbc->fbatch)) {
+		upgraded = wbc->index;
+		goto retry;
 	}
 
 	folio_lock(folio);

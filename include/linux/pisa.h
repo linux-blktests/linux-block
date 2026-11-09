@@ -10,9 +10,13 @@
 #include <linux/device.h>
 #include <linux/mm.h>
 #include <linux/numa.h>
+#include <linux/folio_batch.h>
 #include <linux/rcupdate.h>
 
+struct address_space;
+struct block_device;
 struct device;
+struct folio_batch;
 struct iommu_domain;
 
 #ifdef CONFIG_PISA
@@ -134,7 +138,15 @@ static inline void pisa_task_frag_release(struct task_struct *tsk)
 
 /* User pages in PISA blocks, see drivers/iommu/pisa-user.c */
 DECLARE_STATIC_KEY_FALSE(pisa_user_key);
-bool pisa_upgrade_user_pages(struct page **pages, unsigned int nr);
+bool pisa_upgrade_user_pages(struct page **pages, unsigned int nr,
+			     enum dma_data_direction dir, bool pinned);
+struct folio *__pisa_filemap_alloc(const struct address_space *mapping,
+				   gfp_t gfp, bool is_write);
+bool pisa_folio_upgrade(struct folio *folio, enum dma_data_direction dir,
+			struct folio_batch *fbatch);
+bool __pisa_bdev_enabled(struct block_device *bdev, enum dma_data_direction dir);
+bool __pisa_mapping_enabled(const struct address_space *mapping,
+			    enum dma_data_direction dir);
 int pisa_madvise(struct vm_area_struct *vma, unsigned long start,
 		 unsigned long end, bool to_pisa);
 
@@ -142,6 +154,49 @@ int pisa_madvise(struct vm_area_struct *vma, unsigned long start,
 static inline bool pisa_user_enabled(void)
 {
 	return static_branch_unlikely(&pisa_user_key);
+}
+
+static inline bool is_bdev_pisa_enabled(struct block_device *bdev,
+					enum dma_data_direction dir)
+{
+	return pisa_user_enabled() && __pisa_bdev_enabled(bdev, dir);
+}
+
+static inline bool pisa_mapping_enabled(const struct address_space *mapping,
+					enum dma_data_direction dir)
+{
+	return pisa_user_enabled() && __pisa_mapping_enabled(mapping, dir);
+}
+
+static inline bool pisa_filemap_upgrade(const struct address_space *mapping,
+					struct folio *folio, bool write_wait)
+{
+	return write_wait && pisa_mapping_enabled(mapping, DMA_TO_DEVICE) &&
+	       pisa_folio_upgrade(folio, DMA_TO_DEVICE, NULL);
+}
+
+static inline bool pisa_writeback_upgrade(const struct address_space *mapping,
+					  struct folio *folio, pgoff_t *index,
+					  struct folio_batch *fbatch)
+{
+	pgoff_t idx;
+
+	if (!pisa_mapping_enabled(mapping, DMA_TO_DEVICE))
+		return false;
+	idx = folio->index;
+	if (!pisa_folio_upgrade(folio, DMA_TO_DEVICE, fbatch))
+		return false;
+	*index = idx;
+	return true;
+}
+
+static inline struct folio *
+pisa_filemap_alloc(const struct address_space *mapping, gfp_t gfp,
+		   unsigned int order, bool is_write)
+{
+	if (order || !pisa_user_enabled())
+		return NULL;
+	return __pisa_filemap_alloc(mapping, gfp, is_write);
 }
 
 #else /* !CONFIG_PISA */
@@ -230,9 +285,50 @@ static inline bool pisa_user_enabled(void)
 	return false;
 }
 
-static inline bool pisa_upgrade_user_pages(struct page **pages, unsigned int nr)
+static inline bool pisa_upgrade_user_pages(struct page **pages, unsigned int nr,
+					   enum dma_data_direction dir,
+					   bool pinned)
 {
 	return false;
+}
+
+static inline bool pisa_folio_upgrade(struct folio *folio,
+				      enum dma_data_direction dir,
+				      struct folio_batch *fbatch)
+{
+	return false;
+}
+
+static inline bool is_bdev_pisa_enabled(struct block_device *bdev,
+					enum dma_data_direction dir)
+{
+	return false;
+}
+
+static inline bool pisa_mapping_enabled(const struct address_space *mapping,
+					enum dma_data_direction dir)
+{
+	return false;
+}
+
+static inline bool pisa_filemap_upgrade(const struct address_space *mapping,
+					struct folio *folio, bool write_wait)
+{
+	return false;
+}
+
+static inline bool pisa_writeback_upgrade(const struct address_space *mapping,
+					  struct folio *folio, pgoff_t *index,
+					  struct folio_batch *fbatch)
+{
+	return false;
+}
+
+static inline struct folio *
+pisa_filemap_alloc(const struct address_space *mapping, gfp_t gfp,
+		   unsigned int order, bool is_write)
+{
+	return NULL;
 }
 
 static inline int pisa_madvise(struct vm_area_struct *vma, unsigned long start,

@@ -61,6 +61,18 @@ enum {
  * - pisa_srcu: protects pisa_domains[] readers against pisa_domain_release().
  */
 
+/* Value of @meta->on_list. 0 is "not on an allocator list", as for a zeroed @meta. */
+enum pisa_meta_list {
+	PISA_LIST_NONE,
+	PISA_LIST_FULL,
+	PISA_LIST_IDLE_CLEAN,		/* head of @idle */
+	PISA_LIST_IDLE_DIRTY,		/* tail of @idle */
+	PISA_LIST_PARTIAL_CLEAN_DENSE,	/* head of @partial */
+	PISA_LIST_PARTIAL_CLEAN_SPARSE,	/* tail of @partial */
+	PISA_LIST_PARTIAL_DIRTY_DENSE,	/* head of @partial_dirty */
+	PISA_LIST_PARTIAL_DIRTY_SPARSE,	/* tail of @partial_dirty */
+};
+
 /**
  * struct pisa_meta - Metadata for a single PISA page in @pisa_meta_array
  * @flags:	PISA_ACTIVE / PISA_QUARANTINED / PISA_DECRYPTED
@@ -187,7 +199,7 @@ static inline long pisa_alloc_held_pages(const struct pisa_alloc *pa)
 struct pisa_node {
 	unsigned long		next_alloc;	/* atomic alloc backoff jiffies */
 	struct pisa_alloc	*pa[2][PISA_ORDER + 1]; /* [0]=RW, [1]=RO by order */
-	struct pisa_alloc	*user_pa;	/* user page migration pa */
+	struct pisa_alloc	*user_pa[3];	/* user/page-cache allocators by dir */
 
 	spinlock_t		lock;		/* protects @pages and @nr_pages */
 	struct list_head	pages;		/* reservoir */
@@ -243,6 +255,8 @@ static inline void pisa_alloc_backoff(int nid, bool can_block)
 		WRITE_ONCE(pisa_nodes[nid].next_alloc, jiffies + DIV_ROUND_UP(HZ, 100));
 }
 bool pisa_want_decrypt(void);
+bool pisa_place_meta(struct pisa_meta *meta);
+void pisa_schedule_reclaim(void);
 int pisa_page_prepare(struct page *page, struct pisa_meta *meta);
 int pisa_page_unprepare(struct pisa_meta *meta);
 
@@ -266,11 +280,16 @@ static inline struct page *pisa_alloc(struct pisa_alloc *pa, gfp_t gfp)
 	return page;
 }
 
+#define PISA_OLD_MS_MAX		100000U
+extern unsigned int pisa_wasted_pct;
+extern unsigned int pisa_old_ms;
+extern unsigned int pisa_scrub_migrate;
 unsigned long pisa_shrink_list(spinlock_t *lock, struct list_head *list,
 			       unsigned int *nr, struct list_head *release_list,
 			       unsigned long nr_to_scan);
 extern unsigned int pisa_scrub_max;
 bool pisa_scrub_node(int nid);
+bool pisa_user_scrub_node(int nid, unsigned long budget, u64 deadline);
 
 /* pisa-node.c: per-NUMA-node PISA page reservoir and work item */
 extern unsigned int pisa_reservoir_max;

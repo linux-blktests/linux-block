@@ -114,6 +114,7 @@
  */
 
 #include <linux/blk_plug.h>
+#include <linux/pisa.h>
 #include <linux/kernel.h>
 #include <linux/dax.h>
 #include <linux/gfp.h>
@@ -197,7 +198,9 @@ static struct folio *ractl_alloc_folio(struct readahead_control *ractl,
 {
 	struct folio *folio;
 
-	folio = filemap_alloc_folio(gfp_mask, order, NULL);
+	folio = pisa_filemap_alloc(ractl->mapping, gfp_mask, order, false);
+	if (!folio)
+		folio = filemap_alloc_folio(gfp_mask, order, NULL);
 	if (folio && ractl->dropbehind)
 		__folio_set_dropbehind(folio);
 

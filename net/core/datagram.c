@@ -651,7 +651,8 @@ static bool pisa_zc_iter(int *ret, struct sk_buff *skb, struct iov_iter *from, s
 		return false;
 
 	/* Move user pages into PISA memory, then look them up again. */
-	if (pisa_upgrade_user_pages(pages, DIV_ROUND_UP(*start + *copied, PAGE_SIZE))) {
+	if (pisa_upgrade_user_pages(pages, DIV_ROUND_UP(*start + *copied, PAGE_SIZE),
+				    DMA_TO_DEVICE, false)) {
 		iov_iter_revert(from, *copied);
 		*copied = iov_iter_get_pages2(from, pages, *length, max_pages, start);
 		if (*copied < 0) {
