@@ -170,7 +170,6 @@ static inline bool blk_should_throtl(struct bio *bio)
 		return false;
 
 	tg = blkg_to_tg(bio->bi_blkg);
-	blkcg_account_v1_bio(bio);
 
 	/* iops limit is always counted */
 	if (tg->has_rules_iops[rw])

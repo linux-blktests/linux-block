@@ -924,6 +924,7 @@ void submit_bio_noacct(struct bio *bio)
 		goto not_supported;
 	}
 
+	blkcg_account_v1_bio(bio);
 	if (blk_throtl_bio(bio))
 		return;
 	submit_bio_noacct_nocheck(bio, false);
