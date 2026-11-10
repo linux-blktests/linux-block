@@ -458,7 +458,8 @@ static bool ldm_validate_vmdb(struct parsed_partitions *state,
 	 * The last_vblkd_seq can be before the end of the vmdb, just make sure
 	 * it is not out of bounds.
 	 */
-	if ((vm->vblk_size * vm->last_vblk_seq) > (toc->bitmap1_size << 9)) {
+	if (((u64)vm->vblk_size * vm->last_vblk_seq) >
+	    (toc->bitmap1_size << 9)) {
 		ldm_crit ("VMDB exceeds allowed size specified by TOCBLOCK.  "
 				"Database is corrupt.  Aborting.");
 		goto out;
