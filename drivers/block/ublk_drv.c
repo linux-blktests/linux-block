@@ -693,8 +693,10 @@ free_req:
 			struct blk_zone *zone = buffer + i;
 
 			/* A zero length zone means no more zones in this response */
-			if (!zone->len)
-				break;
+			if (!zone->len) {
+				ret = done_zones;
+				goto out;
+			}
 
 			ret = disk_report_zone(disk, zone, done_zones, args);
 			if (ret)
