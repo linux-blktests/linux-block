@@ -275,6 +275,7 @@ static void nbd_dev_remove(struct nbd_device *nbd)
 	 */
 	mutex_lock(&nbd_index_mutex);
 	idr_remove(&nbd_index_idr, nbd->index);
+	nbd_total_devices--;
 	mutex_unlock(&nbd_index_mutex);
 	destroy_workqueue(nbd->recv_workq);
 	put_disk(disk);
@@ -1509,6 +1510,31 @@ static void nbd_config_put(struct nbd_device *nbd)
 	}
 }
 
+/*
+ * nbd_start_device() calls blk_mq_update_nr_hw_queues() with config_lock
+ * held.  del_gendisk() takes the tag set's update_nr_hwq_lock and then
+ * disk->open_mutex, while ->open()/->release() run with disk->open_mutex
+ * held and take config_lock (nbd_open(), and nbd_release() through
+ * nbd_disconnect_and_put() or nbd_config_put()), so lockdep reports the
+ * class-level cycle
+ *
+ *   config_lock -> update_nr_hwq_lock -> open_mutex -> config_lock
+ *
+ * as a possible deadlock.  It cannot happen: nbd_start_device() is called
+ * with an nbd reference held, and the open/release side takes config_lock
+ * while the open file still holds one, so nbd->refs cannot reach zero and
+ * nbd_dev_remove_work() -> del_gendisk() cannot run concurrently.  In
+ * addition, nbd_config_put() drops config_lock before nbd_put(), so the
+ * teardown path never calls del_gendisk() with config_lock held.
+ *
+ * Only the acquisitions that can reach nbd_start_device() are annotated:
+ * nbd_genl_connect(), and nbd_ioctl() for NBD_DO_IT (which ends up in
+ * nbd_start_device_ioctl()).  No other ioctl reaches it, so they keep the
+ * default subclass and stay fully checked.  This only changes the lockdep
+ * annotation, not the locking itself.
+ */
+#define NBD_CONFIG_LOCK_SETUP	1
+
 static int nbd_start_device(struct nbd_device *nbd)
 {
 	struct nbd_config *config = nbd->config;
@@ -1525,17 +1551,7 @@ static int nbd_start_device(struct nbd_device *nbd)
 		return -EINVAL;
 	}
 
-retry:
-	mutex_unlock(&nbd->config_lock);
-	blk_mq_update_nr_hw_queues(&nbd->tag_set, num_connections);
-	mutex_lock(&nbd->config_lock);
-
-	/* if another code path updated nr_hw_queues, retry until succeed */
-	if (num_connections != config->num_connections) {
-		num_connections = config->num_connections;
-		goto retry;
-	}
-
+	blk_mq_update_nr_hw_queues(&nbd->tag_set, config->num_connections);
 	nbd->pid = task_pid_nr(current);
 
 	nbd_parse_flags(nbd);
@@ -1694,7 +1710,10 @@ static int nbd_ioctl(struct block_device *bdev, blk_mode_t mode,
 	if (_IOC_TYPE(cmd) != 0xab)
 		return -EINVAL;
 
-	mutex_lock(&nbd->config_lock);
+	if (cmd == NBD_DO_IT)
+		mutex_lock_nested(&nbd->config_lock, NBD_CONFIG_LOCK_SETUP);
+	else
+		mutex_lock(&nbd->config_lock);
 
 	/* Don't allow ioctl operations on a nbd device that was created with
 	 * netlink, unless it's DISCONNECT or CLEAR_SOCK, which are fine.
@@ -2028,10 +2047,15 @@ static struct nbd_device *nbd_dev_add(int index, unsigned int refs,
 		goto out_free_work;
 
 	/*
-	 * Now publish the device.
+	 * Now publish the device.  nbd->refs and nbd_total_devices are
+	 * updated together under nbd_index_mutex, so a concurrent idr
+	 * lookup either sees a fully initialised device or one that it has
+	 * to skip because its refcount is still zero.
 	 */
+	mutex_lock(&nbd_index_mutex);
 	refcount_set(&nbd->refs, refs);
 	nbd_total_devices++;
+	mutex_unlock(&nbd_index_mutex);
 	return nbd;
 
 out_free_work:
@@ -2227,7 +2251,7 @@ again:
 		}
 	}
 
-	mutex_lock(&nbd->config_lock);
+	mutex_lock_nested(&nbd->config_lock, NBD_CONFIG_LOCK_SETUP);
 	if (refcount_read(&nbd->config_refs)) {
 		mutex_unlock(&nbd->config_lock);
 		nbd_put(nbd);
@@ -2401,22 +2425,6 @@ static int nbd_genl_reconfigure(struct sk_buff *skb, struct genl_info *info)
 		pr_err("couldn't find a device at index %d\n", index);
 		return -EINVAL;
 	}
-	if (nbd->backend) {
-		if (info->attrs[NBD_ATTR_BACKEND_IDENTIFIER]) {
-			if (nla_strcmp(info->attrs[NBD_ATTR_BACKEND_IDENTIFIER],
-				       nbd->backend)) {
-				mutex_unlock(&nbd_index_mutex);
-				dev_err(nbd_to_dev(nbd),
-					"backend image doesn't match with %s\n",
-					nbd->backend);
-				return -EINVAL;
-			}
-		} else {
-			mutex_unlock(&nbd_index_mutex);
-			dev_err(nbd_to_dev(nbd), "must specify backend\n");
-			return -EINVAL;
-		}
-	}
 	if (!refcount_inc_not_zero(&nbd->refs)) {
 		mutex_unlock(&nbd_index_mutex);
 		pr_err("device at index %d is going down\n", index);
@@ -2439,6 +2447,22 @@ static int nbd_genl_reconfigure(struct sk_buff *skb, struct genl_info *info)
 			"not configured, cannot reconfigure\n");
 		ret = -EINVAL;
 		goto out;
+	}
+
+	if (nbd->backend) {
+		if (!info->attrs[NBD_ATTR_BACKEND_IDENTIFIER]) {
+			dev_err(nbd_to_dev(nbd), "must specify backend\n");
+			ret = -EINVAL;
+			goto out;
+		}
+		if (nla_strcmp(info->attrs[NBD_ATTR_BACKEND_IDENTIFIER],
+			       nbd->backend)) {
+			dev_err(nbd_to_dev(nbd),
+				"backend image doesn't match with %s\n",
+				nbd->backend);
+			ret = -EINVAL;
+			goto out;
+		}
 	}
 
 	ret = nbd_genl_size_set(info, nbd);
@@ -2518,6 +2542,7 @@ static struct genl_family nbd_genl_family __ro_after_init = {
 	.hdrsize	= 0,
 	.name		= NBD_GENL_FAMILY_NAME,
 	.version	= NBD_GENL_VERSION,
+	.parallel_ops	= 1,
 	.module		= THIS_MODULE,
 	.small_ops	= nbd_connect_genl_ops,
 	.n_small_ops	= ARRAY_SIZE(nbd_connect_genl_ops),
@@ -2535,6 +2560,16 @@ static int populate_nbd_status(struct nbd_device *nbd, struct sk_buff *reply)
 	struct nlattr *dev_opt;
 	u8 connected = 0;
 	int ret;
+
+	/*
+	 * nbd_dev_add() inserts the device into the idr before it is fully
+	 * initialised and only publishes it (sets nbd->refs) after
+	 * add_disk(); skip a device that is not published yet or is already
+	 * going away, so that the walk never reports a device that
+	 * nbd_total_devices does not account for.
+	 */
+	if (!refcount_read(&nbd->refs))
+		return 0;
 
 	/* This is a little racey, but for status it's ok.  The
 	 * reason we don't take a ref here is because we can't
