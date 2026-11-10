@@ -6,6 +6,7 @@
  */
 
 #include <linux/mm.h>
+#include <linux/pisa.h>
 #include <linux/slab.h>
 #include <linux/sched/autogroup.h>
 #include <linux/sched/mm.h>
@@ -1009,6 +1010,7 @@ void __noreturn do_exit(long code)
 
 	if (tsk->task_frag.page)
 		put_page(tsk->task_frag.page);
+	pisa_task_frag_release(tsk);
 
 	exit_task_stack_account(tsk);
 

@@ -451,7 +451,7 @@ int esp_output_head(struct xfrm_state *x, struct sk_buff *skb, struct esp_info *
 
 			spin_lock_bh(&x->lock);
 
-			if (unlikely(!skb_page_frag_refill(allocsize, pfrag, GFP_ATOMIC))) {
+			if (unlikely(!skb_page_frag_refill_dev(allocsize, pfrag, skb))) {
 				spin_unlock_bh(&x->lock);
 				goto cow;
 			}
@@ -560,7 +560,7 @@ int esp_output_tail(struct xfrm_state *x, struct sk_buff *skb, struct esp_info *
 		allocsize = ALIGN(skb->data_len, L1_CACHE_BYTES);
 
 		spin_lock_bh(&x->lock);
-		if (unlikely(!skb_page_frag_refill(allocsize, pfrag, GFP_ATOMIC))) {
+		if (unlikely(!skb_page_frag_refill_dev(allocsize, pfrag, skb))) {
 			spin_unlock_bh(&x->lock);
 			goto error_free;
 		}

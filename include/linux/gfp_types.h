@@ -33,7 +33,7 @@ enum {
 	___GFP_IO_BIT,
 	___GFP_FS_BIT,
 	___GFP_ZERO_BIT,
-	___GFP_UNUSED_BIT,	/* 0x200u unused */
+	___GFP_PISA_RO_BIT,
 	___GFP_DIRECT_RECLAIM_BIT,
 	___GFP_KSWAPD_RECLAIM_BIT,
 	___GFP_WRITE_BIT,
@@ -68,7 +68,11 @@ enum {
 #define ___GFP_IO		BIT(___GFP_IO_BIT)
 #define ___GFP_FS		BIT(___GFP_FS_BIT)
 #define ___GFP_ZERO		BIT(___GFP_ZERO_BIT)
-/* 0x200u unused */
+#ifdef CONFIG_PISA
+#define ___GFP_PISA_RO		BIT(___GFP_PISA_RO_BIT)
+#else
+#define ___GFP_PISA_RO		0
+#endif
 #define ___GFP_DIRECT_RECLAIM	BIT(___GFP_DIRECT_RECLAIM_BIT)
 #define ___GFP_KSWAPD_RECLAIM	BIT(___GFP_KSWAPD_RECLAIM_BIT)
 #define ___GFP_WRITE		BIT(___GFP_WRITE_BIT)
@@ -94,6 +98,11 @@ enum {
 #define ___GFP_NOLOCKDEP	BIT(___GFP_NOLOCKDEP_BIT)
 #else
 #define ___GFP_NOLOCKDEP	0
+#endif
+#ifdef CONFIG_PISA
+#define ___GFP_PISA_RW			(___GFP_PISA_RO | ___GFP_WRITE)
+#else
+#define ___GFP_PISA_RW			0
 #endif
 
 /*
@@ -288,6 +297,10 @@ enum {
 
 /* Disable lockdep for GFP context tracking */
 #define __GFP_NOLOCKDEP ((__force gfp_t)___GFP_NOLOCKDEP)
+
+/* Allocate from per-node PISA allocators (fall back to buddy on failure) */
+#define __GFP_PISA_RO			((__force gfp_t)___GFP_PISA_RO)
+#define __GFP_PISA_RW			((__force gfp_t)___GFP_PISA_RW)
 
 /* Room for N __GFP_FOO bits */
 #define __GFP_BITS_SHIFT ___GFP_LAST_BIT

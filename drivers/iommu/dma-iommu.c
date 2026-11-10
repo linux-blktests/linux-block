@@ -36,6 +36,7 @@
 #include <trace/events/swiotlb.h>
 
 #include "dma-iommu.h"
+#include "pisa-priv.h"
 #include "iommu-pages.h"
 #include "iommu-priv.h"
 
@@ -76,6 +77,8 @@ struct iommu_dma_cookie {
 	struct iommu_domain *fq_domain;
 	/* Options for dma-iommu use */
 	struct iommu_dma_options options;
+	/* IOVA window reserved for PISA pages. Nothing else can go here. */
+	struct pisa_window win_pisa;
 };
 
 struct iommu_dma_msi_cookie {
@@ -426,6 +429,9 @@ void iommu_put_dma_cookie(struct iommu_domain *domain)
 {
 	struct iommu_dma_cookie *cookie = domain->iova_cookie;
 	struct iommu_dma_msi_page *msi, *tmp;
+
+	/* Drop cached PISA mappings before the IOVA domain goes away. */
+	pisa_domain_release(domain);
 
 	if (cookie->iovad.granule) {
 		iommu_dma_free_fq(cookie);
@@ -831,6 +837,8 @@ static void __iommu_dma_unmap(struct device *dev, dma_addr_t dma_addr,
 	struct iommu_iotlb_gather iotlb_gather;
 	size_t unmapped;
 
+	if (is_pisa_iova(&cookie->win_pisa, dma_addr))
+		return;
 	dma_addr -= iova_off;
 	size = iova_align(iovad, size + iova_off);
 	iommu_iotlb_gather_init(&iotlb_gather);
@@ -857,6 +865,8 @@ static dma_addr_t __iommu_dma_map(struct device *dev, phys_addr_t phys,
 	    iommu_deferred_attach(dev, domain))
 		return DMA_MAPPING_ERROR;
 
+	if (!pisa_map_phys(&iova, dev, domain, phys, size, prot))
+		return iova;
 	/* If anyone ever wants this we'd need support in the IOVA allocator */
 	if (dev_WARN_ONCE(dev, dma_get_min_align_mask(dev) > iova_mask(iovad),
 	    "Unsupported alignment constraint\n"))
@@ -1215,6 +1225,21 @@ static inline size_t iova_unaligned(struct iova_domain *iovad, phys_addr_t phys,
 	return iova_offset(iovad, phys | size);
 }
 
+/* Return @domain's PISA window, or NULL if @domain cannot use PISA. */
+struct pisa_window *pisa_dma_window(struct iommu_domain *domain)
+{
+	if (static_branch_unlikely(&iommu_deferred_attach_enabled) ||
+	    !domain || domain->cookie_type != IOMMU_COOKIE_DMA_IOVA)
+		return NULL;
+
+	return &domain->iova_cookie->win_pisa;
+}
+
+struct iova_domain *pisa_dma_iovad(struct iommu_domain *domain)
+{
+	return pisa_dma_window(domain) ? &domain->iova_cookie->iovad : NULL;
+}
+
 dma_addr_t iommu_dma_map_phys(struct device *dev, phys_addr_t phys, size_t size,
 		enum dma_data_direction dir, unsigned long attrs)
 {
@@ -1255,6 +1280,10 @@ void iommu_dma_unmap_phys(struct device *dev, dma_addr_t dma_handle,
 		size_t size, enum dma_data_direction dir, unsigned long attrs)
 {
 	phys_addr_t phys;
+
+	/* PISA mapped buffer: nothing to unmap or release. */
+	if (is_pisa_iova(&iommu_get_dma_domain(dev)->iova_cookie->win_pisa, dma_handle))
+		return;
 
 	if (attrs & (DMA_ATTR_MMIO | DMA_ATTR_REQUIRE_COHERENT)) {
 		__iommu_dma_unmap(dev, dma_handle, size);
@@ -1457,6 +1486,13 @@ int iommu_dma_map_sg(struct device *dev, struct scatterlist *sg, int nents,
 			 */
 			break;
 		case PCI_P2PDMA_MAP_NONE:
+			/* Map PISA pages and mark as bus addresses to skip IOVA alloc and unmap. */
+			if (!pisa_map_phys(&s->dma_address, dev, domain,
+					   sg_phys(s), s_length, prot)) {
+				sg_dma_len(s) = s_length;
+				sg_dma_mark_bus_address(s);
+				continue;
+			}
 			break;
 		case PCI_P2PDMA_MAP_BUS_ADDR:
 			/*
@@ -1622,6 +1658,8 @@ static void __iommu_dma_free(struct device *dev, size_t size, void *cpu_addr)
 	} else {
 		/* Lowmem means a coherent atomic or CMA allocation */
 		page = virt_to_page(cpu_addr);
+		if (pisa_free_coherent(page, alloc_size))
+			return;
 	}
 
 	if (pages)
@@ -1680,6 +1718,7 @@ void *iommu_dma_alloc(struct device *dev, size_t size, dma_addr_t *handle,
 		gfp_t gfp, unsigned long attrs)
 {
 	bool coherent = dev_is_dma_coherent(dev);
+	struct iommu_domain *domain = iommu_get_dma_domain(dev);
 	int ioprot = dma_info_to_prot(DMA_BIDIRECTIONAL, coherent, attrs);
 	bool is_alloc_cc_shared = attrs & __DMA_ATTR_ALLOC_CC_SHARED;
 	struct page *page = NULL;
@@ -1690,6 +1729,12 @@ void *iommu_dma_alloc(struct device *dev, size_t size, dma_addr_t *handle,
 		return NULL;
 
 	gfp |= __GFP_ZERO;
+
+	if (domain) {
+		cpu_addr = pisa_alloc_coherent(&page, dev, domain, size, gfp, attrs);
+		if (cpu_addr)
+			goto map;
+	}
 
 	if (gfpflags_allow_blocking(gfp) &&
 	    !(attrs & DMA_ATTR_FORCE_CONTIGUOUS)) {
@@ -1708,6 +1753,7 @@ void *iommu_dma_alloc(struct device *dev, size_t size, dma_addr_t *handle,
 			return NULL;
 	}
 
+map:
 	*handle = __iommu_dma_map(dev, page_to_phys(page), size, ioprot,
 			dev->coherent_dma_mask);
 	if (*handle == DMA_MAPPING_ERROR) {
@@ -1822,7 +1868,7 @@ bool dma_iova_try_alloc(struct device *dev, struct dma_iova_state *state,
 	dma_addr_t addr;
 
 	memset(state, 0, sizeof(*state));
-	if (!use_dma_iommu(dev))
+	if (!use_dma_iommu(dev) || is_pisa_phys(phys))
 		return false;
 
 	domain = iommu_get_dma_domain(dev);

@@ -1900,6 +1900,10 @@ int sk_getsockopt(struct sock *sk, int level, int optname,
 		  sockptr_t optval, sockptr_t optlen);
 int sock_gettstamp(struct socket *sock, void __user *userstamp,
 		   bool timeval, bool time32);
+struct sk_buff *__sock_alloc_send_pskb(struct sock *sk, unsigned long header_len,
+				       unsigned long data_len, int noblock,
+				       int *errcode, int max_page_order,
+				       gfp_t gfp);
 struct sk_buff *sock_alloc_send_pskb(struct sock *sk, unsigned long header_len,
 				     unsigned long data_len, int noblock,
 				     int *errcode, int max_page_order);
@@ -2668,6 +2672,145 @@ static inline struct page_frag *sk_page_frag(struct sock *sk)
 		return &current->task_frag;
 
 	return &sk->sk_frag;
+}
+
+/* 256-jiffy cache in dev->pisa_tx_stamp; see netdev_tx_pisa_refresh(). */
+#define PISA_TX_STAMP_BUFS	BIT(0)
+#define PISA_TX_STAMP_HEADS	BIT(1)
+#define PISA_TX_STAMP_MASK	(~0xffU)
+
+#ifdef CONFIG_PISA
+DECLARE_STATIC_KEY_FALSE(net_pisa_tx_bufs_key);
+DECLARE_STATIC_KEY_FALSE(net_pisa_tx_skb_heads_key);
+
+static inline bool net_pisa_tx_bufs_enabled(void)
+{
+	return static_branch_unlikely(&net_pisa_tx_bufs_key);
+}
+
+static inline bool net_pisa_tx_skb_heads_enabled(void)
+{
+	return static_branch_unlikely(&net_pisa_tx_skb_heads_key);
+}
+
+u32 netdev_tx_pisa_refresh(struct net_device *dev, u32 now);
+
+static inline bool __netdev_tx_pisa_ok(const struct net_device *dev, u32 flag)
+{
+	u32 stamp, now;
+
+	if (!dev)
+		return false;
+	stamp = READ_ONCE(dev->pisa_tx_stamp);
+	now = (u32)jiffies & PISA_TX_STAMP_MASK;
+	if (unlikely((stamp & PISA_TX_STAMP_MASK) != now))
+		stamp = netdev_tx_pisa_refresh((struct net_device *)dev, now);
+	return stamp & flag;
+}
+#else
+static inline bool net_pisa_tx_bufs_enabled(void)
+{
+	return false;
+}
+
+static inline bool net_pisa_tx_skb_heads_enabled(void)
+{
+	return false;
+}
+
+static inline bool __netdev_tx_pisa_ok(const struct net_device *dev, u32 flag)
+{
+	return false;
+}
+#endif
+
+/*
+ * May TX payload routed through @dst be copied into PISA pages? Those pages
+ * stay readable by every device that mapped them for as long as they are
+ * active, so only data that leaves the host in clear qualifies: IPsec payload
+ * is still plaintext here.
+ */
+static inline bool __dst_tx_pisa_ok(const struct dst_entry *dst, u32 flag)
+{
+	bool ok = false;
+
+	if (!dst)
+		return false;
+
+	rcu_read_lock();
+	if (!dst_xfrm(dst))
+		ok = __netdev_tx_pisa_ok(dst_dev_rcu(dst), flag);
+	rcu_read_unlock();
+	return ok;
+}
+
+static inline bool dst_tx_pisa_ok(const struct dst_entry *dst)
+{
+	return net_pisa_tx_bufs_enabled() &&
+	       __dst_tx_pisa_ok(dst, PISA_TX_STAMP_BUFS);
+}
+
+static inline gfp_t pisa_tx_gfp_dst(const struct dst_entry *dst)
+{
+	if (net_pisa_tx_skb_heads_enabled() &&
+	    __dst_tx_pisa_ok(dst, PISA_TX_STAMP_HEADS))
+		return __GFP_PISA_RO;
+	return 0;
+}
+
+static inline gfp_t pisa_tx_gfp_sk(const struct sock *sk)
+{
+	if (net_pisa_tx_skb_heads_enabled() && sk) {
+		bool ok;
+
+		rcu_read_lock();
+		ok = __dst_tx_pisa_ok(rcu_dereference(sk->sk_dst_cache),
+				      PISA_TX_STAMP_HEADS);
+		rcu_read_unlock();
+		if (ok)
+			return __GFP_PISA_RO;
+	}
+	return 0;
+}
+
+static inline struct sk_buff *sock_alloc_send_skb_dst(struct sock *sk,
+						      unsigned long size,
+						      int noblock, int *errcode,
+						      const struct dst_entry *dst)
+{
+	return __sock_alloc_send_pskb(sk, size, 0, noblock, errcode, 0,
+				      pisa_tx_gfp_dst(dst));
+}
+
+/* Is @pfrag the task's frag reserved for PISA-eligible data? */
+static inline bool is_pisa_pfrag(const struct page_frag *pfrag)
+{
+#ifdef CONFIG_PISA
+	return pfrag == &current->task_frag_pisa;
+#else
+	return false;
+#endif
+}
+
+/* current->task_frag, or its PISA twin if @dst qualifies. */
+static inline struct page_frag *task_page_frag(const struct dst_entry *dst)
+{
+#ifdef CONFIG_PISA
+	if (dst_tx_pisa_ok(dst))
+		return &current->task_frag_pisa;
+#endif
+	return &current->task_frag;
+}
+
+/*
+ * sk_page_frag() for data routed through @dst. PISA pages only ever enter
+ * current->task_frag_pisa, so data of sockets that do not qualify (or that use
+ * sk_page_frag() directly: kTLS, sockmap, KCM, MPTCP) never lands in them.
+ */
+static inline struct page_frag *sk_page_frag_dst(struct sock *sk,
+						 const struct dst_entry *dst)
+{
+	return sk->sk_use_task_frag ? task_page_frag(dst) : &sk->sk_frag;
 }
 
 bool sk_page_frag_refill(struct sock *sk, struct page_frag *pfrag);

@@ -81,6 +81,8 @@
 
 #define MADV_GUARD_INSTALL 102		/* fatal signal on access to range */
 #define MADV_GUARD_REMOVE 103		/* unguard range */
+#define MADV_PISA		210	/* move pages into PISA memory */
+#define MADV_NOPISA		211	/* move pages out of PISA memory */
 
 /* compatibility flags */
 #define MAP_FILE	0

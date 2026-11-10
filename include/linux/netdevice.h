@@ -2161,6 +2161,7 @@ enum netdev_reg_state {
  *	@neighbours:	List heads pointing to this device's neighbours'
  *			dev_list, one per address-family.
  *	@hwprov: Tracks which PTP performs hardware packet time stamping.
+ *	@pisa_tx_stamp:	Cached leaf pisa flags and timestamp.
  *
  *	FIXME: cleanup struct net_device such that network protocol info
  *	moves out.
@@ -2276,6 +2277,9 @@ struct net_device {
 	} adj_list;
 
 	/* Read-mostly cache-line for fast-path access */
+#ifdef CONFIG_PISA
+	u32			pisa_tx_stamp;
+#endif
 	xdp_features_t		xdp_features;
 	const struct xdp_metadata_ops *xdp_metadata_ops;
 	const struct xsk_tx_metadata_ops *xsk_tx_metadata_ops;

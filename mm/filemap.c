@@ -15,6 +15,7 @@
 #include <linux/dax.h>
 #include <linux/fs.h>
 #include <linux/sched/signal.h>
+#include <linux/pisa.h>
 #include <linux/uaccess.h>
 #include <linux/capability.h>
 #include <linux/kernel_stat.h>
@@ -1976,6 +1977,7 @@ out:
 struct folio *__filemap_get_folio_mpol(struct address_space *mapping,
 		pgoff_t index, fgf_t fgp_flags, gfp_t gfp, struct mempolicy *policy)
 {
+	bool tried_pisa = false;
 	struct folio *folio;
 
 repeat:
@@ -1984,6 +1986,13 @@ repeat:
 		folio = NULL;
 	if (!folio)
 		goto no_page;
+
+	if (!tried_pisa) {
+		tried_pisa = true;
+		if (pisa_filemap_upgrade(mapping, folio,
+					 (fgp_flags & (FGP_WRITE | FGP_NOWAIT)) == FGP_WRITE))
+			goto repeat;
+	}
 
 	if (fgp_flags & FGP_LOCK) {
 		if (fgp_flags & FGP_NOWAIT) {
@@ -2044,7 +2053,11 @@ no_page:
 			err = -ENOMEM;
 			if (order > min_order)
 				alloc_gfp |= __GFP_NORETRY | __GFP_NOWARN;
-			folio = filemap_alloc_folio(alloc_gfp, order, policy);
+			folio = pisa_filemap_alloc(mapping, alloc_gfp, order,
+						   fgp_flags & FGP_WRITE);
+			if (!folio)
+				folio = filemap_alloc_folio(alloc_gfp, order,
+							    policy);
 			if (!folio)
 				continue;
 

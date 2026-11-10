@@ -115,6 +115,7 @@
 #include <linux/memcontrol.h>
 #include <linux/prefetch.h>
 #include <linux/compat.h>
+#include <linux/pisa.h>
 #include <linux/mroute.h>
 #include <linux/mroute6.h>
 #include <linux/icmpv6.h>
@@ -3060,9 +3061,10 @@ static long sock_wait_for_wmem(struct sock *sk, long timeo)
  *	Generic send/receive buffer handlers
  */
 
-struct sk_buff *sock_alloc_send_pskb(struct sock *sk, unsigned long header_len,
-				     unsigned long data_len, int noblock,
-				     int *errcode, int max_page_order)
+struct sk_buff *__sock_alloc_send_pskb(struct sock *sk, unsigned long header_len,
+				       unsigned long data_len, int noblock,
+				       int *errcode, int max_page_order,
+				       gfp_t gfp)
 {
 	struct sk_buff *skb;
 	long timeo;
@@ -3091,7 +3093,8 @@ struct sk_buff *sock_alloc_send_pskb(struct sock *sk, unsigned long header_len,
 		timeo = sock_wait_for_wmem(sk, timeo);
 	}
 	skb = alloc_skb_with_frags(header_len, data_len, max_page_order,
-				   errcode, sk->sk_allocation);
+				   errcode,
+				   sk->sk_allocation | (!data_len ? gfp : 0));
 	if (skb)
 		skb_set_owner_w(skb, sk);
 	return skb;
@@ -3101,6 +3104,16 @@ interrupted:
 failure:
 	*errcode = err;
 	return NULL;
+}
+EXPORT_SYMBOL(__sock_alloc_send_pskb);
+
+struct sk_buff *sock_alloc_send_pskb(struct sock *sk, unsigned long header_len,
+				     unsigned long data_len, int noblock,
+				     int *errcode, int max_page_order)
+{
+	return __sock_alloc_send_pskb(sk, header_len, data_len, noblock,
+				      errcode, max_page_order,
+				      pisa_tx_gfp_sk(sk));
 }
 EXPORT_SYMBOL(sock_alloc_send_pskb);
 
@@ -3257,13 +3270,20 @@ DEFINE_STATIC_KEY_FALSE(net_high_order_alloc_disable_key);
  */
 bool skb_page_frag_refill(unsigned int sz, struct page_frag *pfrag, gfp_t gfp)
 {
+	/* PISA pages only go into current->task_frag_pisa, see sk_page_frag_dst(). */
+	if (is_pisa_pfrag(pfrag))
+		gfp |= __GFP_PISA_RO;
+
 	if (pfrag->page) {
+		if ((gfp & __GFP_PISA_RO) && !pisa_page_can_recycle(pfrag->page))
+			goto drop_page;
 		if (page_ref_count(pfrag->page) == 1) {
 			pfrag->offset = 0;
 			return true;
 		}
 		if (pfrag->offset + sz <= pfrag->size)
 			return true;
+drop_page:
 		put_page(pfrag->page);
 	}
 
@@ -3288,6 +3308,40 @@ bool skb_page_frag_refill(unsigned int sz, struct page_frag *pfrag, gfp_t gfp)
 	return false;
 }
 EXPORT_SYMBOL(skb_page_frag_refill);
+
+/**
+ * skb_page_frag_refill_dev - GFP_ATOMIC skb_page_frag_refill() for @skb TX
+ * @sz: minimum size of the fragment we want to get
+ * @pfrag: pointer to page_frag, private to the caller
+ * @skb: packet being transmitted
+ *
+ * Pages come from the per-node DMA_TO_DEVICE PISA allocators when they are
+ * useful for @skb's egress device (__netdev_tx_pisa_ok()), otherwise from the
+ * buddy allocator. PISA pages are readable by every device that maps them
+ * while they stay active, so @pfrag must only ever hold data meant for devices,
+ * e.g. ciphertext; it may mix PISA and ordinary pages.
+ */
+bool skb_page_frag_refill_dev(unsigned int sz, struct page_frag *pfrag,
+			      const struct sk_buff *skb)
+{
+	gfp_t gfp = GFP_ATOMIC;
+
+	/*
+	 * Before ip_finish_output2() populates skb->dev (e.g. esp_output),
+	 * the egress device is carried by skb_dst(skb).
+	 */
+	if (net_pisa_tx_bufs_enabled()) {
+		const struct dst_entry *dst = skb_dst(skb);
+
+		rcu_read_lock();
+		if (__netdev_tx_pisa_ok(skb->dev ?: (dst ? dst_dev_rcu(dst) : NULL),
+					PISA_TX_STAMP_BUFS))
+			gfp |= __GFP_PISA_RO;
+		rcu_read_unlock();
+	}
+	return skb_page_frag_refill(sz, pfrag, gfp);
+}
+EXPORT_SYMBOL(skb_page_frag_refill_dev);
 
 bool sk_page_frag_refill(struct sock *sk, struct page_frag *pfrag)
 {

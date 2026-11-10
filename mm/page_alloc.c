@@ -17,6 +17,7 @@
 #include <linux/stddef.h>
 #include <linux/mm.h>
 #include <linux/highmem.h>
+#include <linux/pisa.h>
 #include <linux/interrupt.h>
 #include <linux/jiffies.h>
 #include <linux/compiler.h>
@@ -1298,6 +1299,46 @@ static inline void pgalloc_tag_sub_pages(struct alloc_tag *tag, unsigned int nr)
 
 #endif /* CONFIG_MEM_ALLOC_PROFILING */
 
+/*
+ * pisa_free_page() in __free_pages_prepare() recycles a PISA block into
+ * its allocator before the rest of that function runs. __pisa_free_page() calls
+ * this to apply the buddy allocator's checks, and to clear the order-0 state of
+ * blocks that were user pages (see drivers/iommu/pisa-user.c).
+ *
+ * Return: false if the block is in a bad state (already reported): leak it.
+ */
+bool free_page_prepare_pisa(struct page *page, unsigned int order)
+{
+	struct folio *folio;
+	unsigned int i;
+
+	if (!IS_ENABLED(CONFIG_PISA))
+		return true;
+
+	folio = page_folio(page);
+
+	if (!order) {
+		if (unlikely(folio_test_mlocked(folio))) {
+			__folio_clear_mlocked(folio);
+			zone_stat_mod_folio(folio, NR_MLOCK, -1);
+			count_vm_events(UNEVICTABLE_PGCLEARED, 1);
+		}
+		folio->mapping = NULL;
+	}
+	if (is_check_pages_enabled() && free_page_is_bad(page))
+		return false;
+	page_table_check_free(page, order);
+	for (i = 0; i < (1U << order); i++)
+		page_kasan_tag_reset(page + i);
+	kasan_unpoison_range(page_address(page), PAGE_SIZE << order);
+	if (!order) {
+		page_cpupid_reset_last(page);
+		page->flags.f &= ~PAGE_FLAGS_CHECK_AT_PREP;
+		page->private = 0;
+	}
+	return true;
+}
+
 static __always_inline bool __free_pages_prepare(struct page *page,
 		unsigned int order, fpi_t fpi_flags)
 {
@@ -1311,6 +1352,9 @@ static __always_inline bool __free_pages_prepare(struct page *page,
 		return true;
 
 	VM_BUG_ON_PAGE(PageTail(page), page);
+
+	if (unlikely(pisa_free_page(page)))
+		return false;
 
 	trace_mm_page_free(page, order);
 	kmsan_free_page(page, order);
@@ -5202,6 +5246,14 @@ unsigned long alloc_pages_bulk_noprof(gfp_t gfp, int preferred_nid,
 	while (nr_populated < nr_pages && page_array[nr_populated])
 		nr_populated++;
 
+	if (unlikely(gfp & __GFP_PISA_RO)) {
+		nr_populated = pisa_alloc_pages_bulk(gfp, 0, preferred_nid, nodemask,
+						     nr_pages, page_array, false);
+		gfp &= ~__GFP_PISA_RW;
+		if (nr_populated == nr_pages)
+			goto out;
+	}
+
 	/* No pages requested? */
 	if (unlikely(nr_pages <= 0))
 		goto out;
@@ -5434,6 +5486,13 @@ struct page *__alloc_frozen_pages_noprof(gfp_t gfp, unsigned int order,
 		fastpath_alloc_flags |= ALLOC_WMARK_MIN;
 	} else {
 		fastpath_alloc_flags |= ALLOC_WMARK_LOW;
+	}
+
+	if (unlikely(gfp & __GFP_PISA_RO)) {
+		page = pisa_alloc_pages(gfp, order, preferred_nid, nodemask);
+		if (page)
+			return page;
+		gfp &= ~__GFP_PISA_RW;
 	}
 
 	gfp &= gfp_allowed_mask;

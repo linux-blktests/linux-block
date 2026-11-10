@@ -314,6 +314,7 @@ extern unsigned long totalreserve_pages;
 /* linux/mm/folio.c */
 void folio_add_lru(struct folio *folio);
 void folio_mark_accessed(struct folio *folio);
+void lru_add_drain(void);
 void lru_add_drain_all(void);
 
 enum lru_cache_drained {

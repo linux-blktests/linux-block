@@ -37,6 +37,7 @@
 #include <linux/generic_pt/iommu.h>
 
 #include "dma-iommu.h"
+#include "pisa-priv.h"
 #include "iommu-priv.h"
 
 static struct kset *iommu_group_kset;
@@ -2866,8 +2867,9 @@ ssize_t iommu_map_sg(struct iommu_domain *domain, unsigned long iova,
 
 	while (i <= nents) {
 		phys_addr_t s_phys = sg_phys(sg);
+		bool is_bus = i < nents && sg_dma_is_bus_address(sg);
 
-		if (len && s_phys != start + len) {
+		if (len && (is_bus || s_phys != start + len)) {
 			ret = iommu_map_nosync(domain, iova + mapped, start,
 					len, prot, gfp);
 			if (ret)
@@ -2877,7 +2879,7 @@ ssize_t iommu_map_sg(struct iommu_domain *domain, unsigned long iova,
 			len = 0;
 		}
 
-		if (sg_dma_is_bus_address(sg))
+		if (is_bus)
 			goto next;
 
 		if (len) {
@@ -3362,6 +3364,10 @@ void iommu_device_unuse_default_domain(struct device *dev)
 	mutex_lock(&group->mutex);
 	if (!WARN_ON(!group->owner_cnt || !xa_empty(&group->pasid_array)))
 		group->owner_cnt--;
+
+	/* Unmap persistent PISA windows when the last driver detaches. */
+	if (!group->owner_cnt)
+		pisa_domain_quiesce(group->default_domain);
 
 	mutex_unlock(&group->mutex);
 }

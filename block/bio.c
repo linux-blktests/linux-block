@@ -6,6 +6,7 @@
 #include <linux/swap.h>
 #include <linux/bio-integrity.h>
 #include <linux/blkdev.h>
+#include <linux/pisa.h>
 #include <linux/uio.h>
 #include <linux/iocontext.h>
 #include <linux/slab.h>
@@ -1316,6 +1317,43 @@ static inline bool bio_iov_bvec_aligned(const struct bio *bio,
 }
 #endif
 
+/*
+ * Migrate pinned order-0 user pages in @bio into PISA memory when enabled on
+ * @bio->bi_bdev; returns true if pages were released and the caller must retry.
+ */
+static bool bio_upgrade_pages_to_pisa(struct bio *bio)
+{
+	enum dma_data_direction dir;
+	struct page *pages[64];
+	unsigned int i, nr = 0;
+
+	if (!IS_ENABLED(CONFIG_PISA) || !bio_flagged(bio, BIO_PAGE_PINNED))
+		return false;
+	dir = op_is_write(bio_op(bio)) ? DMA_TO_DEVICE : DMA_FROM_DEVICE;
+	if (!is_bdev_pisa_enabled(bio->bi_bdev, dir))
+		return false;
+
+	for (i = 0; i < bio->bi_vcnt && nr < ARRAY_SIZE(pages); i++) {
+		struct page *page = bio->bi_io_vec[i].bv_page;
+
+		if (bvec_nr_pages(&bio->bi_io_vec[i]) == 1 && !is_pisa_page(page)) {
+			get_page(page);
+			pages[nr++] = page;
+		}
+	}
+	if (!nr)
+		return false;
+
+	bio_release_pages(bio, false);
+	bio->bi_vcnt = 0;
+	bio->bi_iter.bi_size = 0;
+	if (!pisa_upgrade_user_pages(pages, nr, dir, false)) {
+		while (nr)
+			put_page(pages[--nr]);
+	}
+	return true;
+}
+
 /**
  * bio_iov_iter_get_pages - add user or kernel pages to a bio
  * @bio: bio to add pages to
@@ -1346,6 +1384,7 @@ int bio_iov_iter_get_pages(struct bio *bio, struct iov_iter *iter,
 {
 	iov_iter_extraction_t flags = 0;
 	struct iov_iter saved_iter;
+	bool tried_pisa = false;
 	int ret;
 
 	if (WARN_ON_ONCE(bio_flagged(bio, BIO_CLONED)))
@@ -1367,6 +1406,7 @@ int bio_iov_iter_get_pages(struct bio *bio, struct iov_iter *iter,
 	if (bio->bi_bdev && blk_queue_pci_p2pdma(bio->bi_bdev->bd_disk->queue))
 		flags |= ITER_ALLOW_P2PDMA;
 
+retry:
 	saved_iter = *iter;
 	do {
 		ssize_t size;
@@ -1385,6 +1425,12 @@ int bio_iov_iter_get_pages(struct bio *bio, struct iov_iter *iter,
 		}
 		bio->bi_iter.bi_size += size;
 	} while (iov_iter_count(iter) && !bio_full(bio, 0));
+
+	if (!tried_pisa && bio_upgrade_pages_to_pisa(bio)) {
+		tried_pisa = true;
+		*iter = saved_iter;
+		goto retry;
+	}
 
 	if (is_pci_p2pdma_page(bio->bi_io_vec->bv_page))
 		bio->bi_opf |= REQ_NOMERGE;

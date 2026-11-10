@@ -49,7 +49,7 @@ struct kmem_cache *kmem_cache;
  */
 #define SLAB_NEVER_MERGE (SLAB_DEBUG_FLAGS | SLAB_TYPESAFE_BY_RCU | \
 		SLAB_NOLEAKTRACE | SLAB_FAILSLAB | SLAB_NO_MERGE | \
-		SLAB_OBJ_EXT_IN_OBJ)
+		SLAB_OBJ_EXT_IN_OBJ | SLAB_CACHE_PISA_RO)
 
 #define SLAB_MERGE_SAME (SLAB_RECLAIM_ACCOUNT | SLAB_CACHE_DMA | \
 			 SLAB_CACHE_DMA32 | SLAB_ACCOUNT | SLAB_MAY_ACCOUNT)
@@ -376,6 +376,9 @@ struct kmem_cache *__kmem_cache_create_args(const char *name,
 	s = __kmem_cache_alias(name, object_size, flags, args);
 	if (s)
 		goto out_unlock;
+
+	if (flags & SLAB_CACHE_PISA_RO)
+		flags |= SLAB_SKIP_KFENCE;
 
 	cache_name = kstrdup_const(name, GFP_KERNEL);
 	if (!cache_name) {

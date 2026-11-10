@@ -3808,6 +3808,8 @@ static inline void skb_frag_page_copy(skb_frag_t *fragto,
 }
 
 bool skb_page_frag_refill(unsigned int sz, struct page_frag *pfrag, gfp_t prio);
+bool skb_page_frag_refill_dev(unsigned int sz, struct page_frag *pfrag,
+			      const struct sk_buff *skb);
 
 /**
  * __skb_frag_dma_map - maps a paged fragment via the DMA API

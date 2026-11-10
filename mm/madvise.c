@@ -6,6 +6,7 @@
  * Copyright (C) 2002  Christoph Hellwig
  */
 
+#include <linux/pisa.h>
 #include <linux/mman.h>
 #include <linux/pagemap.h>
 #include <linux/syscalls.h>
@@ -1393,6 +1394,9 @@ static int madvise_vma_behavior(struct madvise_behavior *madv_behavior)
 		return madvise_guard_install(madv_behavior);
 	case MADV_GUARD_REMOVE:
 		return madvise_guard_remove(madv_behavior);
+	case MADV_PISA:
+	case MADV_NOPISA:
+		return pisa_madvise(vma, range->start, range->end, behavior == MADV_PISA);
 
 	/* The below behaviours update VMAs via madvise_update_vma(). */
 
@@ -1582,6 +1586,9 @@ madvise_behavior_valid(int behavior)
 	case MADV_HWPOISON:
 #endif
 		return true;
+	case MADV_PISA:
+	case MADV_NOPISA:
+		return IS_ENABLED(CONFIG_PISA);
 
 	default:
 		return false;
@@ -1596,6 +1603,8 @@ static bool process_madvise_remote_valid(int behavior)
 	case MADV_PAGEOUT:
 	case MADV_WILLNEED:
 	case MADV_COLLAPSE:
+	case MADV_PISA:
+	case MADV_NOPISA:
 		return true;
 	default:
 		return false;
@@ -1782,6 +1791,8 @@ static enum madvise_lock_mode get_lock_mode(struct madvise_behavior *madv_behavi
 	case MADV_POPULATE_READ:
 	case MADV_POPULATE_WRITE:
 	case MADV_COLLAPSE:
+	case MADV_PISA:
+	case MADV_NOPISA:
 		return MADVISE_MMAP_READ_LOCK;
 	case MADV_GUARD_INSTALL:
 	case MADV_GUARD_REMOVE:
