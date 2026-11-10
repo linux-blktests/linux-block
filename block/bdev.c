@@ -1076,8 +1076,8 @@ static unsigned blk_to_file_flags(blk_mode_t mode)
 	return flags;
 }
 
-struct file *bdev_file_open_by_dev(dev_t dev, blk_mode_t mode, void *holder,
-				   const struct blk_holder_ops *hops)
+struct file *bdev_file_open_by_dev_autoload(dev_t dev, blk_mode_t mode,
+		void *holder, const struct blk_holder_ops *hops, bool autoload)
 {
 	struct file *bdev_file;
 	struct block_device *bdev;
@@ -1088,7 +1088,7 @@ struct file *bdev_file_open_by_dev(dev_t dev, blk_mode_t mode, void *holder,
 	if (ret)
 		return ERR_PTR(ret);
 
-	bdev = blkdev_get_no_open(dev, true);
+	bdev = blkdev_get_no_open(dev, autoload);
 	if (!bdev)
 		return ERR_PTR(-ENXIO);
 
@@ -1109,6 +1109,13 @@ struct file *bdev_file_open_by_dev(dev_t dev, blk_mode_t mode, void *holder,
 		return ERR_PTR(ret);
 	}
 	return bdev_file;
+}
+EXPORT_SYMBOL(bdev_file_open_by_dev_autoload);
+
+struct file *bdev_file_open_by_dev(dev_t dev, blk_mode_t mode, void *holder,
+				   const struct blk_holder_ops *hops)
+{
+	return bdev_file_open_by_dev_autoload(dev, mode, holder, hops, true);
 }
 EXPORT_SYMBOL(bdev_file_open_by_dev);
 
