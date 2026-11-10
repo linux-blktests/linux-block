@@ -268,12 +268,6 @@ static struct blkg_policy_data *throtl_pd_alloc(struct gendisk *disk,
 	if (!tg)
 		return NULL;
 
-	if (blkg_rwstat_init(&tg->stat_bytes, gfp))
-		goto err_free_tg;
-
-	if (blkg_rwstat_init(&tg->stat_ios, gfp))
-		goto err_exit_stat_bytes;
-
 	throtl_service_queue_init(&tg->service_queue);
 
 	for (rw = READ; rw <= WRITE; rw++) {
@@ -288,12 +282,6 @@ static struct blkg_policy_data *throtl_pd_alloc(struct gendisk *disk,
 	tg->iops[WRITE] = UINT_MAX;
 
 	return &tg->pd;
-
-err_exit_stat_bytes:
-	blkg_rwstat_exit(&tg->stat_bytes);
-err_free_tg:
-	kfree(tg);
-	return NULL;
 }
 
 static void throtl_pd_init(struct blkg_policy_data *pd)
@@ -359,8 +347,6 @@ static void tg_release(struct rcu_head *rcu)
 		container_of(rcu, struct blkg_policy_data, rcu_head);
 	struct throtl_grp *tg = pd_to_tg(pd);
 
-	blkg_rwstat_exit(&tg->stat_bytes);
-	blkg_rwstat_exit(&tg->stat_ios);
 	kfree(tg);
 }
 
@@ -1413,32 +1399,6 @@ static ssize_t tg_set_conf_uint(struct kernfs_open_file *of,
 	return tg_set_conf(of, buf, nbytes, off, false);
 }
 
-static int tg_print_rwstat(struct seq_file *sf, void *v)
-{
-	blkcg_print_blkgs(sf, css_to_blkcg(seq_css(sf)),
-			  blkg_prfill_rwstat, &blkcg_policy_throtl,
-			  seq_cft(sf)->private, true);
-	return 0;
-}
-
-static u64 tg_prfill_rwstat_recursive(struct seq_file *sf,
-				      struct blkg_policy_data *pd, int off)
-{
-	struct blkg_rwstat_sample sum;
-
-	blkg_rwstat_recursive_sum(pd_to_blkg(pd), &blkcg_policy_throtl, off,
-				  &sum);
-	return __blkg_prfill_rwstat(sf, pd, &sum);
-}
-
-static int tg_print_rwstat_recursive(struct seq_file *sf, void *v)
-{
-	blkcg_print_blkgs(sf, css_to_blkcg(seq_css(sf)),
-			  tg_prfill_rwstat_recursive, &blkcg_policy_throtl,
-			  seq_cft(sf)->private, true);
-	return 0;
-}
-
 static struct cftype throtl_legacy_files[] = {
 	{
 		.name = "throttle.read_bps_device",
@@ -1463,26 +1423,6 @@ static struct cftype throtl_legacy_files[] = {
 		.private = offsetof(struct throtl_grp, iops[WRITE]),
 		.seq_show = tg_print_conf_uint,
 		.write = tg_set_conf_uint,
-	},
-	{
-		.name = "throttle.io_service_bytes",
-		.private = offsetof(struct throtl_grp, stat_bytes),
-		.seq_show = tg_print_rwstat,
-	},
-	{
-		.name = "throttle.io_service_bytes_recursive",
-		.private = offsetof(struct throtl_grp, stat_bytes),
-		.seq_show = tg_print_rwstat_recursive,
-	},
-	{
-		.name = "throttle.io_serviced",
-		.private = offsetof(struct throtl_grp, stat_ios),
-		.seq_show = tg_print_rwstat,
-	},
-	{
-		.name = "throttle.io_serviced_recursive",
-		.private = offsetof(struct throtl_grp, stat_ios),
-		.seq_show = tg_print_rwstat_recursive,
 	},
 	{ }	/* terminate */
 };
@@ -1672,25 +1612,8 @@ static void tg_flush_bios(struct throtl_grp *tg)
 static void throtl_pd_offline(struct blkg_policy_data *pd)
 {
 	struct throtl_grp *tg = pd_to_tg(pd);
-	struct throtl_grp *parent = blkg_to_tg(tg_to_blkg(tg)->parent);
 
 	tg_flush_bios(tg);
-
-	/* the recursive files of the ancestors go on counting what it did */
-	if (parent) {
-		blkg_rwstat_add_aux(&parent->stat_bytes, &tg->stat_bytes);
-		blkg_rwstat_add_aux(&parent->stat_ios, &tg->stat_ios);
-		blkg_rwstat_reset(&tg->stat_bytes);
-		blkg_rwstat_reset(&tg->stat_ios);
-	}
-}
-
-static void throtl_pd_reset_stats(struct blkg_policy_data *pd)
-{
-	struct throtl_grp *tg = pd_to_tg(pd);
-
-	blkg_rwstat_reset(&tg->stat_bytes);
-	blkg_rwstat_reset(&tg->stat_ios);
 }
 
 struct blkcg_policy blkcg_policy_throtl = {
@@ -1702,7 +1625,6 @@ struct blkcg_policy blkcg_policy_throtl = {
 	.pd_online_fn		= throtl_pd_online,
 	.pd_offline_fn		= throtl_pd_offline,
 	.pd_free_fn		= throtl_pd_free,
-	.pd_reset_stats_fn	= throtl_pd_reset_stats,
 };
 
 static void tg_cancel_writeback_bios(struct throtl_grp *tg,

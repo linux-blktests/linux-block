@@ -23,6 +23,7 @@
 
 struct blkcg_gq;
 struct blkg_policy_data;
+struct blkg_v1_stats;
 
 
 /* percpu_counter batch for blkg_[rw]stats, per-cpu drift doesn't matter */
@@ -71,6 +72,9 @@ struct blkcg_gq {
 
 	struct blkg_iostat_set __percpu	*iostat_cpu;
 	struct blkg_iostat_set		iostat;
+#ifdef CONFIG_BLK_DEV_THROTTLING
+	struct blkg_v1_stats		*v1_stats;
+#endif
 
 	struct blkg_policy_data		*pd[BLKCG_MAX_POLS];
 #ifdef CONFIG_BLK_CGROUP_PUNT_BIO
@@ -519,5 +523,16 @@ static inline bool blk_cgroup_mergeable(struct request *rq, struct bio *bio) { r
 	for ((rl) = &(q)->root_rl; (rl); (rl) = NULL)
 
 #endif	/* CONFIG_BLK_CGROUP */
+
+#ifdef CONFIG_BLK_DEV_THROTTLING
+void __blkcg_account_v1_bio(struct bio *bio);
+static inline void blkcg_account_v1_bio(struct bio *bio)
+{
+	if (!cgroup_subsys_on_dfl(io_cgrp_subsys))
+		__blkcg_account_v1_bio(bio);
+}
+#else
+static inline void blkcg_account_v1_bio(struct bio *bio) { }
+#endif
 
 #endif /* _BLK_CGROUP_PRIVATE_H */
