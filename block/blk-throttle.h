@@ -2,7 +2,7 @@
 #ifndef BLK_THROTTLE_H
 #define BLK_THROTTLE_H
 
-#include "blk-cgroup-rwstat.h"
+#include "blk-cgroup.h"
 
 /*
  * To implement hierarchical throttling, throtl_grps form a tree and bios
@@ -124,8 +124,6 @@ struct throtl_grp {
 	unsigned long slice_start[2];
 	unsigned long slice_end[2];
 
-	struct blkg_rwstat stat_bytes;
-	struct blkg_rwstat stat_ios;
 };
 
 extern struct blkcg_policy blkcg_policy_throtl;
@@ -172,14 +170,6 @@ static inline bool blk_should_throtl(struct bio *bio)
 		return false;
 
 	tg = blkg_to_tg(bio->bi_blkg);
-	if (!cgroup_subsys_on_dfl(io_cgrp_subsys)) {
-		if (!bio_flagged(bio, BIO_CGROUP_ACCT)) {
-			bio_set_flag(bio, BIO_CGROUP_ACCT);
-			blkg_rwstat_add(&tg->stat_bytes, bio->bi_opf,
-					bio->bi_iter.bi_size);
-		}
-		blkg_rwstat_add(&tg->stat_ios, bio->bi_opf, 1);
-	}
 
 	/* iops limit is always counted */
 	if (tg->has_rules_iops[rw])

@@ -32,6 +32,7 @@
 #include <linux/part_stat.h>
 #include "blk.h"
 #include "blk-cgroup.h"
+#include "blk-cgroup-rwstat.h"
 #include "blk-ioprio.h"
 #include "blk-throttle.h"
 
@@ -65,6 +66,90 @@ bool blkcg_debug_stats = false;
 static DEFINE_RAW_SPINLOCK(blkg_stat_lock);
 
 #define BLKG_DESTROY_BATCH_SIZE  64
+
+#ifdef CONFIG_BLK_DEV_THROTTLING
+struct blkg_v1_stats {
+	struct blkg_rwstat bytes;
+	struct blkg_rwstat ios;
+};
+
+static int blkg_v1_stats_init(struct blkcg_gq *blkg, struct blkcg *blkcg,
+			      gfp_t gfp)
+{
+	struct blkg_v1_stats *stats;
+	int ret;
+
+	/*
+	 * Keep stats for the root blkcg to support late v1 binding.
+	 * Non-root v2 blkgs do not need v1 statistics.
+	 */
+	if (blkcg != &blkcg_root && cgroup_on_dfl(blkcg->css.cgroup))
+		return 0;
+
+	stats = kzalloc_obj(*stats, gfp);
+	if (!stats)
+		return -ENOMEM;
+	ret = blkg_rwstat_init(&stats->bytes, gfp);
+	if (ret)
+		goto out_free;
+	ret = blkg_rwstat_init(&stats->ios, gfp);
+	if (ret)
+		goto out_exit_bytes;
+	blkg->v1_stats = stats;
+	return 0;
+
+out_exit_bytes:
+	blkg_rwstat_exit(&stats->bytes);
+out_free:
+	kfree(stats);
+	return ret;
+}
+
+static void blkg_v1_stats_exit(struct blkcg_gq *blkg)
+{
+	struct blkg_v1_stats *stats = blkg->v1_stats;
+
+	if (!stats)
+		return;
+	blkg_rwstat_exit(&stats->ios);
+	blkg_rwstat_exit(&stats->bytes);
+	kfree(stats);
+}
+
+static void blkg_v1_stats_reset(struct blkcg_gq *blkg)
+{
+	struct blkg_v1_stats *stats = blkg->v1_stats;
+
+	if (!stats)
+		return;
+	blkg_rwstat_reset(&stats->bytes);
+	blkg_rwstat_reset(&stats->ios);
+}
+
+static void blkg_v1_stats_offline(struct blkcg_gq *blkg)
+{
+	struct blkg_v1_stats *stats = blkg->v1_stats;
+	struct blkg_v1_stats *parent;
+
+	if (!stats || !blkg->parent)
+		return;
+
+	parent = blkg->parent->v1_stats;
+	blkg_rwstat_add_aux(&parent->bytes, &stats->bytes);
+	blkg_rwstat_add_aux(&parent->ios, &stats->ios);
+	blkg_v1_stats_reset(blkg);
+}
+#else
+static inline int blkg_v1_stats_init(struct blkcg_gq *blkg,
+				     struct blkcg *blkcg, gfp_t gfp)
+{
+	return 0;
+}
+
+static inline void blkg_v1_stats_exit(struct blkcg_gq *blkg) { }
+static inline void blkg_v1_stats_reset(struct blkcg_gq *blkg) { }
+static inline void blkg_v1_stats_offline(struct blkcg_gq *blkg) { }
+#endif
 
 /*
  * Lockless lists for tracking IO stats update
@@ -150,6 +235,7 @@ static void blkg_free_workfn(struct work_struct *work)
 	 */
 	css_put(&blkg->blkcg->css);
 	blk_put_queue(q);
+	blkg_v1_stats_exit(blkg);
 	free_percpu(blkg->iostat_cpu);
 	percpu_ref_exit(&blkg->refcnt);
 	kfree(blkg);
@@ -329,8 +415,10 @@ static struct blkcg_gq *blkg_alloc(struct blkcg *blkcg, struct gendisk *disk,
 	blkg->iostat_cpu = alloc_percpu_gfp(struct blkg_iostat_set, gfp_mask);
 	if (!blkg->iostat_cpu)
 		goto out_exit_refcnt;
-	if (!blk_get_queue(disk->queue))
+	if (blkg_v1_stats_init(blkg, blkcg, gfp_mask))
 		goto out_free_iostat;
+	if (!blk_get_queue(disk->queue))
+		goto out_exit_stats;
 	/* blkg holds a reference to blkcg */
 	if (!css_tryget_online(&blkcg->css))
 		goto out_put_queue;
@@ -377,6 +465,8 @@ out_free_pds:
 	css_put(&blkcg->css);
 out_put_queue:
 	blk_put_queue(disk->queue);
+out_exit_stats:
+	blkg_v1_stats_exit(blkg);
 out_free_iostat:
 	free_percpu(blkg->iostat_cpu);
 out_exit_refcnt:
@@ -555,6 +645,7 @@ static void blkg_destroy(struct blkcg_gq *blkg)
 		}
 	}
 
+	blkg_v1_stats_offline(blkg);
 	blkg->online = false;
 
 	radix_tree_delete(&blkcg->blkg_tree, blkg->q->id);
@@ -678,6 +769,7 @@ static int blkcg_reset_stats(struct cgroup_subsys_state *css,
 	 */
 	hlist_for_each_entry(blkg, &blkcg->blkg_list, blkcg_node) {
 		blkg_clear_stat(blkg);
+		blkg_v1_stats_reset(blkg);
 		for (i = 0; i < BLKCG_MAX_POLS; i++) {
 			struct blkcg_policy *pol = blkcg_policy[i];
 
@@ -1231,7 +1323,101 @@ static struct cftype blkcg_files[] = {
 	{ }	/* terminate */
 };
 
+#ifdef CONFIG_BLK_DEV_THROTTLING
+void __blkcg_account_v1_bio(struct bio *bio)
+{
+	struct blkg_v1_stats *stats = bio->bi_blkg->v1_stats;
+
+	if (!bio_flagged(bio, BIO_CGROUP_ACCT)) {
+		bio_set_flag(bio, BIO_CGROUP_ACCT);
+		blkg_rwstat_add(&stats->bytes, bio->bi_opf,
+				bio->bi_iter.bi_size);
+	}
+	blkg_rwstat_add(&stats->ios, bio->bi_opf, 1);
+}
+
+static void blkg_v1_stat_recursive_sum(struct blkcg_gq *blkg, int off,
+				       struct blkg_rwstat_sample *sum)
+{
+	struct cgroup_subsys_state *pos_css;
+	struct blkcg_gq *pos_blkg;
+	int i;
+
+	WARN_ON_ONCE(!rcu_read_lock_held());
+	memset(sum, 0, sizeof(*sum));
+	blkg_for_each_descendant_pre(pos_blkg, pos_css, blkg) {
+		struct blkg_rwstat *rwstat;
+
+		/* Tolerate racing with blkg offlining. */
+		if (!data_race(pos_blkg->online) || !pos_blkg->v1_stats)
+			continue;
+		rwstat = (void *)pos_blkg->v1_stats + off;
+		for (i = 0; i < BLKG_RWSTAT_NR; i++)
+			sum->cnt[i] += blkg_rwstat_read_counter(rwstat, i);
+	}
+}
+
+static int blkcg_print_v1_stats(struct seq_file *sf, bool recursive)
+{
+	struct blkcg *blkcg = css_to_blkcg(seq_css(sf));
+	int off = seq_cft(sf)->private;
+	struct blkcg_gq *blkg;
+	u64 total = 0;
+
+	rcu_read_lock();
+	hlist_for_each_entry_rcu(blkg, &blkcg->blkg_list, blkcg_node) {
+		struct gendisk *disk = READ_ONCE(blkg->q->disk);
+		struct blkg_rwstat_sample sum;
+
+		if (!blkg->v1_stats || !disk)
+			continue;
+
+		if (recursive)
+			blkg_v1_stat_recursive_sum(blkg, off, &sum);
+		else
+			blkg_rwstat_read((void *)blkg->v1_stats + off, &sum);
+		total += blkg_print_rwstat(sf, blkg, &sum);
+	}
+	rcu_read_unlock();
+
+	seq_printf(sf, "Total %llu\n", total);
+	return 0;
+}
+
+static int blkcg_print_v1_rwstat(struct seq_file *sf, void *v)
+{
+	return blkcg_print_v1_stats(sf, false);
+}
+
+static int blkcg_print_v1_rwstat_recursive(struct seq_file *sf, void *v)
+{
+	return blkcg_print_v1_stats(sf, true);
+}
+#endif
+
 static struct cftype blkcg_legacy_files[] = {
+#ifdef CONFIG_BLK_DEV_THROTTLING
+	{
+		.name = "throttle.io_service_bytes",
+		.private = offsetof(struct blkg_v1_stats, bytes),
+		.seq_show = blkcg_print_v1_rwstat,
+	},
+	{
+		.name = "throttle.io_service_bytes_recursive",
+		.private = offsetof(struct blkg_v1_stats, bytes),
+		.seq_show = blkcg_print_v1_rwstat_recursive,
+	},
+	{
+		.name = "throttle.io_serviced",
+		.private = offsetof(struct blkg_v1_stats, ios),
+		.seq_show = blkcg_print_v1_rwstat,
+	},
+	{
+		.name = "throttle.io_serviced_recursive",
+		.private = offsetof(struct blkg_v1_stats, ios),
+		.seq_show = blkcg_print_v1_rwstat_recursive,
+	},
+#endif
 	{
 		.name = "reset_stats",
 		.write_u64 = blkcg_reset_stats,

@@ -41,6 +41,8 @@ static inline u64 blkg_rwstat_read_counter(struct blkg_rwstat *rwstat,
 
 int blkg_rwstat_init(struct blkg_rwstat *rwstat, gfp_t gfp);
 void blkg_rwstat_exit(struct blkg_rwstat *rwstat);
+u64 blkg_print_rwstat(struct seq_file *sf, struct blkcg_gq *blkg,
+		      const struct blkg_rwstat_sample *rwstat);
 u64 __blkg_prfill_rwstat(struct seq_file *sf, struct blkg_policy_data *pd,
 			 const struct blkg_rwstat_sample *rwstat);
 u64 blkg_prfill_rwstat(struct seq_file *sf, struct blkg_policy_data *pd,

@@ -26,15 +26,15 @@ void blkg_rwstat_exit(struct blkg_rwstat *rwstat)
 EXPORT_SYMBOL_GPL(blkg_rwstat_exit);
 
 /**
- * __blkg_prfill_rwstat - prfill helper for a blkg_rwstat
+ * blkg_print_rwstat - print a blkg_rwstat sample
  * @sf: seq_file to print to
- * @pd: policy private data of interest
+ * @blkg: block cgroup and queue association
  * @rwstat: rwstat to print
  *
- * Print @rwstat to @sf for the device assocaited with @pd.
+ * Print @rwstat to @sf for the device associated with @blkg.
  */
-u64 __blkg_prfill_rwstat(struct seq_file *sf, struct blkg_policy_data *pd,
-			 const struct blkg_rwstat_sample *rwstat)
+u64 blkg_print_rwstat(struct seq_file *sf, struct blkcg_gq *blkg,
+		      const struct blkg_rwstat_sample *rwstat)
 {
 	static const char *rwstr[] = {
 		[BLKG_RWSTAT_READ]	= "Read",
@@ -43,7 +43,7 @@ u64 __blkg_prfill_rwstat(struct seq_file *sf, struct blkg_policy_data *pd,
 		[BLKG_RWSTAT_ASYNC]	= "Async",
 		[BLKG_RWSTAT_DISCARD]	= "Discard",
 	};
-	const char *dname = blkg_dev_name(pd->blkg);
+	const char *dname = blkg_dev_name(blkg);
 	u64 v;
 	int i;
 
@@ -59,6 +59,12 @@ u64 __blkg_prfill_rwstat(struct seq_file *sf, struct blkg_policy_data *pd,
 		rwstat->cnt[BLKG_RWSTAT_DISCARD];
 	seq_printf(sf, "%s Total %llu\n", dname, v);
 	return v;
+}
+
+u64 __blkg_prfill_rwstat(struct seq_file *sf, struct blkg_policy_data *pd,
+			 const struct blkg_rwstat_sample *rwstat)
+{
+	return blkg_print_rwstat(sf, pd->blkg, rwstat);
 }
 EXPORT_SYMBOL_GPL(__blkg_prfill_rwstat);
 

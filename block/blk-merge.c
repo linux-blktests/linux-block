@@ -131,10 +131,13 @@ struct bio *bio_submit_split_bioset(struct bio *bio, unsigned int split_sectors,
 	trace_block_split(split, bio->bi_iter.bi_sector);
 	WARN_ON_ONCE(bio_zone_write_plugging(bio));
 
-	if (should_fail_bio(bio))
+	if (should_fail_bio(bio)) {
 		bio_io_error(bio);
-	else if (!blk_throtl_bio(bio))
-		submit_bio_noacct_nocheck(bio, true);
+	} else {
+		blkcg_account_v1_bio(bio);
+		if (!blk_throtl_bio(bio))
+			submit_bio_noacct_nocheck(bio, true);
+	}
 
 	return split;
 }
